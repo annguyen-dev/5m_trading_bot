@@ -1,0 +1,17 @@
+{
+  "name": "trading-bot",
+  "private": true,
+  "scripts": {
+    "dev":         "turbo run dev",
+    "dev:api":     "pnpm --filter @trading-bot/api     dev",
+    "dev:workers": "pnpm --filter @trading-bot/workers dev",
+    "dev:web":     "pnpm --filter @trading-bot/web     dev",
+    "build":       "turbo run build",
+    "typecheck":   "turbo run typecheck",
+    "test":        "turbo run test"
+  },
+  "devDependencies": {
+    "turbo": "^2.5.0"
+  },
+  "packageManager": "pnpm@10.11.0"
+}

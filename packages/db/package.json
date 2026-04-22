@@ -1,0 +1,22 @@
+{
+  "name": "@trading-bot/db",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".":             "./src/client.ts",
+    "./migrate":     "./src/migrate.ts",
+    "./migrations":  "./src/migrations/*.sql"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "pg": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.20.0",
+    "typescript": "^5.7.0"
+  }
+}

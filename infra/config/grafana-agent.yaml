@@ -1,0 +1,136 @@
+# Grafana Agent — Static Mode
+#
+# Responsibilities:
+#   1. Receive OTLP from the bot (traces + metrics + logs) on localhost
+#   2. Scrape system metrics (CPU, RAM, disk, network) via node_exporter integration
+#   3. Forward everything to Grafana Cloud
+#
+# Installation:
+#   macOS:  brew install grafana-agent
+#   Linux:  https://grafana.com/docs/agent/latest/install/
+#   Docker: see docker-compose.yaml
+#
+# Run:
+#   grafana-agent -config.file=config/grafana-agent.yaml \
+#                 -config.expand-env=true
+#
+# Required env vars (same as .env):
+#   GRAFANA_CLOUD_METRICS_URL     e.g. https://prometheus-prod-01-eu-west-0.grafana.net/api/prom/push
+#   GRAFANA_CLOUD_METRICS_USER    Grafana Cloud Prometheus instance ID (number)
+#   GRAFANA_CLOUD_TRACES_URL      e.g. https://tempo-prod-04-prod-eu-west-2.grafana.net:443
+#   GRAFANA_CLOUD_LOGS_URL        e.g. https://logs-prod-eu-west-0.grafana.net/loki/api/v1/push
+#   GRAFANA_CLOUD_LOGS_USER       Grafana Cloud Loki instance ID (number)
+#   GRAFANA_CLOUD_API_KEY         Grafana Cloud API key (Publisher role)
+
+server:
+  log_level: warn
+  # Grafana Agent's own HTTP endpoint (health check, metrics about the agent itself)
+  http_listen_port: 12345
+
+# ── Metrics ───────────────────────────────────────────────────────────────────
+metrics:
+  global:
+    scrape_interval: 15s
+    external_labels:
+      service: trading-bot
+      env:     production
+
+  configs:
+    - name: default
+      remote_write:
+        - url: "${GRAFANA_CLOUD_METRICS_URL}"
+          basic_auth:
+            username: "${GRAFANA_CLOUD_METRICS_USER}"
+            password: "${GRAFANA_CLOUD_API_KEY}"
+
+      scrape_configs:
+        # Scrape the agent's own metrics (queue length, dropped spans, etc.)
+        - job_name: grafana-agent
+          static_configs:
+            - targets: [localhost:12345]
+
+# ── Traces ────────────────────────────────────────────────────────────────────
+traces:
+  configs:
+    - name: default
+      # Bot pushes here via OTLP HTTP
+      receivers:
+        otlp:
+          protocols:
+            http:
+              endpoint: "0.0.0.0:4318"
+            grpc:
+              endpoint: "0.0.0.0:4317"
+
+      remote_write:
+        - endpoint: "${GRAFANA_CLOUD_TRACES_URL}"
+          basic_auth:
+            username: "${GRAFANA_CLOUD_METRICS_USER}"
+            password: "${GRAFANA_CLOUD_API_KEY}"
+          tls_config:
+            insecure: false
+
+      # Also forward OTLP metrics (from bot's MeterProvider) to Prometheus remote write
+      spanmetrics:
+        handler_endpoint: "0.0.0.0:8889"
+        dimensions:
+          - name: service.name
+          - name: direction        # BUY/SELL/HOLD
+          - name: horizon          # short/mid/long
+          - name: mm_trap_type
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs:
+  configs:
+    - name: default
+      clients:
+        - url: "${GRAFANA_CLOUD_LOGS_URL}"
+          basic_auth:
+            username: "${GRAFANA_CLOUD_LOGS_USER}"
+            password: "${GRAFANA_CLOUD_API_KEY}"
+          external_labels:
+            service: trading-bot
+            env:     production
+
+      positions:
+        filename: /tmp/grafana-agent-positions.yaml
+
+      scrape_configs:
+        # Tail the bot's log file (if LOG_FILE is set)
+        - job_name: trading-bot-file
+          static_configs:
+            - targets: [localhost]
+              labels:
+                job:    trading-bot
+                __path__: ./logs/trading-bot.log
+
+        # Tail systemd journal (Linux only — comment out on macOS)
+        # - job_name: trading-bot-journal
+        #   journal:
+        #     labels:
+        #       job: trading-bot
+        #     matches: _SYSTEMD_UNIT=trading-bot.service
+
+# ── Integrations (system metrics) ────────────────────────────────────────────
+integrations:
+  # Reports agent health to Grafana Cloud
+  agent:
+    enabled: true
+
+  # System metrics: CPU, memory, disk, network
+  node_exporter:
+    enabled: true
+    # Collectors to enable (trim noise, keep the useful ones)
+    enable_collectors:
+      - cpu
+      - diskstats
+      - filesystem
+      - loadavg
+      - meminfo
+      - netdev
+      - uname
+    filesystem:
+      mount_points_exclude: "^/(dev|proc|sys|run)($|/)"
+    relabel_configs:
+      - target_label: service
+        replacement:  trading-bot

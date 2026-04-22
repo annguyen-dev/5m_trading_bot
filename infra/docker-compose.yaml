@@ -1,0 +1,57 @@
+version: "3.9"
+
+services:
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  # Stores raw OHLCV 1m, funding rates, macro events, and KB snapshots.
+  # Exposed on :5432 so local build scripts (build:raw, build:snapshots,
+  # build:embed) can connect directly without being inside Docker.
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     trading
+      POSTGRES_PASSWORD: trading
+      POSTGRES_DB:       trading
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - observability
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Grafana Agent ───────────────────────────────────────────────────────────
+  # Backend runs natively (PM2). See ecosystem.config.cjs at repo root.
+  # Receives OTLP locally (traces + metrics + logs) and forwards to Grafana Cloud
+  grafana-agent:
+    image: grafana/agent:v0.42.0
+    restart: unless-stopped
+    volumes:
+      - ./config/grafana-agent.yaml:/etc/agent/agent.yaml:ro
+      - ./data/agent:/var/lib/grafana-agent
+    command:
+      - "-config.file=/etc/agent/agent.yaml"
+      - "-config.expand-env=true"
+    environment:
+      GRAFANA_CLOUD_METRICS_URL:  ${GRAFANA_CLOUD_METRICS_URL}
+      GRAFANA_CLOUD_METRICS_USER: ${GRAFANA_CLOUD_METRICS_USER}
+      GRAFANA_CLOUD_TRACES_URL:   ${GRAFANA_CLOUD_TRACES_URL}
+      GRAFANA_CLOUD_LOGS_URL:     ${GRAFANA_CLOUD_LOGS_URL}
+      GRAFANA_CLOUD_LOGS_USER:    ${GRAFANA_CLOUD_LOGS_USER}
+      GRAFANA_CLOUD_API_KEY:      ${GRAFANA_CLOUD_API_KEY}
+    networks:
+      - observability
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP  ← bot sends here
+
+volumes:
+  postgres_data:
+
+networks:
+  observability:
+    driver: bridge

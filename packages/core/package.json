@@ -1,0 +1,37 @@
+{
+  "name": "@trading-bot/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./CoinConfig":              "./src/CoinConfig.ts",
+    "./SignalBus":               "./src/SignalBus.ts",
+    "./PolymarketService":       "./src/PolymarketService.ts",
+    "./orderPlacement":          "./src/orderPlacement.ts",
+    "./PolymarketClobExecutor":  "./src/PolymarketClobExecutor.ts",
+    "./TelegramService":         "./src/TelegramService.ts",
+    "./settings":                "./src/settings.ts",
+    "./logger":                  "./src/observability/logger.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@trading-bot/db":           "workspace:*",
+    "@trading-bot/shared":       "workspace:*",
+    "@polymarket/clob-client":   "^5.8.1",
+    "ethers":                    "^5.8.0",
+    "grammy":                    "^1.30.0",
+    "ioredis":                   "^5.10.1",
+    "pino":                      "^9.6.0",
+    "pino-pretty":               "^13.0.0",
+    "ws":                        "^8.20.0",
+    "@opentelemetry/api":        "^1.9.0",
+    "@opentelemetry/api-logs":   "^0.57.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws":   "^8.18.1",
+    "typescript":  "^5.7.0"
+  }
+}

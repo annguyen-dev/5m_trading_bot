@@ -1,0 +1,35 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*"],
+  "exclude": [
+    "src/__tests__/**",
+    "src/pipeline/**",
+    "src/index.ts",
+    "src/services/StreakSignalEngine.ts",
+    "src/services/AIService.ts",
+    "src/services/NewsService.ts",
+    "src/services/MMDetectorService.ts",
+    "src/services/PanicDetector.ts",
+    "src/services/VectorStoreService.ts",
+    "src/services/PositionTracker.ts",
+    "src/services/PolySignalService.ts",
+    "src/services/StatisticalSignalService.ts",
+    "src/services/MacroEventStore.ts",
+    "src/services/SignalStore.ts",
+    "src/services/SignalRepository.ts",
+    "src/services/MarketDataService.ts",
+    "src/services/OrderExecutor.ts",
+    "src/services/OnChainService.ts",
+    "src/services/GDELTService.ts",
+    "src/services/LagAnalyzer.ts",
+    "src/knowledge/**"
+  ]
+}

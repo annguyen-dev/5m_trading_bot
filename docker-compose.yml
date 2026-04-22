@@ -1,0 +1,43 @@
+# Local infra for the trading bot.
+#
+# Note: the Postgres service here mirrors the existing running container
+# (`trading-bot-postgres-1`) so you can reproduce the setup from scratch, but
+# if that container is already running on port 5432 this declaration won't
+# start a duplicate. Use `docker compose up -d redis` if you only want Redis.
+#
+# Redis port 6379 is standard. If already occupied by another project, change
+# the host-side port (left of the colon) and update REDIS_URL accordingly.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER:     trading
+      POSTGRES_PASSWORD: trading
+      POSTGRES_DB:       trading
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:
+  redisdata:
