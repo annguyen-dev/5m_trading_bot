@@ -29,11 +29,11 @@ async function readCents(key: string, fallback: number): Promise<number> {
   return n;
 }
 
-/** Effective trading mode — 'live' requires POLYMARKET_API_KEY env. */
+/** Effective trading mode — 'live' requires POLY_PRIVATE_KEY env. */
 export async function getTradingMode(): Promise<'simulate' | 'live'> {
   const stored = (await readValue('trading_mode')) ?? 'simulate';
   const requested: 'simulate' | 'live' = stored === 'live' ? 'live' : 'simulate';
-  const hasKey = !!(process.env['POLYMARKET_API_KEY'] && process.env['POLY_PRIVATE_KEY']);
+  const hasKey = !!process.env['POLY_PRIVATE_KEY'];
   return requested === 'live' && hasKey ? 'live' : 'simulate';
 }
 

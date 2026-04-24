@@ -10,7 +10,9 @@
     "./orderPlacement":          "./src/orderPlacement.ts",
     "./PolymarketClobExecutor":  "./src/PolymarketClobExecutor.ts",
     "./TelegramService":         "./src/TelegramService.ts",
+    "./telegramChannels":        "./src/telegramChannels.ts",
     "./settings":                "./src/settings.ts",
+    "./retry":                   "./src/retry.ts",
     "./logger":                  "./src/observability/logger.ts"
   },
   "scripts": {

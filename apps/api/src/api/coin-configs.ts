@@ -22,10 +22,12 @@ const DEFAULT_CONFIG: CoinConfig = {
   mode:                  'signal_only',
   streak_min:            3,
   auto_order_min_streak: 5,
+  auto_schedule:         [],
   size_usdc:             5,
   limit_price_cents:     54,
   tp_cents:              75,
   sl_cents:              25,
+  dca_multiplier:        1.5,
 };
 
 /** GET /api/coin-configs → array of { symbol, ...config } for all 7 coins. */
@@ -44,16 +46,24 @@ export async function listCoinConfigs(_req: Request, res: Response): Promise<voi
 
 // ── PUT /api/coin-configs/:symbol ─────────────────────────────────────────
 
+const autoScheduleEntrySchema = z.object({
+  start_hour:     z.number().int().min(0).max(23),
+  duration_hours: z.number().int().min(1).max(24),
+  threshold:      z.number().int().min(1).max(20),
+}).strict();
+
 const patchSchema = z.object({
   enabled:               z.boolean().optional(),
   strategy:              z.enum(['streak']).optional(),
   mode:                  z.enum(['signal_only', 'signal_and_order']).optional(),
   streak_min:            z.number().int().min(1).max(20).optional(),
   auto_order_min_streak: z.number().int().min(1).max(20).optional(),
+  auto_schedule:         z.array(autoScheduleEntrySchema).max(8).optional(),
   size_usdc:             z.number().positive().max(10_000).optional(),
   limit_price_cents:     z.number().int().min(1).max(99).optional(),
   tp_cents:              z.number().int().min(1).max(99).optional(),
   sl_cents:              z.number().int().min(1).max(99).optional(),
+  dca_multiplier:        z.number().min(1.0).max(10.0).optional(),
 }).strict();
 
 export async function updateCoinConfigHandler(

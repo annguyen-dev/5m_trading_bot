@@ -1,664 +1,779 @@
 /**
- * SettingsPage — runtime config for the trading bot.
+ * SettingsPage — bot configuration.
  *
- * Currently-supported keys (backend whitelist in api/settings.ts):
- *   trading_mode            'simulate' | 'live'
- *   signal_min_streak       integer 1-10 — min |streak| to emit a signal
- *   auto_order_min_streak   integer 1-10 — ≥ this streak → auto-place order
- *                                           (between signal_min and this →
- *                                            manual: signal shown, user clicks)
+ * Sections:
+ *   1. Per-coin strategy config  (backed by /api/coin-configs)
+ *   2. Telegram channels routing (backed by /api/telegram-channels)
  *
- * Invariants (enforced server-side):
- *   - live mode requires POLYMARKET_API_KEY env
- *   - auto_order_min_streak ≥ signal_min_streak
+ * Each section is independently loaded and saved.
  */
 import React, { useCallback, useEffect, useState } from 'react';
-import { api, type SettingsResponse } from '../api/client.js';
+import {
+  api,
+  type CoinConfigRow, type CoinMode, type AutoScheduleEntry,
+  type TelegramChannel, type TelegramInfoType, type CoinSymbol,
+} from '../api/client.js';
 
-const STREAK_MIN = 1;
-const STREAK_MAX = 10;
-const LIMIT_PRICE_MIN = 1;
-const LIMIT_PRICE_MAX = 99;
-const USDC_MAX = 100;
+const ALL_COINS: CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB'];
 
 export default function SettingsPage() {
-  const [settings, setSettings] = useState<SettingsResponse | null>(null);
-  const [error,    setError]    = useState<string | null>(null);
+  const [rows,  setRows]  = useState<CoinConfigRow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    try { setSettings(await api.getSettings()); setError(null); }
+    try { setRows(await api.getCoinConfigs()); setError(null); }
     catch (e) { setError(String(e)); }
   }, []);
   useEffect(() => { load(); }, [load]);
 
-  if (!settings) {
-    return (
-      <div style={S.page}>
-        <div style={S.heading}>Settings</div>
-        <div style={{ color: '#8b949e' }}>{error ?? 'Loading…'}</div>
-      </div>
-    );
-  }
-
   return (
     <div style={S.page}>
-      <div style={S.heading}>Settings</div>
+      <div style={S.heading}>Per-coin strategy config</div>
       <div style={S.subheading}>
-        Cấu hình runtime của bot. Thay đổi lưu ngay vào DB — engine sẽ đọc ở chu kỳ tiếp theo.
+        Enable/disable coins, set mode (signal-only vs auto-order), and tune
+        streak threshold + sizing per symbol. Streak strategy only for now.
       </div>
       {error && <div style={S.errorBar}>{error}</div>}
 
-      <TradingModeCard  settings={settings} onChanged={load} />
-      <StreakCard       settings={settings} onChanged={load} />
-      <SizeDcaCard      settings={settings} onChanged={load} />
-      <LimitPriceCard   settings={settings} onChanged={load} />
-      <TpSlCard         settings={settings} onChanged={load} />
-      <DcaCard          settings={settings} onChanged={load} />
-      <PanicCard        settings={settings} onChanged={load} />
-      <RulesExplainer   settings={settings} />
-      <DangerZoneCard />
+      {rows ? (
+        <>
+          <div style={S.tableWrap}>
+            <table style={S.table}>
+              <thead>
+                <tr>
+                  <th style={S.th}>Coin</th>
+                  <th style={S.th}>Enabled</th>
+                  <th style={S.th}>Mode</th>
+                  <th style={{ ...S.th, textAlign: 'right' }} title="Emit T+4 signal when |streak| ≥ this">Signal ≥</th>
+                  <th style={{ ...S.th, textAlign: 'right' }} title="Place order at T-30s when |streak| ≥ this">Auto ≥</th>
+                  <th style={{ ...S.th, textAlign: 'right' }}>Size $</th>
+                  <th style={{ ...S.th, textAlign: 'right' }}>Limit ¢</th>
+                  <th style={{ ...S.th, textAlign: 'right' }}>TP ¢</th>
+                  <th style={{ ...S.th, textAlign: 'right' }}>SL ¢</th>
+                  <th style={{ ...S.th, textAlign: 'right' }} title="DCA size = previous_loser_size × this. Default 1.5">DCA mult</th>
+                  <th style={S.th} title="Hour-of-day (UTC) overrides for Auto ≥. Empty = always use base.">Schedule</th>
+                  <th style={S.th}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map(row => (
+                  <CoinRow key={row.symbol} initial={row} onSaved={load} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div style={S.note}>
+            ℹ Worker sync coin list mỗi 5s — bật/tắt coin hoặc đổi mode/streak_min
+            sẽ có hiệu lực trong 1 tick tiếp theo, <strong>không cần restart</strong>.
+          </div>
+        </>
+      ) : (
+        <div style={{ color: '#8b949e' }}>Loading…</div>
+      )}
+
+      <TelegramChannelsSection />
     </div>
   );
 }
 
-// ────────────────────────────────────────────────────────────────────────────
+// ── Row ─────────────────────────────────────────────────────────────────────
 
-function TradingModeCard({
-  settings, onChanged,
+function CoinRow({
+  initial, onSaved,
 }: {
-  settings: SettingsResponse;
-  onChanged: () => void;
+  initial: CoinConfigRow;
+  onSaved: () => void;
 }) {
-  const [saving, setSaving] = useState(false);
-  const [err,    setErr]    = useState<string | null>(null);
+  const [draft,    setDraft]    = useState<CoinConfigRow>(initial);
+  const [saving,   setSaving]   = useState(false);
+  const [err,      setErr]      = useState<string | null>(null);
+  const [flash,    setFlash]    = useState(false);
+  const [expanded, setExpanded] = useState(false);
 
-  async function setMode(mode: 'simulate' | 'live') {
-    if (settings.effectiveTradingMode === mode) return;
-    setSaving(true); setErr(null);
-    try {
-      await api.updateSetting('trading_mode', mode);
-      onChanged();
-    } catch (e) {
-      setErr(String(e));
-    } finally { setSaving(false); }
-  }
+  useEffect(() => { setDraft(initial); }, [initial]);
 
-  const { effectiveTradingMode, hasPolymarketKey } = settings;
-  const stored = settings.settings['trading_mode'] ?? 'simulate';
-  const forced = stored === 'live' && !hasPolymarketKey;
+  // Array equality via JSON stringify is sufficient for the schedule shape
+  // (small, flat). Falls back to string compare, O(n) per row.
+  const scheduleDirty =
+    JSON.stringify(draft.auto_schedule ?? []) !== JSON.stringify(initial.auto_schedule ?? []);
 
-  return (
-    <div style={S.card}>
-      <div style={S.cardTitle}>Trading mode</div>
-      <div style={S.cardHint}>
-        Pool tiền được dùng khi đặt lệnh. Simulate = ghi DB không on-chain. Live = đặt lệnh
-        thật trên Polymarket (cần <code>POLYMARKET_API_KEY</code> + wallet — Phase 3).
-      </div>
-      <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
-        <button
-          onClick={() => setMode('simulate')}
-          disabled={saving}
-          style={{ ...S.pill, ...(effectiveTradingMode === 'simulate' ? S.pillActiveOrange : {}) }}
-        >Simulate</button>
-        <button
-          onClick={() => hasPolymarketKey && setMode('live')}
-          disabled={saving || !hasPolymarketKey}
-          title={hasPolymarketKey
-            ? 'Enable real trading on Polymarket'
-            : 'POLYMARKET_API_KEY not configured — live mode locked'}
-          style={{
-            ...S.pill,
-            ...(effectiveTradingMode === 'live' ? S.pillActiveGreen : {}),
-            cursor: hasPolymarketKey ? 'pointer' : 'not-allowed',
-            opacity: hasPolymarketKey ? 1 : 0.5,
-          }}
-        >Live</button>
-        <div style={{ flex: 1 }} />
-        <span style={{ fontSize: 12, color: '#8b949e', alignSelf: 'center' }}>
-          Stored: <code>{stored}</code> · Effective: <code>{effectiveTradingMode}</code>
-          {forced && <span style={{ color: '#f0a500', marginLeft: 8 }}>⚠ forced to simulate</span>}
-        </span>
-      </div>
-      {err && <div style={S.fieldError}>{err}</div>}
-    </div>
+  const dirty =
+       draft.enabled               !== initial.enabled
+    || draft.mode                  !== initial.mode
+    || draft.streak_min            !== initial.streak_min
+    || draft.auto_order_min_streak !== initial.auto_order_min_streak
+    || draft.size_usdc             !== initial.size_usdc
+    || draft.limit_price_cents     !== initial.limit_price_cents
+    || draft.tp_cents              !== initial.tp_cents
+    || draft.sl_cents              !== initial.sl_cents
+    || draft.dca_multiplier        !== initial.dca_multiplier
+    || scheduleDirty;
+
+  const scheduleValid = (draft.auto_schedule ?? []).every(e =>
+       Number.isInteger(e.start_hour)     && e.start_hour     >= 0 && e.start_hour     <= 23
+    && Number.isInteger(e.duration_hours) && e.duration_hours >= 1 && e.duration_hours <= 24
+    && Number.isInteger(e.threshold)      && e.threshold      >= 1 && e.threshold      <= 20,
   );
-}
 
-// ────────────────────────────────────────────────────────────────────────────
-
-function StreakCard({
-  settings, onChanged,
-}: {
-  settings: SettingsResponse;
-  onChanged: () => void;
-}) {
-  const signalStored = Number(settings.settings['signal_min_streak']     ?? 3);
-  const autoStored   = Number(settings.settings['auto_order_min_streak'] ?? 4);
-
-  return (
-    <div style={S.card}>
-      <div style={S.cardTitle}>Signal trigger theo 5m streak</div>
-      <div style={S.cardHint}>
-        Bot theo dõi số nến 5m liên tiếp cùng chiều (|streak|). Khi |streak| vượt ngưỡng bên dưới,
-        engine sẽ emit signal và (nếu đủ lớn) đặt lệnh tự động.
-      </div>
-
-      <StreakField
-        label="Min streak để emit signal"
-        fieldKey="signal_min_streak"
-        initial={signalStored}
-        helper="Dưới ngưỡng này → không emit signal, không có lệnh."
-        onSaved={onChanged}
-      />
-
-      <StreakField
-        label="Min streak để đặt AUTO order"
-        fieldKey="auto_order_min_streak"
-        initial={autoStored}
-        helper="Từ ngưỡng này trở lên → engine đặt lệnh tự động. Giữa signal_min và auto_order_min → lệnh MANUAL (user click)."
-        onSaved={onChanged}
-      />
-    </div>
-  );
-}
-
-function StreakField({
-  label, fieldKey, initial, helper, onSaved,
-}: {
-  label:    string;
-  fieldKey: 'signal_min_streak' | 'auto_order_min_streak';
-  initial:  number;
-  helper:   string;
-  onSaved:  () => void;
-}) {
-  return (
-    <IntegerField
-      label={label} fieldKey={fieldKey} initial={initial}
-      min={STREAK_MIN} max={STREAK_MAX} step={1}
-      suffix="" helper={helper} onSaved={onSaved}
-    />
-  );
-}
-
-function IntegerField({
-  label, fieldKey, initial, min, max, step, suffix, helper, onSaved,
-}: {
-  label:    string;
-  fieldKey: string;
-  initial:  number;
-  min:      number;
-  max:      number;
-  step:     number;
-  suffix:   string;
-  helper:   string;
-  onSaved:  () => void;
-}) {
-  const [value, setValue] = useState(initial);
-  const [saving, setSaving] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const [savedFlash, setSavedFlash] = useState(false);
-
-  useEffect(() => { setValue(initial); }, [initial]);
-
-  const dirty = value !== initial;
-  const inRange = value >= min && value <= max && Number.isInteger(value);
+  const valid =
+       draft.streak_min            >= 1 && draft.streak_min            <= 20
+    && draft.auto_order_min_streak >= 1 && draft.auto_order_min_streak <= 20
+    && draft.size_usdc              > 0 && draft.size_usdc            <= 10_000
+    && draft.limit_price_cents     >= 1 && draft.limit_price_cents     <= 99
+    && draft.tp_cents              >= 1 && draft.tp_cents              <= 99
+    && draft.sl_cents              >= 1 && draft.sl_cents              <= 99
+    && draft.dca_multiplier        >= 1.0 && draft.dca_multiplier      <= 10.0
+    && draft.tp_cents > draft.sl_cents
+    && draft.auto_order_min_streak >= draft.streak_min
+    && scheduleValid;
 
   async function save() {
-    if (!dirty || !inRange) return;
+    if (!dirty || !valid) return;
     setSaving(true); setErr(null);
     try {
-      await api.updateSetting(fieldKey, String(value));
-      setSavedFlash(true);
-      setTimeout(() => setSavedFlash(false), 1500);
+      await api.updateCoinConfig(draft.symbol, {
+        enabled:               draft.enabled,
+        mode:                  draft.mode,
+        streak_min:            draft.streak_min,
+        auto_order_min_streak: draft.auto_order_min_streak,
+        auto_schedule:         draft.auto_schedule ?? [],
+        size_usdc:             draft.size_usdc,
+        limit_price_cents:     draft.limit_price_cents,
+        tp_cents:              draft.tp_cents,
+        sl_cents:              draft.sl_cents,
+        dca_multiplier:        draft.dca_multiplier,
+      });
+      setFlash(true);
+      setTimeout(() => setFlash(false), 1500);
       onSaved();
     } catch (e) {
       setErr(String(e).replace(/^Error: API [^:]+: \d+: /, ''));
     } finally { setSaving(false); }
   }
 
+  const rowBg = draft.enabled ? '#0d1117' : '#0a0d12';
+
   return (
-    <div style={S.field}>
-      <div style={S.fieldLabel}>{label}</div>
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 4 }}>
-        <button style={S.qtyBtn}
-                onClick={() => setValue(v => Math.max(min, v - step))}
-                disabled={saving}>-</button>
-        <input
-          type="number"
-          min={min} max={max} step={step}
-          value={Number.isNaN(value) ? '' : value}
-          onChange={e => setValue(Number(e.target.value))}
-          style={{ ...S.qtyInput, borderColor: inRange ? '#30363d' : '#f85149' }}
-          disabled={saving}
-        />
-        {suffix && <span style={{ fontSize: 13, color: '#8b949e' }}>{suffix}</span>}
-        <button style={S.qtyBtn}
-                onClick={() => setValue(v => Math.min(max, v + step))}
-                disabled={saving}>+</button>
+    <>
+      <tr style={{ background: rowBg }}>
+        <td style={{ ...S.td, fontWeight: 600, color: draft.enabled ? '#c9d1d9' : '#6e7681' }}>
+          {draft.symbol}
+        </td>
+        <td style={S.td}>
+          <Toggle
+            checked={draft.enabled}
+            onChange={v => setDraft({ ...draft, enabled: v })}
+            disabled={saving}
+          />
+        </td>
+        <td style={S.td}>
+          <select
+            value={draft.mode}
+            onChange={e => setDraft({ ...draft, mode: e.target.value as CoinMode })}
+            disabled={saving || !draft.enabled}
+            style={S.select}
+          >
+            <option value="signal_only">signal_only</option>
+            <option value="signal_and_order">signal_and_order</option>
+          </select>
+        </td>
+        <td style={{ ...S.td, textAlign: 'right' }}>
+          <NumInput
+            value={draft.streak_min}
+            min={1} max={20}
+            disabled={saving || !draft.enabled}
+            onChange={v => setDraft({ ...draft, streak_min: v })}
+          />
+        </td>
+        <td style={{ ...S.td, textAlign: 'right' }}>
+          <NumInput
+            value={draft.auto_order_min_streak}
+            min={1} max={20}
+            disabled={saving || !draft.enabled}
+            onChange={v => setDraft({ ...draft, auto_order_min_streak: v })}
+          />
+        </td>
+        <td style={{ ...S.td, textAlign: 'right' }}>
+          <NumInput
+            value={draft.size_usdc}
+            min={1} max={10_000}
+            disabled={saving || !draft.enabled}
+            onChange={v => setDraft({ ...draft, size_usdc: v })}
+          />
+        </td>
+        <td style={{ ...S.td, textAlign: 'right' }}>
+          <NumInput
+            value={draft.limit_price_cents}
+            min={1} max={99}
+            disabled={saving || !draft.enabled}
+            onChange={v => setDraft({ ...draft, limit_price_cents: v })}
+          />
+        </td>
+        <td style={{ ...S.td, textAlign: 'right' }}>
+          <NumInput
+            value={draft.tp_cents}
+            min={1} max={99}
+            disabled={saving || !draft.enabled}
+            onChange={v => setDraft({ ...draft, tp_cents: v })}
+          />
+        </td>
+        <td style={{ ...S.td, textAlign: 'right' }}>
+          <NumInput
+            value={draft.sl_cents}
+            min={1} max={99}
+            disabled={saving || !draft.enabled}
+            onChange={v => setDraft({ ...draft, sl_cents: v })}
+          />
+        </td>
+        <td style={{ ...S.td, textAlign: 'right' }}>
+          <NumInput
+            value={draft.dca_multiplier}
+            min={1.0} max={10.0} step={0.1}
+            disabled={saving || !draft.enabled}
+            onChange={v => setDraft({ ...draft, dca_multiplier: v })}
+          />
+        </td>
+        <td style={S.td}>
+          <button
+            onClick={() => setExpanded(!expanded)}
+            disabled={saving || !draft.enabled}
+            style={{
+              ...S.scheduleBtn,
+              borderColor: scheduleDirty ? '#58a6ff' : '#30363d',
+              color: (draft.auto_schedule?.length ?? 0) > 0 ? '#c9d1d9' : '#6e7681',
+            }}
+            title={scheduleTitle(draft.auto_schedule ?? [])}
+          >
+            {expanded ? '▾' : '▸'}
+            &nbsp;{scheduleSummary(draft.auto_schedule ?? [])}
+          </button>
+        </td>
+        <td style={S.td}>
+          <button
+            onClick={save}
+            disabled={!dirty || !valid || saving}
+            style={{
+              ...S.saveBtn,
+              background: dirty && valid ? '#1f6feb' : '#21262d',
+              color:      dirty && valid ? '#fff' : '#8b949e',
+              cursor:     dirty && valid && !saving ? 'pointer' : 'not-allowed',
+            }}
+          >
+            {saving ? '…' : dirty ? 'Save' : (flash ? '✓' : '—')}
+          </button>
+        </td>
+      </tr>
+      {expanded && (
+        <tr style={{ background: '#0a0d12' }}>
+          <td colSpan={12} style={{ padding: '12px 24px', borderBottom: '1px solid #21262d' }}>
+            <ScheduleEditor
+              value={draft.auto_schedule ?? []}
+              baseThreshold={draft.auto_order_min_streak}
+              disabled={saving || !draft.enabled}
+              onChange={s => setDraft({ ...draft, auto_schedule: s })}
+            />
+          </td>
+        </tr>
+      )}
+      {err && (
+        <tr>
+          <td colSpan={12} style={{ ...S.td, color: '#f85149', fontSize: 11 }}>
+            {err}
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+// ── Schedule editor ─────────────────────────────────────────────────────────
+
+// User picks hours in LOCAL timezone. Backend stores UTC (bot checks
+// `new Date().getUTCHours()`). Integer offset assumed — fractional timezones
+// (e.g. India +5:30) round to nearest hour for display; bot still fires on
+// the UTC boundary.
+const TZ_HOURS = Math.round(-new Date().getTimezoneOffset() / 60);
+const TZ_LABEL = `UTC${TZ_HOURS >= 0 ? '+' : ''}${TZ_HOURS}`;
+
+function utcToLocalHour(utc: number): number {
+  return ((utc + TZ_HOURS) % 24 + 24) % 24;
+}
+function localToUtcHour(local: number): number {
+  return ((local - TZ_HOURS) % 24 + 24) % 24;
+}
+
+/** Compact summary shown on the Schedule column button. "—" | "08-10h→3" | "2 rules". */
+function scheduleSummary(entries: AutoScheduleEntry[]): string {
+  if (!entries.length) return '—';
+  if (entries.length === 1) {
+    const e = entries[0]!;
+    const sLocal = utcToLocalHour(e.start_hour);
+    const eLocal = (sLocal + e.duration_hours) % 24;
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${pad(sLocal)}-${pad(eLocal)}h→${e.threshold}`;
+  }
+  return `${entries.length} rules`;
+}
+
+/** Tooltip lists each rule in local time so the user doesn't have to expand. */
+function scheduleTitle(entries: AutoScheduleEntry[]): string {
+  if (!entries.length) return 'No schedule — base threshold used all day';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return entries.map(e => {
+    const sLocal = utcToLocalHour(e.start_hour);
+    const eLocal = (sLocal + e.duration_hours) % 24;
+    return `${pad(sLocal)}-${pad(eLocal)}h (${TZ_LABEL}) → Auto ≥ ${e.threshold}`;
+  }).join('\n');
+}
+
+function ScheduleEditor({
+  value, baseThreshold, onChange, disabled,
+}: {
+  value:         AutoScheduleEntry[];
+  baseThreshold: number;
+  onChange:      (next: AutoScheduleEntry[]) => void;
+  disabled?:     boolean;
+}) {
+  const add = () => onChange([
+    ...value,
+    {
+      // Default: "now" in local time → convert to UTC for storage.
+      start_hour: localToUtcHour(new Date().getHours()),
+      duration_hours: 2,
+      threshold: Math.max(1, baseThreshold - 2),
+    },
+  ]);
+  const removeAt = (i: number) => onChange(value.filter((_, idx) => idx !== i));
+  const patchAt = (i: number, patch: Partial<AutoScheduleEntry>) =>
+    onChange(value.map((e, idx) => idx === i ? { ...e, ...patch } : e));
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ fontSize: 12, color: '#8b949e' }}>
+        Hour-of-day (<b>{TZ_LABEL}</b>, your local time) overrides for <b>Auto ≥</b>.
+        Each rule: during the window, use <b>threshold</b> instead of the base
+        value ({baseThreshold}). Ranges wrap midnight (e.g. 22h + 4h covers 22, 23,
+        00, 01). First match wins. Stored internally as UTC.
+      </div>
+      {value.length === 0 && (
+        <div style={{ fontSize: 12, color: '#6e7681', fontStyle: 'italic' }}>
+          No rules — base <b>Auto ≥ {baseThreshold}</b> used all day.
+        </div>
+      )}
+      {value.length > 0 && (
+        <table style={{ ...S.table, maxWidth: 620 }}>
+          <thead>
+            <tr>
+              <th style={{ ...S.th, textAlign: 'right' }} title="0-23 local">Start h ({TZ_LABEL})</th>
+              <th style={{ ...S.th, textAlign: 'right' }} title="1-24">Duration (h)</th>
+              <th style={{ ...S.th, textAlign: 'right' }} title="1-20">Threshold (Auto ≥)</th>
+              <th style={{ ...S.th, width: 40 }}></th>
+            </tr>
+          </thead>
+          <tbody>
+            {value.map((entry, i) => {
+              const startLocal = utcToLocalHour(entry.start_hour);
+              const endLocal   = (startLocal + entry.duration_hours) % 24;
+              const endUtc     = (entry.start_hour + entry.duration_hours) % 24;
+              return (
+                <tr key={i}>
+                  <td style={{ ...S.td, textAlign: 'right' }}>
+                    <NumInput
+                      value={startLocal} min={0} max={23}
+                      disabled={disabled}
+                      onChange={v => patchAt(i, { start_hour: localToUtcHour(v) })}
+                    />
+                    <span style={{ fontSize: 11, color: '#6e7681', marginLeft: 6 }}>
+                      → {String(endLocal).padStart(2, '0')}h
+                      <span style={{ color: '#484f58', marginLeft: 6 }}>
+                        (UTC {String(entry.start_hour).padStart(2, '0')}-{String(endUtc).padStart(2, '0')})
+                      </span>
+                    </span>
+                  </td>
+                  <td style={{ ...S.td, textAlign: 'right' }}>
+                    <NumInput
+                      value={entry.duration_hours} min={1} max={24}
+                      disabled={disabled}
+                      onChange={v => patchAt(i, { duration_hours: v })}
+                    />
+                  </td>
+                  <td style={{ ...S.td, textAlign: 'right' }}>
+                    <NumInput
+                      value={entry.threshold} min={1} max={20}
+                      disabled={disabled}
+                      onChange={v => patchAt(i, { threshold: v })}
+                    />
+                  </td>
+                  <td style={S.td}>
+                    <button
+                      onClick={() => removeAt(i)}
+                      disabled={disabled}
+                      style={S.removeBtn}
+                      title="Remove rule"
+                    >×</button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+      <div>
         <button
-          onClick={save}
-          disabled={!dirty || !inRange || saving}
-          style={{
-            ...S.saveBtn,
-            background: dirty && inRange ? '#1f6feb' : '#21262d',
-            color:      dirty && inRange ? '#fff' : '#8b949e',
-            cursor:     dirty && inRange && !saving ? 'pointer' : 'not-allowed',
-          }}
+          onClick={add}
+          disabled={disabled || value.length >= 8}
+          style={S.addBtn}
         >
-          {saving ? 'Saving…' : dirty ? 'Save' : (savedFlash ? '✓ Saved' : '—')}
+          + Add rule
         </button>
-        <span style={{ fontSize: 11, color: '#8b949e' }}>
-          stored: <code>{initial}{suffix}</code>
-        </span>
+        {value.length >= 8 && (
+          <span style={{ fontSize: 11, color: '#6e7681', marginLeft: 8 }}>(max 8)</span>
+        )}
       </div>
-      <div style={S.fieldHint}>{helper}</div>
-      {err && <div style={S.fieldError}>{err}</div>}
     </div>
   );
 }
 
-// ────────────────────────────────────────────────────────────────────────────
+// ── Tiny inputs ─────────────────────────────────────────────────────────────
 
-function LimitPriceCard({
-  settings, onChanged,
+function Toggle({
+  checked, onChange, disabled,
 }: {
-  settings: SettingsResponse;
-  onChanged: () => void;
+  checked: boolean; onChange: (v: boolean) => void; disabled?: boolean;
 }) {
-  const stored = Number(settings.settings['auto_order_limit_price_cents'] ?? 55);
   return (
-    <div style={S.card}>
-      <div style={S.cardTitle}>Auto order — Limit price (entry)</div>
-      <div style={S.cardHint}>
-        Khi signal ≥ auto threshold, engine check giá best_ask hiện tại với limit này:
-        {' '}≤ limit → đặt lệnh ở best_ask; &gt; limit → SKIP (giá quá đắt).
-      </div>
-
-      <IntegerField
-        label="Max giá để auto mua"
-        fieldKey="auto_order_limit_price_cents"
-        initial={stored}
-        min={LIMIT_PRICE_MIN} max={LIMIT_PRICE_MAX} step={1}
-        suffix="¢"
-        helper="VD: 55 = chỉ auto mua nếu ask ≤ 55¢."
-        onSaved={onChanged}
-      />
-    </div>
+    <button
+      onClick={() => onChange(!checked)}
+      disabled={disabled}
+      style={{
+        width: 36, height: 20, borderRadius: 10, border: 'none',
+        background: checked ? '#3fb950' : '#30363d',
+        position: 'relative', cursor: disabled ? 'not-allowed' : 'pointer',
+        transition: 'background 0.15s',
+      }}
+    >
+      <span style={{
+        position: 'absolute', top: 2, left: checked ? 18 : 2,
+        width: 16, height: 16, borderRadius: 8, background: '#fff',
+        transition: 'left 0.15s',
+      }} />
+    </button>
   );
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-
-function TpSlCard({
-  settings, onChanged,
+function NumInput({
+  value, onChange, min, max, step, disabled,
 }: {
-  settings: SettingsResponse;
-  onChanged: () => void;
+  value: number; onChange: (v: number) => void;
+  min: number; max: number; step?: number; disabled?: boolean;
 }) {
-  const tp = Number(settings.settings['auto_order_tp_cents'] ?? 75);
-  const sl = Number(settings.settings['auto_order_sl_cents'] ?? 25);
+  const inRange = value >= min && value <= max && Number.isFinite(value);
   return (
-    <div style={S.card}>
-      <div style={S.cardTitle}>Take Profit / Stop Loss (exit)</div>
-      <div style={S.cardHint}>
-        Áp dụng cho <strong>tất cả</strong> pending sim orders (manual + auto).
-        OrderResolver poll mỗi 5s, khi bestBid của direction mình giữ chạm ngưỡng:
-        ≥ TP → bán chốt lời; ≤ SL → bán cắt lỗ. Không hit thì đóng theo resolution lúc window end.
-        Invariant: TP &gt; SL. Set TP=99 hoặc SL=1 để effectively disable.
-      </div>
-
-      <IntegerField
-        label="Take Profit (TP)"
-        fieldKey="auto_order_tp_cents"
-        initial={tp}
-        min={LIMIT_PRICE_MIN} max={LIMIT_PRICE_MAX} step={1}
-        suffix="¢"
-        helper="VD 75 = bán chốt lời khi bestBid ≥ 75¢. Share @ 75¢ → market 75% confident theo mình."
-        onSaved={onChanged}
-      />
-      <IntegerField
-        label="Stop Loss (SL)"
-        fieldKey="auto_order_sl_cents"
-        initial={sl}
-        min={LIMIT_PRICE_MIN} max={LIMIT_PRICE_MAX} step={1}
-        suffix="¢"
-        helper="VD 25 = bán cắt lỗ khi bestBid ≤ 25¢. Share @ 25¢ → market 75% confident ngược mình → recovery khó."
-        onSaved={onChanged}
-      />
-
-      <div style={{ marginTop: 12, padding: 10, background: '#0d1117', borderRadius: 4,
-                    fontSize: 11, color: '#8b949e', lineHeight: 1.6 }}>
-        <strong style={{ color: '#c9d1d9' }}>Payoff example</strong> — buy UP @ 45¢, 10 shares:
-        <br />
-        {' '}• TP @ {tp}¢ hit → sell {tp}¢ → <span style={{ color: '#3fb950' }}>PnL = +${((tp/100 - 0.45) * 10).toFixed(2)}</span>
-        <br />
-        {' '}• SL @ {sl}¢ hit → sell {sl}¢ → <span style={{ color: '#f85149' }}>PnL = ${((sl/100 - 0.45) * 10).toFixed(2)}</span>
-        <br />
-        {' '}• Hold to close + win → $1.00 → <span style={{ color: '#3fb950' }}>PnL = +${(1.00 - 0.45) * 10}</span>
-        <br />
-        {' '}• Hold to close + lose → $0.00 → <span style={{ color: '#f85149' }}>PnL = -$4.50</span>
-      </div>
-    </div>
+    <input
+      type="number"
+      min={min} max={max} step={step ?? 1}
+      value={Number.isNaN(value) ? '' : value}
+      onChange={e => onChange(Number(e.target.value))}
+      disabled={disabled}
+      style={{
+        ...S.numInput,
+        borderColor: inRange ? '#30363d' : '#f85149',
+        opacity: disabled ? 0.5 : 1,
+      }}
+    />
   );
 }
 
-// ────────────────────────────────────────────────────────────────────────────
+// ── Telegram channels section ─────────────────────────────────────────────
 
-function SizeDcaCard({
-  settings, onChanged,
-}: {
-  settings: SettingsResponse;
-  onChanged: () => void;
-}) {
-  const base = Number(settings.settings['auto_order_base_size_usdc'] ?? 5);
-  const step = Number(settings.settings['auto_order_dca_step_usdc']  ?? 5);
-
-  // Preview first 6 orders of a losing streak
-  const preview: number[] = [];
-  for (let i = 0; i < 6; i++) preview.push(Math.min(base + step * i, 100));
-
-  return (
-    <div style={S.card}>
-      <div style={S.cardTitle}>Order size + DCA (Path A)</div>
-      <div style={S.cardHint}>
-        <strong>Base size</strong>: USDC mỗi lệnh khi không có loss trước đó (reset sau WIN).
-        <br />
-        <strong>DCA step</strong>: cộng thêm bao nhiêu USDC cho mỗi loss Path A liên tiếp. Set = 0 để tắt DCA.
-        <br />
-        Công thức: <code>size = base + step × consecutive_losses</code> (cap $100, chỉ đếm Path A auto + closed).
-        <br />
-        <strong>Chỉ áp dụng cho Path A</strong>. Path B luôn dùng base size (đã có risk asymmetry sẵn).
-      </div>
-
-      <IntegerField
-        label="Base size"
-        fieldKey="auto_order_base_size_usdc"
-        initial={base}
-        min={1} max={USDC_MAX} step={1}
-        suffix="$"
-        helper="VD 5 = mỗi lệnh base $5. Reset sau mỗi WIN."
-        onSaved={onChanged}
-      />
-      <IntegerField
-        label="DCA step"
-        fieldKey="auto_order_dca_step_usdc"
-        initial={step}
-        min={0} max={USDC_MAX} step={1}
-        suffix="$"
-        helper="VD 5 = sau mỗi loss cộng thêm $5. Set 0 = tắt DCA (always base size)."
-        onSaved={onChanged}
-      />
-
-      <div style={{ marginTop: 12, padding: 10, background: '#0d1117', borderRadius: 4,
-                    fontSize: 11, color: '#8b949e', lineHeight: 1.6 }}>
-        <strong style={{ color: '#c9d1d9' }}>Preview</strong> — liên tiếp loss, size Path A sẽ là:
-        <br />
-        <span style={{ fontFamily: 'monospace' }}>
-          {preview.map((s, i) => (
-            <span key={i}>
-              {i > 0 && ' → '}
-              <span style={{ color: s >= 100 ? '#f85149' : '#c9d1d9' }}>${s}</span>
-            </span>
-          ))}
-          {step > 0 && ' → …'}
-          {step === 0 && ' (DCA disabled)'}
-        </span>
-      </div>
-    </div>
-  );
+function uid(): string {
+  // lightweight id; fine for local row keys + server uniqueness check
+  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 }
 
-function DcaCard({
-  settings, onChanged,
-}: {
-  settings: SettingsResponse;
-  onChanged: () => void;
-}) {
-  const max  = Number(settings.settings['dca_max_entry_cents'] ?? 40);
-  const base = Number(settings.settings['auto_order_base_size_usdc'] ?? 5);
-  const tp   = Number(settings.settings['auto_order_tp_cents']   ?? 75);
-  return (
-    <div style={S.card}>
-      <div style={S.cardTitle}>DCA — average down existing BOUNDARY position</div>
-      <div style={S.cardHint}>
-        <strong>Trigger</strong>: đã có pending BOUNDARY BUY cho current window (auto, từ boundary trước),
-        rồi ask của held direction sụt ≤ max entry (default 40¢) + còn &gt; 1m30s.
-        <br />
-        <strong>Action</strong>: mua thêm (market) với size = base_size để giảm avg entry.
-        <br />
-        <strong>Exit</strong>: TP inherit từ global (75¢) — profit together với parent BOUNDARY. Không SL
-        (add rồi cut lỗ sẽ negate averaging-down). Fire tối đa 1 lần / market.
-      </div>
+function TelegramChannelsSection() {
+  const [draft,  setDraft]  = useState<TelegramChannel[] | null>(null);
+  const [saved,  setSaved]  = useState<TelegramChannel[] | null>(null);  // last server state, for dirty compare
+  const [err,    setErr]    = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [flash,  setFlash]  = useState(false);
 
-      <IntegerField
-        label="Max entry (¢)"
-        fieldKey="dca_max_entry_cents"
-        initial={max}
-        min={LIMIT_PRICE_MIN} max={LIMIT_PRICE_MAX} step={1}
-        suffix="¢"
-        helper="VD 40 = trigger DCA-add nếu ask sụt xuống ≤ 40¢ (từ entry thường ~50¢)."
-        onSaved={onChanged}
-      />
-
-      <div style={{ marginTop: 12, padding: 10, background: '#0d1117', borderRadius: 4,
-                    fontSize: 11, color: '#8b949e', lineHeight: 1.6 }}>
-        <strong style={{ color: '#c9d1d9' }}>DCA example</strong>:
-        <br />
-        {' '}Parent BOUNDARY: BUY @ 52¢, size $5 = 9.6 shares
-        <br />
-        {' '}Price drops to {max}¢ mid-window → DCA fires
-        <br />
-        {' '}DCA: BUY @ {max}¢, size ${base} = {(base / (max/100)).toFixed(1)} shares
-        <br />
-        {' '}Combined: {(9.6 + base / (max/100)).toFixed(1)} shares @ avg {((52*9.6 + max*base/(max/100)) / (9.6 + base/(max/100))).toFixed(1)}¢
-        <br />
-        {' '}If price recovers to {tp}¢ → <span style={{ color: '#3fb950' }}>both TP</span>, combined PnL ≈
-        +${((tp/100 - 0.52) * 9.6 + (tp/100 - max/100) * (base/(max/100))).toFixed(2)}
-      </div>
-    </div>
-  );
-}
-
-function PanicCard({
-  settings, onChanged,
-}: {
-  settings: SettingsResponse;
-  onChanged: () => void;
-}) {
-  const entry   = Number(settings.settings['panic_entry_cents']    ?? 5);
-  const tp      = Number(settings.settings['panic_tp_cents']       ?? 20);
-  const winS    = Number(settings.settings['panic_first_window_s'] ?? 180);
-  const base    = Number(settings.settings['auto_order_base_size_usdc'] ?? 5);
-  const signalMin = Number(settings.settings['signal_min_streak']      ?? 3);
-  const autoMin   = Number(settings.settings['auto_order_min_streak']  ?? 4);
-  const shares = entry > 0 ? base / (entry / 100) : 0;
-  const proceed = shares * (tp / 100);
-  const pnl = proceed - base;
-  return (
-    <div style={S.card}>
-      <div style={S.cardTitle}>PANIC — bottom-fishing current window (momentum)</div>
-      <div style={S.cardHint}>
-        <strong>When</strong>: streak sits in the gap [{signalMin}, {autoMin}) — signal exists
-        nhưng BOUNDARY KHÔNG fire cho next window. Trong first {Math.round(winS / 60)}m của current window,
-        ask của hướng streak sụt ≤ entry (default {entry}¢) → market BUY hướng đó.
-        <br />
-        <strong>Logic</strong>: vd streak +2 UP closed, mid-window dump mạnh làm UP token crash
-        xuống {entry}¢. Bet rằng BTC hồi lên, UP token đóng cao. <strong>Momentum</strong>, không contrarian.
-        <br />
-        <strong>Exit</strong>: limit SELL @ panic TP ({tp}¢). Không SL. Fire tối đa 1 lần / market.
-      </div>
-
-      <IntegerField
-        label="Entry (¢)"
-        fieldKey="panic_entry_cents"
-        initial={entry}
-        min={1} max={50} step={1}
-        suffix="¢"
-        helper={`Mua khi streak-side ask ≤ giá này. Thấp = đáy sâu hơn = ít fire hơn.`}
-        onSaved={onChanged}
-      />
-      <IntegerField
-        label="TP (¢)"
-        fieldKey="panic_tp_cents"
-        initial={tp}
-        min={2} max={99} step={1}
-        suffix="¢"
-        helper="Limit SELL exit. Phải > entry."
-        onSaved={onChanged}
-      />
-      <IntegerField
-        label="First window (s)"
-        fieldKey="panic_first_window_s"
-        initial={winS}
-        min={30} max={270} step={10}
-        suffix="s"
-        helper="Chỉ fire trong X giây đầu của window (cần thời gian hồi giá)."
-        onSaved={onChanged}
-      />
-
-      <div style={{ marginTop: 12, padding: 10, background: '#0d1117', borderRadius: 4,
-                    fontSize: 11, color: '#8b949e', lineHeight: 1.6 }}>
-        <strong style={{ color: '#c9d1d9' }}>PANIC example</strong> (streak +2 UP, auto_min=3):
-        <br />
-        {' '}First {Math.round(winS / 60)}m mid-window, UP ask crash xuống {entry}¢
-        <br />
-        {' '}→ Panic BUY UP @ {entry}¢, size ${base} = {shares.toFixed(1)} shares
-        <br />
-        {' '}→ Hồi lên {tp}¢ trong window → TP fill, nhận ${proceed.toFixed(2)}, PnL&nbsp;
-        <span style={{ color: pnl >= 0 ? '#3fb950' : '#f85149' }}>
-          {pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}
-        </span>
-        <br />
-        {' '}→ Nếu BTC resolve UP (share=$1) dù chưa fill TP → nhận ${shares.toFixed(2)}
-      </div>
-    </div>
-  );
-}
-
-function DangerZoneCard() {
-  const [busy,    setBusy]    = useState(false);
-  const [result,  setResult]  = useState<string | null>(null);
-  const [error,   setError]   = useState<string | null>(null);
-
-  async function reset() {
-    const ok = window.confirm(
-      'Xoá TẤT CẢ orders trong simulate + backtest mode?\n\n' +
-      'Live orders sẽ KHÔNG bị xoá.\n' +
-      'Hành động không thể undo.'
-    );
-    if (!ok) return;
-    setBusy(true); setError(null); setResult(null);
+  const load = useCallback(async () => {
     try {
-      const r = await api.resetTestData();
-      setResult(`✓ Đã xoá ${r.deleted} orders. ${r.kept_live} live orders giữ nguyên.`);
+      const list = await api.getTelegramChannels();
+      setDraft(list); setSaved(list); setErr(null);
+    } catch (e) { setErr(String(e)); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  if (!draft || !saved) {
+    return (
+      <>
+        <div style={{ ...S.heading, marginTop: 24 }}>Telegram channels</div>
+        <div style={{ color: '#8b949e' }}>{err ?? 'Loading…'}</div>
+      </>
+    );
+  }
+
+  const dirty = JSON.stringify(draft) !== JSON.stringify(saved);
+  const valid = draft.every(ch =>
+       ch.id.length > 0 && ch.channel_id.trim().length > 0 && ch.name.length <= 100,
+  );
+
+  function addChannel() {
+    setDraft([
+      ...(draft ?? []),
+      { id: uid(), name: '', channel_id: '', enabled: true, coins: [], info_types: [] },
+    ]);
+  }
+  function removeChannel(id: string) {
+    setDraft((draft ?? []).filter(c => c.id !== id));
+  }
+  function patchChannel(id: string, patch: Partial<TelegramChannel>) {
+    setDraft((draft ?? []).map(c => c.id === id ? { ...c, ...patch } : c));
+  }
+
+  async function save() {
+    if (!dirty || !valid || !draft) return;
+    setSaving(true); setErr(null);
+    try {
+      const next = await api.saveTelegramChannels(draft);
+      setSaved(next); setDraft(next);
+      setFlash(true);
+      setTimeout(() => setFlash(false), 1500);
     } catch (e) {
-      setError(String(e));
-    } finally { setBusy(false); }
+      setErr(String(e).replace(/^Error: API [^:]+: \d+: /, ''));
+    } finally { setSaving(false); }
   }
 
   return (
-    <div style={{ ...S.card, borderColor: '#7d1f1f' }}>
-      <div style={{ ...S.cardTitle, color: '#f85149' }}>Danger zone</div>
-      <div style={S.cardHint}>
-        Reset tất cả test data (simulate + backtest orders). Live orders KHÔNG ảnh hưởng.
-        Dùng để dọn dẹp khi muốn test lại từ đầu.
+    <>
+      <div style={{ ...S.heading, marginTop: 24 }}>Telegram channels</div>
+      <div style={S.subheading}>
+        Gửi tin nhắn tới nhiều channel với filter theo coin + loại thông tin.
+        Bỏ trống <b>Coins</b> = nhận tất cả coins. Bỏ trống <b>Info</b> = nhận cả
+        signal và order. Info mapping: <code>signal</code> = T+4, <code>order</code>
+        = T+0 / T-30s / T-0. Bot cần <code>TELEGRAM_TOKEN</code> trong .env.
       </div>
-      <button
-        onClick={reset}
-        disabled={busy}
-        style={{
-          marginTop: 12, padding: '8px 16px', borderRadius: 6,
-          background: busy ? '#21262d' : '#4a1a1a',
-          color: busy ? '#8b949e' : '#f85149',
-          border: '1px solid #7d1f1f',
-          cursor: busy ? 'wait' : 'pointer',
-          fontSize: 13, fontWeight: 600,
-        }}
-      >{busy ? 'Đang xoá…' : '🗑 Reset test data (sim + backtest)'}</button>
-      {result && <div style={{ marginTop: 8, fontSize: 12, color: '#3fb950' }}>{result}</div>}
-      {error  && <div style={{ marginTop: 8, fontSize: 12, color: '#f85149' }}>{error}</div>}
-    </div>
+      {err && <div style={S.errorBar}>{err}</div>}
+
+      <div style={S.tableWrap}>
+        <table style={S.table}>
+          <thead>
+            <tr>
+              <th style={S.th}>Enabled</th>
+              <th style={S.th}>Name</th>
+              <th style={S.th} title="Telegram chat/channel ID (e.g. -1001234567890)">Channel ID</th>
+              <th style={S.th}>Coins</th>
+              <th style={S.th}>Info</th>
+              <th style={S.th}></th>
+            </tr>
+          </thead>
+          <tbody>
+            {draft.length === 0 && (
+              <tr>
+                <td colSpan={6} style={{ ...S.td, color: '#6e7681', fontStyle: 'italic', padding: 20, textAlign: 'center' }}>
+                  Chưa có channel. Tin nhắn rơi vào fallback <code>TELEGRAM_CHANNEL_ID</code>
+                  trong .env (nếu set). Thêm channel để route.
+                </td>
+              </tr>
+            )}
+            {draft.map(ch => (
+              <TelegramChannelRow
+                key={ch.id}
+                value={ch}
+                onChange={p => patchChannel(ch.id, p)}
+                onRemove={() => removeChannel(ch.id)}
+                disabled={saving}
+              />
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+        <button
+          onClick={addChannel}
+          disabled={saving || draft.length >= 32}
+          style={S.addBtn}
+        >
+          + Add channel
+        </button>
+        <button
+          onClick={save}
+          disabled={!dirty || !valid || saving}
+          style={{
+            ...S.saveBtn,
+            background: dirty && valid ? '#1f6feb' : '#21262d',
+            color:      dirty && valid ? '#fff'    : '#8b949e',
+            cursor:     dirty && valid && !saving ? 'pointer' : 'not-allowed',
+          }}
+        >
+          {saving ? 'Saving…' : dirty ? 'Save channels' : (flash ? '✓ Saved' : 'No changes')}
+        </button>
+        {!valid && <span style={{ fontSize: 12, color: '#f85149' }}>Check required fields</span>}
+      </div>
+    </>
   );
 }
 
-function RulesExplainer({ settings }: { settings: SettingsResponse }) {
-  const signal        = Number(settings.settings['signal_min_streak']            ?? 3);
-  const auto          = Number(settings.settings['auto_order_min_streak']        ?? 4);
-  const limit         = Number(settings.settings['auto_order_limit_price_cents'] ?? 55);
-  const tp            = Number(settings.settings['auto_order_tp_cents']          ?? 75);
-  const sl            = Number(settings.settings['auto_order_sl_cents']          ?? 25);
-  const dcaMax        = Number(settings.settings['dca_max_entry_cents']          ?? 40);
-  const panicEntry    = Number(settings.settings['panic_entry_cents']            ?? 5);
-  const panicTp       = Number(settings.settings['panic_tp_cents']               ?? 20);
-  const panicWinS     = Number(settings.settings['panic_first_window_s']         ?? 180);
+function TelegramChannelRow({
+  value, onChange, onRemove, disabled,
+}: {
+  value:    TelegramChannel;
+  onChange: (patch: Partial<TelegramChannel>) => void;
+  onRemove: () => void;
+  disabled?: boolean;
+}) {
+  const toggleCoin = (c: CoinSymbol) => {
+    const has = value.coins.includes(c);
+    onChange({ coins: has ? value.coins.filter(x => x !== c) : [...value.coins, c] });
+  };
+  const toggleInfo = (i: TelegramInfoType) => {
+    const has = value.info_types.includes(i);
+    onChange({ info_types: has ? value.info_types.filter(x => x !== i) : [...value.info_types, i] });
+  };
+
+  const idValid = value.channel_id.trim().length > 0;
+
   return (
-    <div style={S.rulesCard}>
-      <div style={S.cardTitle}>Quy tắc hiện tại (derived)</div>
-
-      <div style={{ marginTop: 8, fontSize: 12, color: '#c9d1d9' }}>
-        <strong style={{ color: '#3fb950' }}>BOUNDARY (pre-position for next window)</strong>
-        <br />
-        Fires trong 10s cuối current window. Target: next market. Contrarian sau streak.
-        <ul style={{ paddingLeft: 18, marginTop: 4, marginBottom: 10, lineHeight: 1.6, fontSize: 13 }}>
-          <li>|streak| &lt; <strong>{signal}</strong> → không emit</li>
-          <li><strong>{signal}</strong> ≤ |streak| &lt; <strong>{auto}</strong> → emit MANUAL (user click)</li>
-          <li>|streak| ≥ <strong>{auto}</strong> + ask ≤ <strong>{limit}¢</strong> → AUTO order + TP <strong>{tp}¢</strong> / SL <strong>{sl}¢</strong></li>
-        </ul>
-
-        <strong style={{ color: '#79c0ff' }}>DCA (average down existing BOUNDARY)</strong>
-        <br />
-        Fires khi đã có auto BOUNDARY BUY + held ask sụt vào DCA zone.
-        <ul style={{ paddingLeft: 18, marginTop: 4, marginBottom: 10, lineHeight: 1.6, fontSize: 13 }}>
-          <li>Có pending auto BOUNDARY BUY cho market</li>
-          <li>Ask của held direction ≤ <strong>{dcaMax}¢</strong></li>
-          <li>Còn &gt; 1m30s</li>
-          <li>→ Market BUY @ ask, size = base (flat), TP inherit = <strong>{tp}¢</strong>, no SL. 1 lần/market.</li>
-        </ul>
-
-        <strong style={{ color: '#ff9f43' }}>PANIC (bottom-fishing current window, momentum)</strong>
-        <br />
-        Fires khi streak rơi vào gap [{signal}, {auto}) — có signal nhưng BOUNDARY không auto-fire.
-        <ul style={{ paddingLeft: 18, marginTop: 4, lineHeight: 1.6, fontSize: 13 }}>
-          <li>Streak closed ∈ [<strong>{signal}</strong>, <strong>{auto}</strong>) (cùng hướng)</li>
-          <li>Trong first <strong>{Math.round(panicWinS / 60)}m</strong> của current window</li>
-          <li>Ask của streak-matching side ≤ <strong>{panicEntry}¢</strong></li>
-          <li>→ Market BUY hướng đó, size = base, limit TP <strong>{panicTp}¢</strong>, no SL. 1 lần/market.</li>
-        </ul>
-      </div>
-    </div>
+    <tr>
+      <td style={S.td}>
+        <Toggle
+          checked={value.enabled}
+          onChange={v => onChange({ enabled: v })}
+          disabled={disabled}
+        />
+      </td>
+      <td style={S.td}>
+        <input
+          type="text"
+          value={value.name}
+          placeholder="Label"
+          disabled={disabled}
+          onChange={e => onChange({ name: e.target.value })}
+          style={{ ...S.textInput, width: 160 }}
+        />
+      </td>
+      <td style={S.td}>
+        <input
+          type="text"
+          value={value.channel_id}
+          placeholder="-100123…"
+          disabled={disabled}
+          onChange={e => onChange({ channel_id: e.target.value })}
+          style={{
+            ...S.textInput, width: 180,
+            borderColor: idValid ? '#30363d' : '#f85149',
+          }}
+        />
+      </td>
+      <td style={S.td}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+          {ALL_COINS.map(c => {
+            const on = value.coins.includes(c);
+            return (
+              <button
+                key={c}
+                onClick={() => toggleCoin(c)}
+                disabled={disabled}
+                style={{
+                  ...S.chip,
+                  background: on ? '#1f6feb' : 'transparent',
+                  color:      on ? '#fff'    : '#8b949e',
+                  borderColor: on ? '#1f6feb' : '#30363d',
+                }}
+                title={on ? `Remove ${c}` : `Add ${c}`}
+              >
+                {c}
+              </button>
+            );
+          })}
+          {value.coins.length === 0 && (
+            <span style={{ fontSize: 11, color: '#6e7681', alignSelf: 'center', marginLeft: 4 }}>
+              (all)
+            </span>
+          )}
+        </div>
+      </td>
+      <td style={S.td}>
+        <div style={{ display: 'flex', gap: 4 }}>
+          {(['signal', 'order'] as TelegramInfoType[]).map(i => {
+            const on = value.info_types.includes(i);
+            return (
+              <button
+                key={i}
+                onClick={() => toggleInfo(i)}
+                disabled={disabled}
+                style={{
+                  ...S.chip,
+                  background: on ? '#3fb950' : 'transparent',
+                  color:      on ? '#fff'    : '#8b949e',
+                  borderColor: on ? '#3fb950' : '#30363d',
+                }}
+              >
+                {i}
+              </button>
+            );
+          })}
+          {value.info_types.length === 0 && (
+            <span style={{ fontSize: 11, color: '#6e7681', alignSelf: 'center', marginLeft: 4 }}>
+              (all)
+            </span>
+          )}
+        </div>
+      </td>
+      <td style={S.td}>
+        <button
+          onClick={onRemove}
+          disabled={disabled}
+          style={S.removeBtn}
+          title="Remove channel"
+        >×</button>
+      </td>
+    </tr>
   );
 }
 
-// ────────────────────────────────────────────────────────────────────────────
+// ── Styles ──────────────────────────────────────────────────────────────────
 
 const S: Record<string, React.CSSProperties> = {
-  page:       { maxWidth: 760, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 16 },
+  page:       { maxWidth: 1100, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 12 },
   heading:    { fontSize: 22, fontWeight: 700, color: '#c9d1d9' },
-  subheading: { fontSize: 13, color: '#8b949e', marginTop: -8 },
+  subheading: { fontSize: 13, color: '#8b949e', marginTop: -4 },
   errorBar:   { color: '#f85149', padding: '8px 12px', background: '#21262d',
                 borderRadius: 6, fontSize: 13 },
 
-  card:       { background: '#161b22', border: '1px solid #30363d', borderRadius: 8, padding: 20 },
-  cardTitle:  { fontSize: 16, fontWeight: 600, color: '#c9d1d9', marginBottom: 4 },
-  cardHint:   { fontSize: 12, color: '#8b949e', lineHeight: 1.5, marginTop: 4 },
+  tableWrap:  { background: '#161b22', border: '1px solid #30363d', borderRadius: 8, overflow: 'hidden' },
+  table:      { width: '100%', borderCollapse: 'collapse' as const, fontSize: 13 },
+  th:         { padding: '10px 12px', textAlign: 'left' as const, fontWeight: 600,
+                color: '#8b949e', fontSize: 12, borderBottom: '1px solid #30363d',
+                background: '#0d1117' },
+  td:         { padding: '8px 12px', borderBottom: '1px solid #21262d', color: '#c9d1d9' },
 
-  pill:       { padding: '6px 16px', borderRadius: 6, border: '1px solid #30363d',
-                background: '#0d1117', color: '#8b949e', fontSize: 13, fontWeight: 600, cursor: 'pointer' },
-  pillActiveOrange: { background: '#f0a500', color: '#0d1117', borderColor: '#f0a500' },
-  pillActiveGreen:  { background: '#3fb950', color: '#0d1117', borderColor: '#3fb950' },
+  select:     { background: '#0d1117', color: '#c9d1d9', border: '1px solid #30363d',
+                borderRadius: 4, padding: '4px 6px', fontSize: 12 },
+  numInput:   { width: 60, padding: '4px 6px', background: '#0d1117',
+                border: '1px solid #30363d', color: '#c9d1d9', borderRadius: 4,
+                fontSize: 12, textAlign: 'right' as const },
+  textInput:  { padding: '4px 8px', background: '#0d1117',
+                border: '1px solid #30363d', color: '#c9d1d9', borderRadius: 4,
+                fontSize: 12 },
+  chip:       { padding: '2px 8px', borderRadius: 12, border: '1px solid #30363d',
+                fontSize: 11, fontWeight: 600, cursor: 'pointer' },
+  saveBtn:    { padding: '4px 12px', borderRadius: 4, border: 'none',
+                fontSize: 12, fontWeight: 600, minWidth: 56 },
+  scheduleBtn:{ padding: '4px 10px', borderRadius: 4, border: '1px solid #30363d',
+                background: '#0d1117', color: '#c9d1d9', fontSize: 12, cursor: 'pointer',
+                minWidth: 70, textAlign: 'left' as const },
+  addBtn:     { padding: '4px 12px', borderRadius: 4, border: '1px solid #30363d',
+                background: '#0d1117', color: '#58a6ff', fontSize: 12, cursor: 'pointer' },
+  removeBtn:  { padding: '2px 8px', borderRadius: 4, border: '1px solid #30363d',
+                background: '#0d1117', color: '#f85149', fontSize: 14, fontWeight: 700,
+                cursor: 'pointer', width: 28 },
 
-  field:        { marginTop: 16 },
-  fieldLabel:   { fontSize: 13, fontWeight: 600, color: '#c9d1d9' },
-  fieldHint:    { fontSize: 11, color: '#8b949e', marginTop: 6, lineHeight: 1.4 },
-  fieldError:   { fontSize: 12, color: '#f85149', marginTop: 6 },
-
-  qtyBtn:    { width: 28, height: 28, background: '#21262d', color: '#c9d1d9',
-               border: '1px solid #30363d', borderRadius: 4, cursor: 'pointer',
-               fontSize: 14, fontWeight: 600 },
-  qtyInput:  { width: 60, padding: '4px 8px', background: '#0d1117', border: '1px solid #30363d',
-               color: '#c9d1d9', borderRadius: 4, fontSize: 14, textAlign: 'center' },
-  saveBtn:   { padding: '6px 14px', borderRadius: 4, border: 'none',
-               fontSize: 12, fontWeight: 600, minWidth: 70 },
-
-  rulesCard: { background: '#0d1117', border: '1px solid #21262d', borderRadius: 8, padding: 16 },
+  note:       { fontSize: 12, color: '#79c0ff', background: '#0d1f33',
+                border: '1px solid #1e3a5f', borderRadius: 6, padding: '8px 12px',
+                marginTop: 8 },
 };

@@ -80,8 +80,21 @@ export interface SignalTMinus30Event {
   price?:        number;
   sizeUsdc?:     number;
   reason?:       string;     // e.g. "ask 60¢ > limit 54¢"
-  /** 'boundary' = normal contrarian entry; 'dca' = 1.5× size after a prior loss. */
+  /** 'boundary' = normal contrarian entry; 'dca' = previous_size × dca_multiplier after a prior loss. */
   signalPath?:   'boundary' | 'dca';
+  /** True if this placement was retried at T-0 of N (after T-30s failed gates). */
+  lateRetry?:    boolean;
+  /**
+   * Adaptive threshold context. Present whenever the threshold gate is
+   * evaluated (both order_placed and order_skipped). Lets UI / Telegram
+   * explain why the effective threshold differs from the base config.
+   */
+  adaptive?: {
+    base:      number;          // cfg.auto_order_min_streak
+    threshold: number;          // effective threshold used for the gate
+    mode:      'aggressive' | 'conservative' | 'default';
+    reason:    string;          // human-readable trigger explanation
+  };
   emittedAt:     number;
 }
 

@@ -1285,7 +1285,7 @@ function CoinCard({ coin, entry }: { coin: CoinSymbol; entry?: CoinEventsEntry }
       {t0plus && (
         <div style={CS.section}>
           <div style={CS.phase}>
-            T+0 · {fmtClock(t0plus.emittedAt)}
+            T+0 · {fmtClock(t0plus.emittedAt)} · <span style={CS.windowChip}>{fmtWindowChip(t0plus.windowStart, t0plus.windowEnd)}</span>
             {t0plus.order.signalPath === 'dca' && <span style={CS.dcaTag}>🔄 DCA</span>}
           </div>
           <div>
@@ -1298,7 +1298,7 @@ function CoinCard({ coin, entry }: { coin: CoinSymbol; entry?: CoinEventsEntry }
 
       {t4 ? (
         <div style={CS.section}>
-          <div style={CS.phase}>T+4 · {fmtClock(t4.emittedAt)}</div>
+          <div style={CS.phase}>T+4 · {fmtClock(t4.emittedAt)} · <span style={CS.windowChip}>{fmtWindowChip(t4.windowStart, t4.windowEnd)}</span></div>
           <div style={CS.icons}>{t4.pastStreakIcons}{t4.currentIcon}</div>
           <VolumeRow buckets={t4.streakVolumeBuckets} />
           <div>
@@ -1326,9 +1326,12 @@ function CoinCard({ coin, entry }: { coin: CoinSymbol; entry?: CoinEventsEntry }
       {t30 && (
         <div style={CS.section}>
           <div style={CS.phase}>
-            T-30s
+            T-30s · <span style={CS.windowChip}>{fmtWindowChip(t30.windowStart, t30.windowEnd)}</span>
             {t30.signalPath === 'dca' && (
               <span style={CS.dcaTag}>🔄 DCA</span>
+            )}
+            {t30.lateRetry && (
+              <span style={{ ...CS.dcaTag, background: '#3a2d0a', color: '#f0a500' }}>⏰ T-0 retry</span>
             )}
           </div>
           <div>
@@ -1345,7 +1348,7 @@ function CoinCard({ coin, entry }: { coin: CoinSymbol; entry?: CoinEventsEntry }
 
       {t0 && (
         <div style={CS.section}>
-          <div style={CS.phase}>T-0</div>
+          <div style={CS.phase}>T-0 · <span style={CS.windowChip}>{fmtWindowChip(t0.windowStart, t0.windowEnd)}</span></div>
           <div>
             <span style={{
               color: t0.outcome === 'up'   ? '#3fb950'
@@ -1383,6 +1386,14 @@ function CoinCard({ coin, entry }: { coin: CoinSymbol; entry?: CoinEventsEntry }
 function fmtClock(ms: number): string {
   const d = new Date(ms);
   return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+}
+
+function fmtWindowChip(start: number, end: number): string {
+  const hhmm = (ms: number) => {
+    const d = new Date(ms);
+    return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+  };
+  return `${hhmm(start)}-${hhmm(end)}`;
 }
 
 const VOL_STYLE: Record<VolumeBucket, { label: string; color: string }> = {
@@ -1425,6 +1436,9 @@ const CS: Record<string, React.CSSProperties> = {
   volCell:      { width: 17, textAlign: 'center' as const, textTransform: 'uppercase' as const },
   dcaTag:       { marginLeft: 6, padding: '1px 4px', background: '#1f3a4d', color: '#79c0ff',
                   borderRadius: 3, fontSize: 9, fontWeight: 700 },
+  windowChip:   { display: 'inline-block', padding: '0 4px', background: '#21262d',
+                  color: '#c9d1d9', borderRadius: 3, fontSize: 9, fontFamily: 'monospace',
+                  fontWeight: 600, letterSpacing: 0.3 },
   dim:          { fontSize: 10, color: '#8b949e', marginTop: 2 },
   emptySection: { fontSize: 10, color: '#4a5159', marginTop: 6 },
 };

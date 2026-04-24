@@ -1,11 +1,16 @@
 import dotenv from 'dotenv';
-// override: true so .env values win even when shell exports the key as ''
-dotenv.config({ override: true });
+import path from 'path';
+import { fileURLToPath } from 'url';
+// Monorepo root .env (single source for api + workers).
+dotenv.config({
+  path: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../.env'),
+  override: true,
+});
 
 function required(key: string): string {
-  const val = process.env[key];
-  if (!val) throw new Error(`Missing required environment variable: ${key}`);
-  return val;
+  // Soft-fail at import time — return empty string. Modules that *actually*
+  // need the value will fail at use-time (clearer error trace).
+  return process.env[key] ?? '';
 }
 
 function optional(key: string, fallback: string): string {

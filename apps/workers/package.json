@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev":       "tsx watch src/main.ts",
-    "start":     "node dist/main.js",
+    "dev":       "SERVICE_NAME=workers tsx watch --include='../../packages/**/*.ts' src/main.ts",
+    "start":     "SERVICE_NAME=workers node dist/main.js",
     "build":     "tsc",
     "typecheck": "tsc --noEmit"
   },

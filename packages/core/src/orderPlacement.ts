@@ -14,6 +14,7 @@ import { randomUUID } from 'crypto';
 import { getPool } from '@trading-bot/db';
 import { getTradingMode, getAutoOrderTpCents, getAutoOrderSlCents } from './settings.js';
 import { getClobExecutor } from './PolymarketClobExecutor.js';
+import { log } from './observability/logger.js';
 
 export interface RecordOrderParams {
   conditionId: string;
@@ -79,13 +80,20 @@ export async function recordOrder(p: RecordOrderParams): Promise<RecordOrderResu
   // Force simulate if POLY_PRIVATE_KEY missing.
   const mode: 'simulate' | 'live' = await getTradingMode();
 
-  // LIVE: hit CLOB first. If the market BUY fails (insufficient liquidity at
-  // the limit price, balance issues, etc.) we bail BEFORE touching the DB.
+  // LIVE: hit CLOB first (FAK — partial fills accepted). If 0 shares filled,
+  // throw and don't touch DB. For partial fills, record ACTUAL amounts:
+  //   size_usdc  = filled USDC      (may be < requested)
+  //   share_price = avg price paid  (filledUsdc / filledShares)
   let buyClobID: string | null = null;
+  let recordedSize  = p.sizeUsdc;
+  let recordedPrice = p.sharePrice;
   if (mode === 'live') {
     const ex = getClobExecutor();
     if (!ex) throw new Error('live mode but PolymarketClobExecutor not initialized');
-    buyClobID = await ex.placeMarketBuy(tokenID, p.sizeUsdc, p.sharePrice);
+    const fill = await ex.placeMarketBuy(tokenID, p.sizeUsdc, p.sharePrice);
+    buyClobID     = fill.orderID;
+    recordedSize  = fill.filledUsdc;
+    recordedPrice = fill.filledUsdc / fill.filledShares;
   }
 
   const id = randomUUID();
@@ -96,7 +104,7 @@ export async function recordOrder(p: RecordOrderParams): Promise<RecordOrderResu
         p_signal, ev, mode, source, side, status,
         tp_cents, sl_cents, signal_path, clob_order_id)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'buy','pending',$11,$12,$13,$14)`,
-    [id, p.conditionId, ts, p.direction, p.sharePrice, p.sizeUsdc,
+    [id, p.conditionId, ts, p.direction, recordedPrice, recordedSize,
      p.pSignal ?? 0, p.ev ?? 0, mode, p.source,
      p.tpCents ?? null, p.slCents ?? null, p.signalPath ?? null, buyClobID],
   );
@@ -106,27 +114,35 @@ export async function recordOrder(p: RecordOrderParams): Promise<RecordOrderResu
   // clob_order_id=NULL. OrderResolver monitors share ticks and fires a
   // MARKET SELL on CLOB (live) or just DB-closes (simulate) when a threshold
   // is crossed. No resting limit orders on CLOB any more.
-  await createExitOrders(id, p, ts, mode);
+  //
+  // Use ACTUAL filled amounts (important for live partial fills) when computing
+  // child share sizes. Pass tokenID so createExitOrders can place the GTC
+  // limit SELL for TP on the correct token.
+  await createExitOrders(id, p, ts, mode, recordedSize, recordedPrice, tokenID);
 
   return { id, ts, mode, source: p.source, market_id: p.conditionId };
 }
 
 /**
- * After a BUY is inserted, create its pending TP/SL SELL children (DB-only).
- *   TP SELL: close_reason='tp', status='pending', clob_order_id=NULL
- *   SL SELL: close_reason='sl', status='pending', clob_order_id=NULL
+ * After a BUY is inserted, create its TP/SL SELL children.
  *
- * No resting limit on CLOB. OrderResolver watches share ticks and — when a
- * threshold is crossed — fires a MARKET SELL (live) or just DB-closes
- * (simulate). This gives actual market fills instead of missed limit fills
- * (previous FOK SELL attempts kept failing due to on-chain settlement race).
+ *   TP SELL: resting GTC limit on CLOB (live) — passive fill when the book
+ *            reaches TP price. clob_order_id set so we can cancel on
+ *            window close / SL trigger / streak-break. In simulate mode
+ *            the row is DB-only; OrderResolver DB-closes when bid ≥ TP.
+ *   SL SELL: DB-only with clob_order_id=NULL. OrderResolver watches the
+ *            bid and fires a MARKET SELL on CLOB (live) or DB-closes
+ *            (simulate) when bid ≤ SL — this is a stop-style trigger.
+ *            Can't be a resting limit: a SELL limit at a price BELOW market
+ *            would fill immediately.
  *
  * TP/SL cents fall back to global settings when not explicitly set on the BUY.
- * A null SL cent value means "no SL" — skip the SL SELL entirely (DCA case).
+ * `p.slCents === null` (not undefined) means "no SL" — skip SL entirely.
  */
 async function createExitOrders(
   buyId: string, p: RecordOrderParams, ts: number,
   mode: 'simulate' | 'live',
+  actualSizeUsdc: number, actualSharePrice: number, tokenID: string,
 ): Promise<void> {
   const pool = getPool();
   const [globalTp, globalSl] = await Promise.all([
@@ -136,24 +152,83 @@ async function createExitOrders(
   const tpCents = p.tpCents ?? globalTp;
   const slCents = p.slCents === null ? null : (p.slCents ?? globalSl);
 
-  const shares = p.sizeUsdc / p.sharePrice;
+  // Round shares DOWN to 2 decimals — Polymarket CLOB rejects high-precision
+  // sizes ("orderType - error - matching size required"). Loses ≤ $0.01 vs
+  // FAK fill but ensures the TP limit accepts.
+  const sharesExact = actualSizeUsdc / actualSharePrice;
+  const shares = Math.floor(sharesExact * 100) / 100;
+  const tpPrice = tpCents / 100;
 
-  async function insertPendingSell(price: number, reason: 'tp' | 'sl'): Promise<void> {
+  // TP: for live mode, place a resting GTC limit SELL on CLOB so fills are
+  // passive (no polling latency). If CLOB call fails, fall back to DB-only
+  // pending row so OrderResolver still handles TP via market SELL on trigger.
+  //
+  // IMPORTANT: Polymarket has ~1-3s lag between BUY fill and CTF balance
+  // settlement. Without waiting, SELL rejects with "balance 0". Strategy:
+  //   1. Poll getBalanceAllowance until our shares appear (or 10s timeout)
+  //   2. Use the ACTUAL balance returned (handles FAK partial fills self-
+  //      correctingly — no mismatch between our calc and CLOB accounting)
+  //   3. Even on poll timeout, still attempt placement — withRetry treats
+  //      "not enough balance" as transient and retries with backoff.
+  let tpClobId: string | null = null;
+  let tpShares = shares;          // sized from BUY response by default
+  let tpSizeUsdc = shares * tpPrice;
+  if (mode === 'live') {
+    const ex = getClobExecutor();
+    if (ex) {
+      try {
+        const actualShares = await ex.waitForTokenBalance(tokenID, shares, 10_000);
+        // Prefer actual balance over computed when available — guards
+        // against partial fill / rounding drift between our math and CLOB.
+        if (actualShares > 0) {
+          tpShares = Math.min(actualShares, shares);  // never oversize
+          tpSizeUsdc = tpShares * tpPrice;
+        }
+        log('info', 'placeLimitSell attempt (TP)', {
+          tokenID, tpPrice, tpShares, computedShares: shares, actualShares,
+          conditionId: p.conditionId,
+        });
+        tpClobId = await ex.placeLimitSell(tokenID, tpPrice, tpShares);
+        log('info', 'placeLimitSell ok (TP resting on CLOB)', {
+          tokenID, tpClobId, tpPrice, tpShares,
+        });
+      } catch (err) {
+        // Don't fail the whole order — BUY already placed. Log and fall
+        // through to DB-only TP (OrderResolver polling fallback).
+        log('warn', 'placeLimitSell FAILED — falling back to polled TP', {
+          tokenID, tpPrice, tpShares,
+          error: err instanceof Error ? err.message : String(err),
+          stack:  err instanceof Error ? err.stack   : undefined,
+        });
+      }
+    } else {
+      log('warn', 'placeLimitSell skipped — no CLOB executor', { tokenID });
+    }
+  }
+
+  await pool.query(
+    `INSERT INTO poly_orders
+       (id, parent_order_id, market_id, ts_entry, direction, share_price,
+        size_usdc, p_signal, ev, mode, source, side, status,
+        signal_path, close_reason, clob_order_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, $8, 'auto', 'sell', 'pending',
+             $9, 'tp', $10)`,
+    [randomUUID(), buyId, p.conditionId, ts + 1, p.direction, tpPrice,
+     tpSizeUsdc, mode, p.signalPath ?? null, tpClobId],
+  );
+
+  if (slCents != null && slCents > 0) {
+    const slPrice = slCents / 100;
     await pool.query(
       `INSERT INTO poly_orders
          (id, parent_order_id, market_id, ts_entry, direction, share_price,
           size_usdc, p_signal, ev, mode, source, side, status,
           signal_path, close_reason, clob_order_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, $8, 'auto', 'sell', 'pending',
-               $9, $10, NULL)`,
-      [randomUUID(), buyId, p.conditionId, ts + 1, p.direction, price,
-       shares * price, mode, p.signalPath ?? null, reason],
+               $9, 'sl', NULL)`,
+      [randomUUID(), buyId, p.conditionId, ts + 2, p.direction, slPrice,
+       shares * slPrice, mode, p.signalPath ?? null],
     );
-  }
-
-  await insertPendingSell(tpCents / 100, 'tp');
-  if (slCents != null && slCents > 0) {
-    await insertPendingSell(slCents / 100, 'sl');
   }
 }
 

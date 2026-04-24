@@ -34,6 +34,7 @@ import {
   type ApiKeyCreds,
 } from '@polymarket/clob-client';
 import { log } from './observability/logger.js';
+import { withRetry } from './retry.js';
 
 const CLOB_HOST = 'https://clob.polymarket.com';
 
@@ -123,46 +124,48 @@ export class PolymarketClobExecutor {
   }
 
   /**
-   * Market BUY — spend `usdcAmount` USDC on `tokenID`. FOK so any unfilled
-   * portion is killed (we want all-or-nothing at market). `maxPrice` is the
-   * ceiling price in dollars (0..1); if the book can't fill at or below this,
-   * the FOK fails and no shares are purchased.
+   * Market BUY — spend up to `usdcAmount` USDC on `tokenID`. FAK so partial
+   * fills are accepted and any unfilled remainder is killed. Polymarket 5m
+   * books are often thin at top-of-book; FOK fails frequently when bids
+   * can't absorb the full size at `maxPrice`. With FAK we take whatever's
+   * available, and the caller records the ACTUAL filled USDC/shares in DB.
    *
-   * Returns the CLOB orderID on success.
+   * Returns: orderID + actual filled USDC + actual filled shares.
+   * Throws if 0 shares were filled (full FAK kill).
    */
   async placeMarketBuy(
     tokenID: string, usdcAmount: number, maxPrice: number,
-  ): Promise<string> {
+  ): Promise<{ orderID: string; filledUsdc: number; filledShares: number }> {
     const client = this.mustClient();
     log('info', 'CLOB market BUY attempt', {
       tokenID, usdcAmount, maxPrice,
       sigType: SignatureType[client.orderBuilder.signatureType],
       signer:  this.address,
     });
-    let resp: OrderResponse;
-    try {
-      resp = await client.createAndPostMarketOrder(
+    const resp: OrderResponse = await withRetry('CLOB market BUY', async () => {
+      return await client.createAndPostMarketOrder(
         { tokenID, amount: usdcAmount, side: Side.BUY, price: maxPrice },
         undefined,
-        OrderType.FOK,
+        OrderType.FAK,
       );
-    } catch (err) {
-      log('warn', 'CLOB market BUY threw', {
-        tokenID, usdcAmount, maxPrice,
-        error: err instanceof Error ? err.message : String(err),
-        stack: err instanceof Error ? err.stack : undefined,
-      });
-      throw err;
-    }
-    // Log the FULL raw response every time (success or failure) so we can
-    // see exactly what Polymarket sent back.
-    log('info', 'CLOB market BUY response', {
-      tokenID, usdcAmount, maxPrice, resp,
     });
     if (!resp.success || !resp.orderID) {
+      log('warn', 'CLOB market BUY rejected', { tokenID, usdcAmount, maxPrice, resp });
       throw new Error(`CLOB market BUY failed: ${respErrorMessage(resp)}`);
     }
-    return resp.orderID;
+    // FAK response: makingAmount = USDC we spent, takingAmount = shares acquired.
+    const filledUsdc   = Number(resp.makingAmount ?? 0);
+    const filledShares = Number(resp.takingAmount ?? 0);
+    log('info', 'CLOB market BUY response (FAK)', {
+      tokenID, requested_usdc: usdcAmount,
+      filledUsdc, filledShares,
+      avg_price: filledShares > 0 ? filledUsdc / filledShares : null,
+      status: resp.status, success: resp.success,
+    });
+    if (filledShares === 0) {
+      throw new Error('CLOB market BUY filled 0 shares (FAK kill — book empty at limit)');
+    }
+    return { orderID: resp.orderID, filledUsdc, filledShares };
   }
 
   /**
@@ -187,21 +190,13 @@ export class PolymarketClobExecutor {
       sigType: SignatureType[client.orderBuilder.signatureType],
       signer:  this.address,
     });
-    let resp: OrderResponse;
-    try {
-      resp = await client.createAndPostMarketOrder(
+    const resp: OrderResponse = await withRetry('CLOB market SELL', async () => {
+      return await client.createAndPostMarketOrder(
         { tokenID, amount: shares, side: Side.SELL, orderType: OrderType.FAK },
         undefined,
         OrderType.FAK,
       );
-    } catch (err) {
-      log('warn', 'CLOB market SELL threw', {
-        tokenID, shares,
-        error: err instanceof Error ? err.message : String(err),
-        stack: err instanceof Error ? err.stack : undefined,
-      });
-      throw err;
-    }
+    });
     log('info', 'CLOB market SELL response (FAK)', {
       tokenID, requested_shares: shares,
       makingAmount: resp.makingAmount,    // shares actually sold
@@ -223,28 +218,70 @@ export class PolymarketClobExecutor {
     tokenID: string, price: number, shares: number,
   ): Promise<string> {
     const client = this.mustClient();
-    let resp: OrderResponse;
-    try {
-      resp = await client.createAndPostOrder(
+    const resp: OrderResponse = await withRetry('CLOB limit SELL', async () => {
+      return await client.createAndPostOrder(
         { tokenID, price, size: shares, side: Side.SELL },
         undefined,
         OrderType.GTC,
       );
-    } catch (err) {
-      log('warn', 'CLOB limit SELL threw', {
-        tokenID, price, shares,
-        error: err instanceof Error ? err.message : String(err),
-        stack: err instanceof Error ? err.stack : undefined,
-      });
-      throw err;
-    }
-    log('info', 'CLOB limit SELL response', {
-      tokenID, price, shares, resp,
     });
+    log('info', 'CLOB limit SELL response', { tokenID, price, shares, resp });
     if (!resp.success || !resp.orderID) {
       throw new Error(`CLOB limit SELL failed: ${respErrorMessage(resp)}`);
     }
     return resp.orderID;
+  }
+
+  /**
+   * Poll CLOB until our balance for `tokenID` reaches `minShares` (or timeout).
+   * Used after placeMarketBuy to wait for shares to be credited before placing
+   * a resting limit SELL — otherwise SELL rejects with
+   *   "not enough balance / allowance: balance 0, order amount N"
+   * (Polymarket has ~1-3s lag between BUY fill and CTF balance settlement.)
+   *
+   * Returns the ACTUAL balance in shares (floored to 2 decimal places), or 0
+   * on timeout. Caller should size the SELL from the returned value rather
+   * than computed shares — it always matches CLOB accounting and handles FAK
+   * partial fills self-correctingly.
+   *
+   * Balances are 1e6-scaled integers; we use BigInt so huge positions don't
+   * overflow Number.
+   */
+  async waitForTokenBalance(
+    tokenID: string, minShares: number, timeoutMs = 10_000,
+  ): Promise<number> {
+    const client = this.mustClient();
+    const minAtomic = BigInt(Math.floor(minShares * 1e6));
+    const start = Date.now();
+    let lastBal = '0';
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const ba = await client.getBalanceAllowance({
+          asset_type: AssetType.CONDITIONAL,
+          token_id: tokenID,
+        });
+        lastBal = ba.balance;
+        if (BigInt(ba.balance) >= minAtomic) {
+          // Convert atomic → shares with 2-decimal floor (safe for CLOB tick).
+          const sharesFloat = Number(BigInt(ba.balance)) / 1e6;
+          const sharesFloored = Math.floor(sharesFloat * 100) / 100;
+          log('info', 'waitForTokenBalance ready', {
+            tokenID, minShares, actualShares: sharesFloored, balance: ba.balance,
+            elapsedMs: Date.now() - start,
+          });
+          return sharesFloored;
+        }
+      } catch (err) {
+        log('warn', 'waitForTokenBalance poll error', {
+          tokenID, error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      await new Promise(r => setTimeout(r, 250));
+    }
+    log('warn', 'waitForTokenBalance TIMEOUT', {
+      tokenID, minShares, lastBal, timeoutMs,
+    });
+    return 0;
   }
 
   /**
@@ -268,13 +305,59 @@ export class PolymarketClobExecutor {
     }
   }
 
+  /**
+   * Fetch the resolved outcome of a 5-min market by inspecting the UP token's
+   * final share price around the window close. The CLOB prices-history endpoint
+   * stores all historical share prices for a token (both pre- and post-resolve).
+   * At / after resolution, the winning token settles at 1.0 and the losing
+   * token at 0.0 — so the UP token's final price alone determines direction.
+   *
+   * Returns:
+   *   'up'      — UP token final price ≥ 0.5
+   *   'down'    — UP token final price < 0.5
+   *   'unknown' — no price data in the window (market not yet resolved, or
+   *               transient API error); caller should retry later.
+   *
+   * Pulls a small ±1 minute band around windowEndMs to tolerate timing jitter.
+   * Uses unauth'd `/prices-history` — doesn't require the L2 client, but we
+   * route through the same ClobClient for consistency & retry.
+   */
+  async fetchResolvedOutcome(
+    tokenUp: string, windowEndMs: number,
+  ): Promise<'up' | 'down' | 'unknown'> {
+    const client = this.mustClient();
+    const endSec = Math.floor(windowEndMs / 1000);
+    try {
+      const prices = await withRetry('CLOB prices-history', () =>
+        client.getPricesHistory({
+          market:  tokenUp,
+          startTs: endSec - 60,        // 1 min before window close
+          endTs:   endSec + 300,       // 5 min after (resolve lag tolerance)
+          fidelity: 1,                 // 1-minute points
+        }),
+      );
+      if (!prices.length) return 'unknown';
+      // Use the LAST price in the range — that's closest to resolution.
+      const last = prices[prices.length - 1]!;
+      const p = Number(last.p);
+      if (!Number.isFinite(p)) return 'unknown';
+      return p >= 0.5 ? 'up' : 'down';
+    } catch (err) {
+      log('warn', 'fetchResolvedOutcome failed', {
+        tokenUp: tokenUp.slice(0, 20) + '…', windowEndMs,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return 'unknown';
+    }
+  }
+
   /** Cancel a resting GTC order by its CLOB orderID. Best-effort — logs on fail. */
   async cancelOrder(orderID: string): Promise<void> {
     try {
-      await this.mustClient().cancelOrder({ orderID });
+      await withRetry('CLOB cancel', () => this.mustClient().cancelOrder({ orderID }));
       log('info', 'CLOB order cancelled', { orderID });
     } catch (err) {
-      log('warn', 'CLOB cancel failed', { orderID, error: String(err) });
+      log('warn', 'CLOB cancel failed (exhausted)', { orderID, error: String(err) });
     }
   }
 }

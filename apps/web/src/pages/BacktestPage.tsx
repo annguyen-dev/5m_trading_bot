@@ -312,7 +312,14 @@ export default function BacktestPage() {
         noCache,
       );
 
-      const sse = new EventSource(`/api/backtest/progress/${jobId}`);
+      // Pass JWT via ?token= since EventSource can't set Authorization header.
+      const adminToken = (() => {
+        try { return localStorage.getItem('tb_admin_token'); } catch { return null; }
+      })();
+      const sseUrl = adminToken
+        ? `/api/backtest/progress/${jobId}?token=${encodeURIComponent(adminToken)}`
+        : `/api/backtest/progress/${jobId}`;
+      const sse = new EventSource(sseUrl);
       sseRef.current = sse;
 
       sse.onmessage = (e) => {

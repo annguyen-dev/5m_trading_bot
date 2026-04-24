@@ -150,8 +150,10 @@ export interface CoinT30Event {
   price?:      number;
   sizeUsdc?:   number;
   reason?:     string;
-  /** 'dca' → 1.5× size after prior boundary loss. */
+  /** 'dca' → previous_size × dca_multiplier after a prior boundary loss. */
   signalPath?: 'boundary' | 'dca';
+  /** True if placement happened at T-0 retry (not the original T-30s tick). */
+  lateRetry?:  boolean;
   emittedAt:   number;
 }
 
@@ -254,7 +256,13 @@ export function useLiveStream(url = '/api/poly/stream'): LiveStreamState {
 
     function connect(): void {
       if (cancelled) return;
-      es = new EventSource(url);
+      // EventSource can't set Authorization headers, so append the JWT as a
+      // query param — the server's requireAuth middleware accepts either.
+      const token = (() => { try { return localStorage.getItem('tb_admin_token'); } catch { return null; } })();
+      const fullUrl = token
+        ? `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`
+        : url;
+      es = new EventSource(fullUrl);
 
       es.onopen = () => patch({ connected: true });
       es.onerror = () => {

@@ -8,10 +8,14 @@
  *   PORT=8080 npm run dashboard # custom port
  */
 import dotenv from 'dotenv';
-dotenv.config({ override: true }); // override: true so .env wins over empty shell vars
-import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
+// Load .env from monorepo root so api + workers share one config file.
+dotenv.config({
+  path: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../.env'),
+  override: true,
+});
+import express from 'express';
 import { listEnvironments } from './environments.js';
 import { getSignals, getSummary } from './signals.js';
 import { getCandles, getRunCandles } from './candles.js';
@@ -30,12 +34,16 @@ import { getPolyStatus, getUpcomingMarkets, getCurrentMarket,
          resetTestData, getPortfolio } from './poly-status.js';
 import { verifyCoinSlugs } from './poly-verify.js';
 import { listCoinConfigs, updateCoinConfigHandler } from './coin-configs.js';
+import { listTelegramChannels, replaceTelegramChannels } from './telegram-channels.js';
 import { polyStreamHandler } from './poly-stream.js';
+import { loginHandler, meHandler } from './auth.js';
+import { requireAuth } from '../auth/middleware.js';
 import { PolymarketService } from '@trading-bot/core/PolymarketService';
 import { FutureTickScanner } from '../services/FutureTickScanner.js';
 import { BinanceFastTicker } from '../services/BinanceFastTicker.js';
 import { LiveTradingEngine } from '../services/LiveTradingEngine.js';
 import { getSignalBus, type SignalBusEvent } from '@trading-bot/core/SignalBus';
+import { initClobExecutor } from '@trading-bot/core/PolymarketClobExecutor';
 import { migrate } from '@trading-bot/db/migrate';
 
 // Silence OTel / logger (dashboard server doesn't need tracing)
@@ -68,6 +76,19 @@ app.use((req, res, next) => {
 });
 
 // ── API routes ──────────────────────────────────────────────────────────────
+
+// ── Public: health + login (no auth required) ──────────────────────────────
+app.get('/api/health', (_req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+app.post('/api/auth/login', loginHandler);
+
+// ── Auth gate: everything under /api/* BELOW requires a valid admin JWT ────
+// Routes registered above this line are public. Routes below are protected.
+app.use('/api', requireAuth);
+
+// Protected: return the authenticated user (used by FE to verify session).
+app.get('/api/auth/me', meHandler);
 
 // ── Backtest runner ──────────────────────────────────────────────────────────
 app.post('/api/backtest/run',                startBacktest);
@@ -116,12 +137,15 @@ app.get('/api/poly/verify-slugs',      verifyCoinSlugs);
 app.get('/api/coin-configs',           listCoinConfigs);
 app.put('/api/coin-configs/:symbol',   updateCoinConfigHandler);
 
-// ── Polymarket — SSE live stream (set up below after engine boots) ─────────
+// ── Telegram channel routing ──────────────────────────────────────────────
+app.get('/api/telegram-channels',      listTelegramChannels);
+app.put('/api/telegram-channels',      replaceTelegramChannels);
 
-// Health check
-app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
+// ── Polymarket — SSE live stream (set up below after engine boots) ─────────
+//    SSE needs auth too — polyStreamHandler is mounted under /api, so the
+//    global requireAuth middleware protects it. EventSource can't send
+//    Authorization headers, so FE passes `?token=...` and the middleware
+//    accepts either source.
 
 // ── Start — run migrations, boot engine for FE chart, subscribe to bus
 //          and relay to SSE. Workers run in a SEPARATE process (apps/workers)
@@ -132,6 +156,11 @@ async function bootstrap(): Promise<void> {
   } catch (err) {
     console.error('[api] Migration error (DB may be unavailable):', err);
   }
+
+  // CLOB executor needed for manual live orders (POST /api/poly/orders/simulate
+  // routes through recordOrder → ClobExecutor when trading_mode=live). Workers
+  // initialize their own instance for auto orders.
+  await initClobExecutor();
 
   // Live trading engine — owns BTC ticker / scanner / Polymarket(BTC) ONLY
   // for FE chart purposes (real-time SSE feed). Decision logic + per-coin
@@ -181,11 +210,30 @@ async function bootstrap(): Promise<void> {
     console.log(`  Workers run in separate process: pnpm --filter @trading-bot/workers dev\n`);
   });
 
+  // Hard-timeout graceful shutdown. ioredis quit() can hang if Redis is
+  // unreachable; without a timeout the process never exits and Ctrl+C
+  // appears to do nothing. Second Ctrl+C bypasses graceful path entirely.
+  let shuttingDown = false;
+  const SHUTDOWN_TIMEOUT_MS = 5_000;
+
   const shutdown = async (signal: string): Promise<void> => {
-    console.log(`\n[api] ${signal} — shutting down`);
+    if (shuttingDown) {
+      console.warn(`[api] ${signal} received twice — force exit`);
+      process.exit(1);
+    }
+    shuttingDown = true;
+    console.log(`\n[api] ${signal} — shutting down (timeout ${SHUTDOWN_TIMEOUT_MS}ms)`);
+
+    const hardKill = setTimeout(() => {
+      console.warn('[api] graceful shutdown timed out — force exit');
+      process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS);
+    hardKill.unref();
+
     server.close();
     try { await bus.stop(); }    catch (err) { console.error('[api] bus stop error', err); }
     try { await engine.stop(); } catch (err) { console.error('[api] engine stop error', err); }
+    clearTimeout(hardKill);
     process.exit(0);
   };
   process.on('SIGINT',  () => void shutdown('SIGINT'));

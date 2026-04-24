@@ -173,8 +173,22 @@ export interface PolyResult {
   };
 }
 
+import { getStoredToken, handleUnauthorized } from '../auth/AuthContext.js';
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(url, options);
+  // Attach the admin JWT on every API call. The AuthContext manages the token
+  // lifecycle; if it's missing/expired, the server returns 401 and we bounce
+  // the user back to the login page via handleUnauthorized().
+  const token = getStoredToken();
+  const headers = new Headers(options?.headers);
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+  const res = await fetch(url, { ...options, headers });
+  if (res.status === 401) {
+    handleUnauthorized();
+    throw new Error(`API ${url} → 401: unauthenticated`);
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     throw new Error(`API ${url} → ${res.status}: ${text}`);
@@ -347,6 +361,17 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify(patch),
     }),
+
+  getTelegramChannels: () =>
+    request<{ channels: TelegramChannel[] }>('/api/telegram-channels')
+      .then(r => r.channels),
+
+  saveTelegramChannels: (channels: TelegramChannel[]) =>
+    request<{ channels: TelegramChannel[] }>('/api/telegram-channels', {
+      method:  'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ channels }),
+    }).then(r => r.channels),
 };
 
 // ── Per-coin config types ───────────────────────────────────────────────────
@@ -354,6 +379,12 @@ export const api = {
 export type CoinSymbol  = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE' | 'HYPE' | 'BNB';
 export type CoinMode    = 'signal_only' | 'signal_and_order';
 export type CoinStrategy = 'streak';
+
+export interface AutoScheduleEntry {
+  start_hour:     number;   // 0-23 UTC
+  duration_hours: number;   // 1-24
+  threshold:      number;   // override for auto_order_min_streak
+}
 
 export interface CoinConfigPatch {
   enabled:               boolean;
@@ -363,14 +394,30 @@ export interface CoinConfigPatch {
   streak_min:            number;
   /** Place order at T-30s when |streak| ≥ this (only if mode=signal_and_order). */
   auto_order_min_streak: number;
+  /** Hour-of-day (UTC) overrides for auto_order_min_streak. Empty = no overrides. */
+  auto_schedule:         AutoScheduleEntry[];
   size_usdc:             number;
   limit_price_cents:     number;
   tp_cents:              number;
   sl_cents:              number;
+  /** DCA size = previous_loser_size × dca_multiplier. Default 1.5. */
+  dca_multiplier:        number;
 }
 
 export interface CoinConfigRow extends CoinConfigPatch {
   symbol: CoinSymbol;
+}
+
+// ── Telegram channels ─────────────────────────────────────────────────────
+export type TelegramInfoType = 'signal' | 'order';
+
+export interface TelegramChannel {
+  id:         string;
+  name:       string;
+  channel_id: string;
+  enabled:    boolean;
+  coins:      CoinSymbol[];         // empty = all coins
+  info_types: TelegramInfoType[];   // empty = all types
 }
 
 export interface PolyPortfolio {
