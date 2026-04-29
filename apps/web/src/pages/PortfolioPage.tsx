@@ -232,7 +232,8 @@ const S: Record<string, React.CSSProperties> = {
   kpiSub:     { fontSize: 12, color: '#8b949e', marginTop: 4 },
 
   twoCol:     { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 },
-  card:       { background: '#161b22', border: '1px solid #30363d', borderRadius: 8, padding: 16 },
+  card:       { background: '#161b22', border: '1px solid #30363d', borderRadius: 8, padding: 16,
+                overflowX: 'auto' as const, WebkitOverflowScrolling: 'touch' as const },
   cardTitle:  { fontSize: 14, fontWeight: 600, color: '#c9d1d9', marginBottom: 10 },
   row:        { display: 'grid', gridTemplateColumns: '1.5fr 1fr 1fr',
                 fontSize: 13, color: '#c9d1d9', padding: '6px 0',

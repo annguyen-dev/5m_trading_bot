@@ -4,3 +4,13 @@ data/
 logs/
 .env
 *.log
+inventory.yml
+keys
+
+# Ansible secrets (deploy/) — must never be committed plaintext.
+# Encrypt with `ansible-vault encrypt deploy/group_vars/all.yml` if you want
+# to commit a vault-protected version (still recommended to keep .yml local).
+deploy/group_vars/all.yml
+deploy/inventory.yml
+.claude/
+.turbo/

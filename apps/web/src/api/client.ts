@@ -240,6 +240,16 @@ export const api = {
       body: JSON.stringify({ from, to, formulaConfigId, noCache }),
     }),
 
+  // Poly-driven backtest — mirrors live PMW strategy on historical Poly ticks.
+  // Returns a jobId; subscribe to /api/backtest/poly/progress/:jobId via SSE
+  // to get progress + final result.
+  runPolyBacktest: (body: PolyBacktestRequestBody) =>
+    request<{ jobId: string }>('/api/backtest/poly/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+
   // ── Formula configs ────────────────────────────────────────────────────────
   getFormulaConfigs: () =>
     request<{ configs: FormulaConfig[] }>('/api/formula/configs')
@@ -336,6 +346,41 @@ export const api = {
       body:    JSON.stringify(body),
     }),
 
+  // ── Balance ────────────────────────────────────────────────────────────────
+  // Returns user's CLOB USDC collateral balance + allowance. Returns
+  // {available:false} in simulate-only setups (no POLY_PRIVATE_KEY).
+  getPolyBalance: () =>
+    request<
+      { available: false; reason: string }
+      | { available: true; balance: number; allowance: number; address: string }
+    >('/api/poly/balance'),
+
+  // ── Manual sell ────────────────────────────────────────────────────────────
+  // GET aggregates open BUY orders into per-direction "shares owned".
+  // POST closes BUYs LIFO at the supplied exit price (current bid).
+  getPolyPosition: (conditionId: string) =>
+    request<{
+      conditionId: string;
+      up:   { shares: number; costBasis: number; avgPrice: number; openOrderCount: number };
+      down: { shares: number; costBasis: number; avgPrice: number; openOrderCount: number };
+    }>(`/api/poly/positions/${encodeURIComponent(conditionId)}`),
+
+  sellPolyPosition: (body: {
+    conditionId: string; direction: 'up' | 'down';
+    sharesToSell: number;        // 0 = all
+    exitPrice:    number;        // 0..1 — pass current bid
+  }) =>
+    request<{
+      ok: boolean; mode: 'simulate' | 'live';
+      closed: number; sharesSold: number;
+      proceedUsdc: number; pnlUsdc: number; exitPrice: number;
+      liveSoldShares: number | null;
+    }>('/api/poly/orders/sell', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(body),
+    }),
+
   getPolyOrders: (status?: 'pending' | 'closed', limit = 100) => {
     const q = new URLSearchParams();
     if (status) q.set('status', status);
@@ -372,6 +417,11 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ channels }),
     }).then(r => r.channels),
+
+  getStreakStats: (coin: string, days: number) =>
+    request<StreakStatsResponse>(
+      `/api/analyze/streak-stats?coin=${encodeURIComponent(coin)}&days=${days}`,
+    ),
 };
 
 // ── Per-coin config types ───────────────────────────────────────────────────
@@ -386,13 +436,62 @@ export interface AutoScheduleEntry {
   threshold:      number;   // override for auto_order_min_streak
 }
 
+// ── Streak analysis ────────────────────────────────────────────────────────
+
+export interface StreakLengthRow {
+  length:       number;
+  count:        number;
+  perDay:       number;
+  lastSeenMs:   number;
+  lastSeenAgo:  string;
+}
+
+export interface PostExtremeBucket {
+  afterStreakAtLeast: number;
+  occurrences:        number;
+  avgMinsToSideways:  number;
+  avgMaxStreakNext60: number;
+  sidewaysFraction:   number;
+}
+
+export interface StreakStatsResponse {
+  coin:          string;
+  rangeStartMs:  number;
+  rangeEndMs:    number;
+  totalBars:     number;
+  totalRuns:     number;
+  streakLengths: StreakLengthRow[];
+  highVol: {
+    threshold:        number;
+    occurrences:      number;
+    perDay:           number;
+    p50RunDurationMin: number;
+    p90RunDurationMin: number;
+    longestRunMin:    number;
+  };
+  postExtreme:      PostExtremeBucket[];
+  hourlyHotness:    Array<{ hourUtc: number; perCandle: number }>;
+  dayOfWeekHotness: Array<{
+    dayUtc:    number;       // 0=Sun, 6=Sat (UTC)
+    dayName:   string;
+    perCandle: number;
+    bigCount:  number;
+    totalBars: number;
+  }>;
+  suggested: {
+    auto_order_min_streak: number;
+    dca_streak_whitelist:  number[];
+    reasoning:             string;
+  };
+}
+
 export interface CoinConfigPatch {
   enabled:               boolean;
   strategy:              CoinStrategy;
   mode:                  CoinMode;
   /** Emit T+4 signal when |streak| ≥ this. */
   streak_min:            number;
-  /** Place order at T-30s when |streak| ≥ this (only if mode=signal_and_order). */
+  /** Place order at T-3s when |streak| ≥ this (only if mode=signal_and_order). */
   auto_order_min_streak: number;
   /** Hour-of-day (UTC) overrides for auto_order_min_streak. Empty = no overrides. */
   auto_schedule:         AutoScheduleEntry[];
@@ -402,6 +501,11 @@ export interface CoinConfigPatch {
   sl_cents:              number;
   /** DCA size = previous_loser_size × dca_multiplier. Default 1.5. */
   dca_multiplier:        number;
+  /**
+   * Whitelist of |parent_streak| values at which DCA is allowed to fire.
+   * Empty = always allowed (default). Non-empty = strict whitelist.
+   */
+  dca_streak_whitelist:  number[];
 }
 
 export interface CoinConfigRow extends CoinConfigPatch {
@@ -530,6 +634,10 @@ export interface PolyOrderRow {
   question?:    string | null;
   window_start?: string | null;
   window_end?:   string | null;
+  /** Token IDs for the order's market — used to look up live bid/ask in the
+   *  shares stream so we can show unrealized PnL on pending positions. */
+  token_up?:    string | null;
+  token_down?:  string | null;
 }
 
 /** Map (mode, source) → which UI tab the order belongs in. */
@@ -537,4 +645,83 @@ export function polyOrderKind(o: Pick<PolyOrderRow, 'mode' | 'source'>): PolyOrd
   if (o.source === 'backtest') return 'backtest';
   if (o.mode === 'live')       return 'live';
   return 'simulate';
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Poly backtest types (see apps/api/src/backtest/poly/types.ts for source)
+// ────────────────────────────────────────────────────────────────────────────
+
+export interface PolyBacktestAutoScheduleEntry {
+  start_hour:     number;
+  duration_hours: number;
+  threshold:      number;
+}
+
+export interface PolyBacktestCoinConfig {
+  symbol:                'BTC';
+  size_usdc:             number;
+  streak_min:            number;
+  auto_order_min_streak: number;
+  limit_price_cents:     number;
+  tp_cents:              number;
+  sl_cents:              number;
+  dca_multiplier:        number;
+  dca_streak_whitelist:  number[];
+  auto_schedule:         PolyBacktestAutoScheduleEntry[];
+}
+
+export interface PolyBacktestRequestBody {
+  fromMs:    number;
+  toMs:      number;
+  config:    PolyBacktestCoinConfig;
+}
+
+export interface PolyBacktestTrade {
+  windowStart:   number;
+  windowEnd:     number;
+  direction:     'up' | 'down';
+  streakAtEntry: number;
+  signalPath:    'boundary' | 'dca';
+  dcaRound:      number;
+  entryPrice:    number;
+  sizeUsdc:      number;
+  shares:        number;
+  exitReason:    'tp' | 'sl' | 'resolution_win' | 'resolution_loss';
+  exitPrice:     number;
+  exitTs:        number;
+  pnlUsdc:       number;
+}
+
+export interface PolyBacktestEquityPoint { ts: number; equity: number }
+
+export interface PolyBacktestSummary {
+  trades:           number;
+  wins:             number;
+  losses:           number;
+  winRate:          number;
+  totalPnlUsdc:     number;
+  avgPnlPerTrade:   number;
+  maxDrawdownUsdc:  number;
+  coveredFromMs:    number | null;
+  coveredToMs:      number | null;
+  windowsEvaluated: number;
+  skipReasons:      Record<string, number>;
+}
+
+export interface PolyBacktestDecision {
+  windowStart:         number;
+  windowEnd:           number;
+  streak:              number;
+  contrarianDirection: 'up' | 'down' | null;
+  cycleActive:         boolean;
+  action:              'boundary' | 'dca' | 'skip';
+  skipReason?:         string;
+}
+
+export interface PolyBacktestResult {
+  request:   PolyBacktestRequestBody;
+  summary:   PolyBacktestSummary;
+  trades:    PolyBacktestTrade[];
+  equity:    PolyBacktestEquityPoint[];
+  decisions: PolyBacktestDecision[];
 }

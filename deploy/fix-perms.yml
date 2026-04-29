@@ -1,0 +1,30 @@
+---
+# One-shot: chown /opt/trading-bot back to {{ app_user }}:{{ app_user }}.
+#
+# Useful after legacy `sudo rsync` attempts (or anything else) left files
+# owned by root/ubuntu, which then blocks the zero-sudo deploy.yml from
+# overwriting them as `bot`.
+#
+# Connects as the inventory's ansible_user (ubuntu) with sudo — same path
+# as bootstrap.yml — so it inherits the SSH key from inventory.yml.
+#
+# Run:
+#   pnpm release:fix-perms
+#   # or
+#   cd deploy && ansible-playbook fix-perms.yml
+
+- name: Fix /opt/trading-bot ownership
+  hosts: all
+  become: true
+  gather_facts: false
+  vars_files:
+    - group_vars/all.yml
+
+  tasks:
+    - name: chown -R {{ app_user }}:{{ app_user }} {{ app_dir }}
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        recurse: true

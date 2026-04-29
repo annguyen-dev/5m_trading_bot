@@ -29,8 +29,17 @@ async function readCents(key: string, fallback: number): Promise<number> {
   return n;
 }
 
-/** Effective trading mode — 'live' requires POLY_PRIVATE_KEY env. */
+/**
+ * Effective trading mode — 'live' requires POLY_PRIVATE_KEY env.
+ *
+ * Hard safety gate: outside production (`NODE_ENV !== 'production'`), this
+ * ALWAYS returns 'simulate' regardless of the DB setting or env key. Prevents
+ * a stray `trading_mode=live` row in a dev DB from firing real CLOB orders
+ * when running locally / during tests.
+ */
 export async function getTradingMode(): Promise<'simulate' | 'live'> {
+  if (process.env['NODE_ENV'] !== 'production') return 'simulate';
+
   const stored = (await readValue('trading_mode')) ?? 'simulate';
   const requested: 'simulate' | 'live' = stored === 'live' ? 'live' : 'simulate';
   const hasKey = !!process.env['POLY_PRIVATE_KEY'];

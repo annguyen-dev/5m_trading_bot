@@ -1,0 +1,244 @@
+/* ─────────────────────────────────────────────────────────────────────────
+ * Global responsive base.
+ *
+ * Inline styles handle component visuals; this file handles ONLY the
+ * viewport-dependent bits (because inline styles can't do media queries).
+ *
+ * Conventions:
+ *   .page-wrap   — every page's outermost <div>. Centered, max 1100px.
+ *   .app-nav     — top nav bar. Horizontally scrollable on mobile.
+ *   .app-content — area below nav. Tight padding on mobile.
+ *   .scroll-x    — wrap any wide block (tables, etc) so it scrolls on mobile.
+ *
+ * Mobile breakpoint: 640px (covers ALL phones in portrait).
+ * ──────────────────────────────────────────────────────────────────────── */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+/* ── App-shell scroll model ────────────────────────────────────────────────
+ * Body is viewport-locked (no scroll). The .app-content area is the SOLE
+ * scroll container. This makes `position: sticky` rock-solid: there's a
+ * single, well-defined scroll context, no hidden parent containers, no
+ * confusion across mobile/desktop.
+ *
+ * Side effect: code that listens to `window.scroll` would need to listen to
+ * `.app-content` instead — none of our code does today. */
+html, body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: #0d1117;
+  color: #c9d1d9;
+}
+#root {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── App shell ─────────────────────────────────────────────────────────── */
+
+.app-nav {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 12px 16px;
+  background: #161b22;
+  border-bottom: 1px solid #30363d;
+  /* Phones: many tabs + user info won't fit. Allow horizontal swipe. */
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.app-nav::-webkit-scrollbar { display: none; }
+
+.app-tab {
+  padding: 6px 16px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+  background: transparent;
+  color: #8b949e;
+  text-decoration: none;
+  transition: all 0.15s;
+  /* Don't let tabs squeeze each other when nav scrolls */
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.app-tab.active { background: #1f6feb; color: #fff; }
+
+.app-content {
+  flex: 1 1 auto;
+  /* THIS is the scroll container (not body). Sticky inside resolves to here.
+   * Padding moved to .page-wrap so sticky bars can span the full container
+   * width without negative-margin tricks. */
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ── Reusable layout helpers ───────────────────────────────────────────── */
+
+.page-wrap {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 20px;             /* moved from .app-content for sticky reasons */
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* For wide tables, charts, anything that should scroll horizontally
+ * on mobile rather than overflow + clip the viewport. */
+.scroll-x {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* MarketHeader sticky bar. Now that .app-content is the sole scroll container,
+ * sticky behaves consistently — pins to the top of .app-content as user
+ * scrolls, no portal/fixed-position gymnastics needed.
+ *
+ * IMPORTANT: this element must be a direct child of .app-content (a sibling
+ * of .page-wrap, NOT inside it) — its containing block needs to span the
+ * full scroll range, which page-wrap doesn't (page-wrap is flex column and
+ * has shown sticky-quirk behavior).
+ *
+ * No spacer needed — sticky stays in document flow. */
+.market-header-sticky {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  background: #161b22;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.45);
+  padding: 12px 20px;
+}
+@media (max-width: 640px) {
+  .market-header-sticky { padding: 10px; }
+}
+/* Inner wrapper centers the actual card within the strip, matching
+ * .page-wrap's max-width on desktop. */
+.market-header-sticky-inner {
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+/* MarketHeader top row — icon + title + countdown. Wraps on mobile so the
+ * countdown drops to its own line instead of squeezing the title. */
+.market-header-top {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+/* Title block grows; min-width:0 lets flexbox shrink it below content size
+ * (otherwise long titles force horizontal overflow on phones). */
+.market-header-title-block {
+  flex: 1 1 180px;
+  min-width: 0;
+}
+.market-header-meta {
+  text-align: right;
+  flex: 0 0 auto;
+}
+
+/* Price row — 3 cards (BTC current, UP share, DOWN share). Wraps on mobile. */
+.market-header-prices {
+  display: flex;
+  gap: 32px;
+  margin-top: 16px;
+  flex-wrap: wrap;
+}
+
+/* ── Mobile (<= 640px) ─────────────────────────────────────────────────── */
+
+@media (max-width: 640px) {
+  .app-nav     { padding: 8px 10px; gap: 2px; }
+  .app-tab     { padding: 6px 10px; font-size: 13px; }
+
+  .page-wrap   { padding: 10px; gap: 10px; }
+
+  /* iOS Safari zooms the viewport in when a focused <input> has font-size
+   * < 16px. Force every form control to >= 16px on mobile to prevent the
+   * jarring zoom. !important defeats the inline `fontSize` props scattered
+   * across pages (qtyInput, textInput, login input, etc.). Visual sizes
+   * grow slightly on mobile but it's the standard mobile UX pattern. */
+  input, select, textarea {
+    font-size: 16px !important;
+  }
+
+  /* Mua + Bán cards stay 2-col on mobile per user request. To make this fit
+   * on phones (~180px per card), the inner elements have mobile-specific
+   * shrinks below — tighter padding, smaller direction buttons, smaller
+   * stat values. The .live-trade-stack itself just keeps its inline grid. */
+
+  /* Card body: tighter padding to claw back horizontal space. */
+  .live-trade-stack > .live-trade-card { padding: 10px !important; }
+
+  /* Card title smaller + tighter divider. */
+  .live-trade-stack .live-trade-title {
+    font-size: 13px !important;
+    margin-bottom: 8px !important;
+    padding-bottom: 6px !important;
+  }
+
+  /* Direction buttons: smaller padding/font, allow 2-line stacked content
+   * (label on top, price below) for very narrow cards. */
+  .live-trade-stack .live-dir-btn {
+    padding: 8px 6px !important;
+    font-size: 12px !important;
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    gap: 2px !important;
+  }
+  .live-trade-stack .live-dir-btn .live-dir-price { font-size: 11px !important; }
+
+  /* Quick-add buttons: tighter, smaller. Row already wraps when too narrow. */
+  .live-trade-stack .live-quick-btn {
+    padding: 3px 7px !important;
+    font-size: 11px !important;
+    min-width: 30px !important;
+  }
+
+  /* Compact stat row: stack values when too narrow (under ~180px). */
+  .live-trade-stack .live-stat-row {
+    grid-template-columns: 1fr !important;
+    gap: 6px !important;
+    margin-top: 8px !important;
+  }
+  .live-trade-stack .live-stat-row > * {
+    display: flex !important;
+    justify-content: space-between !important;
+    align-items: baseline !important;
+  }
+
+  /* Place button slightly smaller. */
+  .live-trade-stack .live-place-btn {
+    padding: 10px !important;
+    font-size: 13px !important;
+  }
+
+  /* MarketHeader: tighter, smaller numbers, equal-width price cards. */
+  .market-header-top    { gap: 10px; }
+  .market-header-meta   { text-align: left; }
+  .market-header-prices {
+    gap: 12px;
+    margin-top: 12px;
+  }
+  /* Cards size to content (no shrink past content width) and wrap as needed.
+   * Previously `flex: 1 1 30%; min-width: 90px` overrode the implicit
+   * content-based min-width and let inner text overflow into siblings (e.g.
+   * BTC value spilling into UP share card). `min-width: 0` + `flex: 0 1 auto`
+   * lets content set the floor. */
+  .market-header-prices > * { flex: 0 1 auto; min-width: 0; }
+  /* BTC card grows to absorb extra horizontal space so it doesn't look
+   * cramped next to the tiny share-price cards. */
+  .market-header-prices > *:first-child { flex-grow: 1; }
+}
+

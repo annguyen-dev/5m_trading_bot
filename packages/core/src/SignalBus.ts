@@ -7,7 +7,7 @@
  * Channels:
  *   signal:T+0     — window-start: notify if there's an active order targeting this window
  *   signal:T+4     — streak-based signal emitted at T+4m of a window
- *   signal:T-30s   — order placement check/result at T-30s (target = N+1)
+ *   signal:T-3s   — order placement check/result at T-3s (target = N+1)
  *   signal:T-0     — window-end: PnL of resolving order + DCA fire OR cancel of N+1
  *
  * Event payloads are JSON. Consumers use onSignal(type, handler) with type
@@ -36,7 +36,7 @@ export interface OrderRef {
 
 /**
  * T+0 — start of window N. Fires ONLY when there's an active (pending) auto
- * order targeting N (placed at T-30s of N-1). "Active order is now live."
+ * order targeting N (placed at T-3s of N-1). "Active order is now live."
  */
 export interface SignalT0PlusEvent {
   type:         'T+0';
@@ -68,8 +68,8 @@ export interface SignalT4Event {
   emittedAt:     number;
 }
 
-export interface SignalTMinus30Event {
-  type:          'T-30s';
+export interface SignalTMinus3Event {
+  type:          'T-3s';
   coin:          CoinSymbol;
   windowStart:   number;
   windowEnd:     number;
@@ -82,7 +82,7 @@ export interface SignalTMinus30Event {
   reason?:       string;     // e.g. "ask 60¢ > limit 54¢"
   /** 'boundary' = normal contrarian entry; 'dca' = previous_size × dca_multiplier after a prior loss. */
   signalPath?:   'boundary' | 'dca';
-  /** True if this placement was retried at T-0 of N (after T-30s failed gates). */
+  /** True if this placement was retried at T-0 of N (after T-3s failed gates). */
   lateRetry?:    boolean;
   /**
    * Adaptive threshold context. Present whenever the threshold gate is
@@ -121,21 +121,21 @@ export interface SignalT0Event {
 }
 
 export type SignalBusEvent =
-  | SignalT0PlusEvent | SignalT4Event | SignalTMinus30Event | SignalT0Event;
+  | SignalT0PlusEvent | SignalT4Event | SignalTMinus3Event | SignalT0Event;
 
 // ── Channel names ──────────────────────────────────────────────────────────
 
 const CHANNEL_T0PLUS = 'signal:T+0';
 const CHANNEL_T4     = 'signal:T+4';
-const CHANNEL_T30    = 'signal:T-30s';
+const CHANNEL_T3    = 'signal:T-3s';
 const CHANNEL_T0     = 'signal:T-0';
-const ALL_CHANNELS   = [CHANNEL_T0PLUS, CHANNEL_T4, CHANNEL_T30, CHANNEL_T0] as const;
+const ALL_CHANNELS   = [CHANNEL_T0PLUS, CHANNEL_T4, CHANNEL_T3, CHANNEL_T0] as const;
 
 function channelFor(ev: SignalBusEvent): string {
   switch (ev.type) {
     case 'T+0':   return CHANNEL_T0PLUS;
     case 'T+4':   return CHANNEL_T4;
-    case 'T-30s': return CHANNEL_T30;
+    case 'T-3s': return CHANNEL_T3;
     case 'T-0':   return CHANNEL_T0;
   }
 }

@@ -38,6 +38,12 @@ const TRANSIENT_PATTERNS = [
   // via waitForTokenBalance first, but retry as safety net if still stale.
   'not enough balance',
   'balance is not enough',
+  // Polymarket FAK no-match: book was momentarily empty at our price level
+  // when the order hit the matcher. New asks/bids typically arrive within
+  // 100-500ms — short retries usually catch them. Falls through after
+  // maxAttempts, so genuinely-empty books still error out cleanly.
+  'no orders found to match',
+  'fak orders are partially filled or killed',
 ];
 
 /** Default classifier — true if the error message looks transient. */

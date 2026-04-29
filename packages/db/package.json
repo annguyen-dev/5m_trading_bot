@@ -4,11 +4,13 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".":             "./src/client.ts",
-    "./migrate":     "./src/migrate.ts",
+    ".":             { "types": "./dist/client.d.ts",  "import": "./dist/client.js" },
+    "./migrate":     { "types": "./dist/migrate.d.ts", "import": "./dist/migrate.js" },
     "./migrations":  "./src/migrations/*.sql"
   },
   "scripts": {
+    "build":     "tsc && mkdir -p dist/migrations && cp src/migrations/*.sql dist/migrations/",
+    "dev":       "tsc --watch --preserveWatchOutput",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

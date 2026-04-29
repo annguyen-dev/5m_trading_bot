@@ -1,0 +1,274 @@
+---
+# First-time server setup. Idempotent — safe to re-run.
+#
+# Installs: Node 22 (NodeSource), pnpm (corepack), Docker + compose plugin, ufw.
+# Creates: the bot user and the infra containers (Postgres + Redis) via
+# docker compose. The app itself runs native (systemd) — only Postgres + Redis
+# are containerized.
+#
+# Run:
+#   cd deploy
+#   cp inventory.example.yml        inventory.yml
+#   cp group_vars/all.example.yml   group_vars/all.yml   # fill in secrets
+#   ansible-playbook bootstrap.yml
+
+- name: Bootstrap trading-bot host
+  hosts: all
+  become: true
+  gather_facts: true
+  vars_files:
+    - group_vars/all.yml
+
+  tasks:
+    # ── APT basics ─────────────────────────────────────────────────────────
+    - name: APT — update cache (daily)
+      apt:
+        update_cache: true
+        cache_valid_time: 86400
+
+    - name: APT — install base packages
+      apt:
+        name:
+          - git
+          - rsync
+          - curl
+          - ca-certificates
+          - gnupg
+          - build-essential
+          - ufw
+        state: present
+
+    # ── Node.js 22 via NodeSource ──────────────────────────────────────────
+    - name: NodeSource — install setup script
+      shell: |
+        curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh
+        bash /tmp/nodesource_setup.sh
+      args:
+        creates: /etc/apt/sources.list.d/nodesource.list
+
+    - name: APT — install nodejs
+      apt:
+        name: nodejs
+        state: present
+
+    - name: Corepack — enable pnpm
+      shell: |
+        corepack enable
+        corepack prepare pnpm@10.11.0 --activate
+      args:
+        creates: /usr/bin/pnpm
+
+    # ── PM2 process manager ────────────────────────────────────────────────
+    # Installed globally so the `bot` user can invoke it. Process list +
+    # boot-time autostart are configured later (after the bot user exists).
+    - name: PM2 — install globally via npm
+      npm:
+        name: pm2
+        global: true
+        state: present
+
+    # ── Docker (official apt repo) ─────────────────────────────────────────
+    # docker.io from Ubuntu repos is older; use Docker's own repo for the
+    # up-to-date engine + compose v2 plugin.
+    - name: Docker — apt key dir
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Docker — add apt signing key
+      shell: |
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+          | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: Docker — add apt repo
+      apt_repository:
+        repo: "deb [arch={{ ansible_architecture | replace('x86_64', 'amd64') | replace('aarch64', 'arm64') }} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        filename: docker
+        state: present
+
+    - name: APT — install Docker engine + compose plugin
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Systemd — enable + start docker
+      systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    # ── Bot user ───────────────────────────────────────────────────────────
+    - name: User — create {{ app_user }}
+      user:
+        name: "{{ app_user }}"
+        shell: /bin/bash
+        create_home: true
+
+    - name: User — add {{ app_user }} to docker group (manage containers without sudo)
+      user:
+        name: "{{ app_user }}"
+        groups: docker
+        append: true
+
+    # Copy the connecting user's SSH authorized_keys to {{ app_user }} so
+    # subsequent deploy.yml runs can SSH in directly as `bot` — no sudo,
+    # no `rsync_path` workaround. One-time setup.
+    - name: SSH — read connecting user's authorized_keys
+      slurp:
+        src: "{{ '/root' if ansible_user == 'root' else '/home/' + ansible_user }}/.ssh/authorized_keys"
+      register: src_authkeys
+
+    - name: SSH — install authorized_keys for {{ app_user }}
+      authorized_key:
+        user: "{{ app_user }}"
+        state: present
+        key:  "{{ src_authkeys.content | b64decode }}"
+
+    # PM2 boot-time autostart: registers a systemd unit `pm2-{{ app_user }}.service`
+    # which restores the saved PM2 process list on reboot. One-time install;
+    # `creates:` makes it idempotent.
+    - name: PM2 — register systemd boot script for {{ app_user }}
+      command: pm2 startup systemd -u {{ app_user }} --hp /home/{{ app_user }}
+      args:
+        creates: /etc/systemd/system/pm2-{{ app_user }}.service
+
+    - name: Dir — ensure {{ app_dir }} exists, owned by {{ app_user }}
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0755'
+
+    - name: Dir — logs/ (writable, survives code redeploys)
+      file:
+        path: "{{ app_dir }}/logs"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0755'
+
+    - name: Dir — infra/ (for the docker-compose stack)
+      file:
+        path: "{{ app_dir }}/infra"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0755'
+
+    # ── nginx reverse proxy: TLS cert + config ────────────────────────────
+    - name: Dir — infra/certs (self-signed TLS material)
+      file:
+        path: "{{ app_dir }}/infra/certs"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0700'
+
+    - name: nginx — generate self-signed cert (10y validity) if missing
+      command: >
+        openssl req -x509 -nodes -newkey rsa:4096
+          -keyout {{ app_dir }}/infra/certs/selfsigned.key
+          -out    {{ app_dir }}/infra/certs/selfsigned.crt
+          -days   3650
+          -subj   "/CN={{ ansible_host | default(inventory_hostname) }}/O=trading-bot"
+      args:
+        creates: "{{ app_dir }}/infra/certs/selfsigned.crt"
+
+    - name: nginx — chmod cert files to bot user
+      file:
+        path: "{{ item }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0600'
+      loop:
+        - "{{ app_dir }}/infra/certs/selfsigned.key"
+        - "{{ app_dir }}/infra/certs/selfsigned.crt"
+
+    - name: nginx — render nginx.conf
+      template:
+        src: templates/nginx.conf.j2
+        dest: "{{ app_dir }}/infra/nginx.conf"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0640'
+      register: nginx_conf
+
+    # ── Infra containers: Postgres + Redis + nginx ────────────────────────
+    - name: Infra — render docker-compose.yml
+      template:
+        src: templates/docker-compose.infra.yml.j2
+        dest: "{{ app_dir }}/infra/docker-compose.yml"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0640'
+      register: compose_template
+
+    - name: Infra — docker compose up -d (postgres + redis + nginx)
+      command: docker compose up -d
+      args:
+        chdir: "{{ app_dir }}/infra"
+      become_user: "{{ app_user }}"
+      when: compose_template.changed or nginx_conf.changed or force_infra_up | default(false)
+      changed_when: true
+
+    - name: Infra — reload nginx if config changed but compose unchanged
+      command: docker exec trading-bot-nginx nginx -s reload
+      become_user: "{{ app_user }}"
+      when: nginx_conf.changed and not compose_template.changed
+      changed_when: true
+      failed_when: false      # container may not exist on first run — covered by compose up above
+
+    - name: Infra — wait for Postgres to accept connections
+      command: >
+        docker exec trading-bot-postgres pg_isready -U {{ pg_user }} -d {{ pg_database }}
+      register: pg_ready
+      retries: 20
+      delay: 2
+      until: pg_ready.rc == 0
+      changed_when: false
+
+    - name: Infra — wait for Redis
+      command: docker exec trading-bot-redis redis-cli ping
+      register: redis_ready
+      retries: 10
+      delay: 2
+      until: redis_ready.rc == 0 and 'PONG' in (redis_ready.stdout | default(''))
+      changed_when: false
+
+    # ── Firewall ───────────────────────────────────────────────────────────
+    # Public traffic only on 80 (auto-redirects to 443) and 443 (TLS via
+    # nginx). The api port {{ api_port }} stays internal — nginx reaches
+    # it via the docker bridge, no external exposure needed.
+    - name: UFW — allow SSH
+      ufw:
+        rule: allow
+        name: OpenSSH
+
+    - name: UFW — allow HTTP (80) for redirect + healthcheck
+      ufw:
+        rule: allow
+        port: "80"
+        proto: tcp
+
+    - name: UFW — allow HTTPS (443)
+      ufw:
+        rule: allow
+        port: "443"
+        proto: tcp
+
+    - name: UFW — enable
+      ufw:
+        state: enabled
+        policy: deny
+        direction: incoming

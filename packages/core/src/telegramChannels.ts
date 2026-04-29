@@ -6,7 +6,7 @@
  *   - coins: symbols to subscribe to (empty = ALL enabled coins)
  *   - info_types: which event categories to forward:
  *       'signal' → T+4 (streak emission)
- *       'order'  → T+0 (active), T-30s (placement), T-0 (close/DCA/cancel)
+ *       'order'  → T+0 (active), T-3s (placement), T-0 (close/DCA/cancel)
  *     (empty = ALL)
  *   - enabled: toggle without losing config
  *

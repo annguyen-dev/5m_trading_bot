@@ -1,0 +1,122 @@
+{{ ansible_managed | comment }}
+# nginx reverse proxy for trading-bot.
+#   :80   → 301 redirect to :443
+#   :443  → TLS (self-signed cert) → host.docker.internal:{{ api_port }}
+#
+# The api server (PM2 on the host) serves both /api/* and the FE static
+# bundle (`FRONTEND_DIST` env). nginx just terminates TLS and forwards.
+#
+# SSE endpoints get dedicated location blocks because nginx's default
+# proxy_buffering breaks long-lived event streams.
+
+worker_processes auto;
+
+events {
+  worker_connections 1024;
+}
+
+http {
+  # Logging — keep brief; PM2 + pino already log everything app-side.
+  log_format main '$remote_addr - [$time_iso8601] "$request" $status '
+                  '$body_bytes_sent "$http_referer" "$http_user_agent" '
+                  '$request_time';
+  access_log /var/log/nginx/access.log main;
+  error_log  /var/log/nginx/error.log  warn;
+
+  sendfile        on;
+  tcp_nopush      on;
+  tcp_nodelay     on;
+  keepalive_timeout  65;
+  types_hash_max_size 2048;
+  client_max_body_size 16m;
+
+  # Gzip — saves bandwidth on FE bundle. JSON responses also compress nicely.
+  gzip on;
+  gzip_vary on;
+  gzip_proxied any;
+  gzip_comp_level 4;
+  gzip_types text/plain text/css application/json application/javascript
+             text/xml application/xml application/xml+rss text/javascript
+             image/svg+xml;
+
+  upstream api_upstream {
+    # nginx runs with `network_mode: host` (see docker-compose.infra.yml.j2),
+    # so it shares the host's network namespace and reaches the PM2 api on
+    # plain loopback — same as if nginx were apt-installed.
+    server 127.0.0.1:{{ api_port }};
+    keepalive 32;
+  }
+
+  # ── HTTP → HTTPS redirect ───────────────────────────────────────────────
+  server {
+    listen      80;
+    listen      [::]:80;
+    server_name _;
+
+    # Allow HTTP healthcheck before TLS handshake (e.g. UptimeRobot)
+    location = /api/health {
+      proxy_pass http://api_upstream;
+    }
+
+    location / {
+      return 301 https://$host$request_uri;
+    }
+  }
+
+  # ── HTTPS (self-signed) ─────────────────────────────────────────────────
+  server {
+    listen      443 ssl;
+    listen      [::]:443 ssl;
+    http2 on;
+    server_name _;
+
+    ssl_certificate     /etc/nginx/certs/selfsigned.crt;
+    ssl_certificate_key /etc/nginx/certs/selfsigned.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    # ── SSE endpoints ─────────────────────────────────────────────────────
+    # nginx's defaults (proxy_buffering on, short read timeout) break SSE —
+    # the connection appears to "stall" on the FE. Disable buffering and
+    # let the connection live for hours.
+    location /api/poly/stream {
+      proxy_pass         http://api_upstream;
+      proxy_http_version 1.1;
+      proxy_set_header   Host              $host;
+      proxy_set_header   X-Real-IP         $remote_addr;
+      proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+      proxy_set_header   X-Forwarded-Proto https;
+      proxy_set_header   Connection        "";
+      proxy_buffering    off;
+      proxy_cache        off;
+      proxy_read_timeout 24h;
+      chunked_transfer_encoding off;
+    }
+
+    location /api/backtest/progress {
+      proxy_pass         http://api_upstream;
+      proxy_http_version 1.1;
+      proxy_set_header   Host              $host;
+      proxy_set_header   X-Real-IP         $remote_addr;
+      proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+      proxy_set_header   X-Forwarded-Proto https;
+      proxy_set_header   Connection        "";
+      proxy_buffering    off;
+      proxy_cache        off;
+      proxy_read_timeout 1h;
+    }
+
+    # ── Everything else (REST + FE static bundle) ─────────────────────────
+    location / {
+      proxy_pass         http://api_upstream;
+      proxy_http_version 1.1;
+      proxy_set_header   Host              $host;
+      proxy_set_header   X-Real-IP         $remote_addr;
+      proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+      proxy_set_header   X-Forwarded-Proto https;
+      proxy_set_header   Connection        "";
+    }
+  }
+}

@@ -1,0 +1,70 @@
+{{ ansible_managed | comment }}
+# Infra containers for trading-bot. App runs native via systemd.
+# Brought up by bootstrap.yml; survives across deploys.
+#
+# Postgres + Redis bind to 127.0.0.1 only — not exposed publicly.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: trading-bot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     {{ pg_user }}
+      POSTGRES_PASSWORD: {{ pg_password }}
+      POSTGRES_DB:       {{ pg_database }}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=C"
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:     ["CMD-SHELL", "pg_isready -U {{ pg_user }} -d {{ pg_database }}"]
+      interval: 10s
+      timeout:  3s
+      retries:  5
+
+  redis:
+    image: redis:7-alpine
+    container_name: trading-bot-redis
+    restart: unless-stopped
+    # `--appendonly yes` → durable persistence (AOF). Cheap for our event volume.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test:     ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout:  3s
+      retries:  5
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: trading-bot-nginx
+    restart: unless-stopped
+    # Public-facing on 80/443 — terminates TLS, forwards to host's PM2 api.
+    #
+    # network_mode: host puts nginx in the host's network namespace so:
+    #   - It binds 80/443 directly on the host (no `ports:` mapping needed)
+    #   - It reaches the api at `127.0.0.1:{{ api_port }}` directly
+    # This sidesteps the host.docker.internal flakiness on Linux (UFW + the
+    # docker bridge gateway don't always cooperate), and is the simplest
+    # path for a single-host deploy where nginx is the only public entrypoint.
+    network_mode: host
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    healthcheck:
+      test:     ["CMD", "wget", "-qO-", "http://127.0.0.1/api/health"]
+      interval: 30s
+      timeout:  5s
+      retries:  3
+      start_period: 10s
+
+volumes:
+  postgres_data:
+    name: trading-bot-postgres-data
+  redis_data:
+    name: trading-bot-redis-data

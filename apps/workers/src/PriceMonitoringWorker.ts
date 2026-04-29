@@ -6,7 +6,7 @@
  * which phase event to emit for the current window:
  *
  *   T+4m   — signal only (streak + direction + price) via Redis
- *   T-30s  — order placement (if config.mode = 'signal_and_order')
+ *   T-3s   — order placement (if config.mode = 'signal_and_order')
  *   T-0    — window close confirmation with outcome + PnL
  *
  * The worker DOES NOT talk to FE or Telegram directly. It publishes events on
@@ -19,7 +19,7 @@
 
 import { log } from '@trading-bot/core/logger';
 import type {
-  SignalBus, SignalT0PlusEvent, SignalT4Event, SignalTMinus30Event,
+  SignalBus, SignalT0PlusEvent, SignalT4Event, SignalTMinus3Event,
   SignalT0Event, VolumeBucket, OrderRef,
 } from '@trading-bot/core/SignalBus';
 import { PolymarketService, type PolyClobMarket, type ShareTick } from '@trading-bot/core/PolymarketService';
@@ -35,18 +35,23 @@ import { getPool } from '@trading-bot/db';
 const TICK_MS    = 5_000;
 const WINDOW_MS  = 300_000;
 
-// Phase slots. Each must be ≥ TICK_MS wide so ticks are guaranteed to land
-// in them. Dedup keys ensure each phase fires at most once per window.
+// Phase slots. Tick-driven phases must be ≥ TICK_MS wide. T-3s placement is
+// NOT tick-driven — it's scheduled precisely via setTimeout from phaseT4 so
+// the order fires exactly 3s before window close (was 30s; users observed
+// the current candle flipping in the 27s leading up to close).
 //
-//   T+0      → window-start: notify if there's an active order targeting N
-//   T+4      → emit signal (bet will be placed for window N+1 at T-30s)
-//   T-30s    → place auto order for window N+1 (contrarian to streak)
-//   T-0      → window N close: if active order, report PnL & maybe DCA;
-//              if no active order + current reversed, cancel N+1 outgoing.
+//   T+0     → window-start: notify if there's an active order targeting N
+//   T+4     → emit signal (bet will be placed for window N+1 at T-3s)
+//   T-3s    → scheduled via setTimeout in phaseT4 success path —
+//             places the auto order for window N+1 (contrarian)
+//   T-0     → window N close: if active order, report PnL & maybe DCA;
+//             if no active order + current reversed, cancel N+1 outgoing.
 const T_PLUS_0_END_MS = 5_000;   // T+0 phase = first tick of window
-const T_PLUS_4_MS     = 240_000; // T+4m
-const T_MINUS_30_MS   = 270_000; // T+4:30 = T_close - 30s
+const T_PLUS_4_MS     = 240_000; // T+4m — start of T+4 retry slot
 const T_MINUS_0_MS    = 295_000; // T+4:55 — wide enough that a 5s tick always lands inside
+
+/** Milliseconds before window close to fire the scheduled placement. */
+const PLACEMENT_LEAD_MS = 3_000;
 
 /** Binance kline symbol per coin. HYPE is absent here on purpose — it's not
  *  reliably listed on Binance spot, so we route it to Pyth below. */
@@ -69,15 +74,44 @@ interface CoinState {
   poly:    PolymarketService;
   /** Window-bucketed dedup set for phases already emitted. Key = `${windowStart}:${phase}`. */
   emitted: Set<string>;
-  /** Cached signal from T+4 for use at T-30s. */
+  /** Cached signal from T+4 for use at T-3s placement. */
   lastT4?: SignalT4Event;
   /**
-   * True if a DCA already fired in the current loss cycle. Cleared on ANY
-   * win (boundary OR DCA). Prevents DCA cascading on consecutive losses;
-   * caller must wait for a winning trade to reset and try DCA again.
-   * In-memory only — workers restart loses cycle state (acceptable for MVP).
+   * Cycle state — a "cycle" begins when the bot enters a new contrarian bet
+   * (cycleActive=false → T-3s places a boundary order at base size → cycleActive=true).
+   * It ends on the next strategy WIN (window outcome matches our bet direction).
+   *
+   * Placement model (split by phase):
+   *   T-3s of N — INITIAL ENTRY only. Fires when cycleActive=false AND
+   *               effective streak (closed + current candle) ≥ adaptive
+   *               threshold. Skips entirely if a cycle is already running.
+   *   T+0  of N — CONTINUATION (DCA). Fires when cycleActive=true AND just-
+   *               closed window N was a LOSS. Computes the streak length AS
+   *               OF window N+1's start (= includes N's loss) and gates on
+   *               `cfg.dca_streak_whitelist`:
+   *                 - streak ∈ whitelist → place DCA, size = lastCycleOrderSize ×
+   *                   dca_multiplier (first DCA: cfg.size_usdc × dca_multiplier)
+   *                 - empty whitelist    → fire on every loss
+   *                 - streak ∉ whitelist → silent skip
+   *
+   * Why DCA at T+0 and not T-3s: at T-3s the just-completing candle isn't in
+   * `t4.streak` yet. Whitelist=[4] with current order at streak=3 about to
+   * lose would see `absStreak=3` and silently skip. T+0 sees the real post-
+   * loss streak.
+   *
+   * Example (size_usdc=$2, dca_multiplier=2, whitelist=[4,6,8]):
+   *   streak=3 boundary → cycle starts, $2 order on N+1
+   *   N+1 loses → at T+0 of N+1, streak=4 ✓ → DCA $4 on N+2 (lastSize → $4)
+   *   N+2 loses → at T+0 of N+2, streak=5 ✗ → skip; cycle continues
+   *   N+3 loses → at T+0 of N+3, streak=6 ✓ → DCA $8 on N+4 (lastSize → $8)
+   *   ... win → cycle reset; next T-3s eligible to start a fresh cycle at $2.
+   *
+   * In-memory; workers restart loses cycle state (acceptable for MVP).
    */
-  dcaFiredInCycle: boolean;
+  cycleActive:        boolean;
+  cycleDirection?:    'up' | 'down';   // bot's bet side for this cycle
+  lastCycleOrderSize: number | null;
+  dcaFiredCount:      number;
   /**
    * Recent |streak| values from emitted T+4 signals (last up to 5 entries).
    * Feeds the small-adjust inside a schedule window: if the last 2 entries
@@ -85,6 +119,12 @@ interface CoinState {
    * by +1 so the bot waits for a stronger signal next round. In-memory only.
    */
   recentStreakAbs: number[];
+  /**
+   * One-shot timer scheduled by phaseT4 to fire phaseTMinus3 at exactly
+   * windowEnd - PLACEMENT_LEAD_MS. Cleared on worker stop and on each new
+   * T+4 emission (only the latest cached signal fires).
+   */
+  pendingPlacementTimer?: ReturnType<typeof setTimeout>;
 }
 
 export class PriceMonitoringWorker {
@@ -159,6 +199,10 @@ export class PriceMonitoringWorker {
     this.running = false;
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
     for (const st of this.coins.values()) {
+      if (st.pendingPlacementTimer) {
+        clearTimeout(st.pendingPlacementTimer);
+        delete st.pendingPlacementTimer;
+      }
       try { await st.poly.stop(); } catch { /* ignore */ }
     }
     this.coins.clear();
@@ -188,7 +232,9 @@ export class PriceMonitoringWorker {
     await poly.start();
     this.coins.set(symbol, {
       symbol, poly, emitted: new Set(),
-      dcaFiredInCycle: false,
+      cycleActive:        false,
+      lastCycleOrderSize: null,
+      dcaFiredCount:      0,
       recentStreakAbs: [],
     });
     log('info', `PriceMonitoringWorker: tracking ${symbol}`);
@@ -212,10 +258,10 @@ export class PriceMonitoringWorker {
 
         if (msFromStart < T_PLUS_0_END_MS) {
           await this.phaseT0Plus(state, cfg, windowStart, windowEnd);
-        } else if (msFromStart >= T_PLUS_4_MS && msFromStart < T_MINUS_30_MS) {
+        } else if (msFromStart >= T_PLUS_4_MS && msFromStart < T_MINUS_0_MS) {
+          // T+4 retry slot extends right up to T-0. Successful T+4 schedules
+          // a one-shot setTimeout for phaseTMinus3 at windowEnd - 3s.
           await this.phaseT4(state, cfg, windowStart, windowEnd);
-        } else if (msFromStart >= T_MINUS_30_MS && msFromStart < T_MINUS_0_MS) {
-          await this.phaseTMinus30(state, cfg, windowStart, windowEnd);
         } else if (msFromStart >= T_MINUS_0_MS) {
           await this.phaseT0(state, cfg, windowStart, windowEnd);
         }
@@ -375,6 +421,33 @@ export class PriceMonitoringWorker {
     };
   }
 
+  /**
+   * Schedule the precise T-3s placement firing. Idempotent — clears any
+   * previous timer for this coin so only the latest T+4 emission's timer
+   * is live (re-emitting via late-eval paths replaces the schedule).
+   *
+   * If T+4 fired so late that T-3s is already past, fires immediately —
+   * `phaseTMinus3` itself dedups via `state.emitted`.
+   */
+  private schedulePlacement(
+    state: CoinState, cfg: CoinConfig, windowStart: number, windowEnd: number,
+  ): void {
+    if (state.pendingPlacementTimer) clearTimeout(state.pendingPlacementTimer);
+    const fireAt = windowEnd - PLACEMENT_LEAD_MS;
+    const delay  = fireAt - Date.now();
+    if (delay <= 0) {
+      // Already past T-3s — fire immediately (still has time before window close).
+      void this.phaseTMinus3(state, cfg, windowStart, windowEnd);
+      return;
+    }
+    const timer = setTimeout(() => {
+      delete state.pendingPlacementTimer;
+      void this.phaseTMinus3(state, cfg, windowStart, windowEnd);
+    }, delay);
+    timer.unref();    // don't keep the event loop alive on shutdown
+    state.pendingPlacementTimer = timer;
+  }
+
   private async phaseT4(
     state: CoinState, cfg: CoinConfig, windowStart: number, windowEnd: number,
   ): Promise<void> {
@@ -387,36 +460,52 @@ export class PriceMonitoringWorker {
       state.lastT4 = result.event;
       state.emitted.add(key);
       this.recordStreakAbs(state, result.event.streak);
+      this.schedulePlacement(state, cfg, windowStart, windowEnd);
       log('info', `PriceMonitoringWorker T+4 ${state.symbol}`, {
         streak: result.event.streak, direction: result.event.direction,
         price: result.event.price, mode: cfg.mode,
       });
     } else if (result.persistentSkip) {
-      state.emitted.add(key);   // permanent — don't retry
+      state.emitted.add(key);   // permanent — don't retry, no T-3s needed
       log('info', `PriceMonitoringWorker T+4 skip ${state.symbol} (permanent)`, {
         reason: result.reason,
       });
     } else {
       // Transient skip (current candle flipped against streak). Don't add
-      // emitted → retry next tick. Stays in T+4 phase until 270s, after which
-      // phaseTMinus30 + phaseT0 each take one more shot via inline eval.
-      log('info', `PriceMonitoringWorker T+4 transient skip ${state.symbol} (will retry)`, {
+      // emitted → retry next tick. ALSO schedule the T-3s timer right here
+      // (idempotent — schedulePlacement no-ops if a timer is already live)
+      // so T-3s STILL fires even if T+4 never produces a signal across all
+      // its retries. phaseTMinus3 will then re-evaluate the gates with fresh
+      // data and place an order if conditions allow — independently of
+      // whether T+4 ever emitted. (User-requested: T+4 = preview, T-3s/T+0
+      // are the actual decision points.)
+      if (!state.pendingPlacementTimer) {
+        this.schedulePlacement(state, cfg, windowStart, windowEnd);
+      }
+      log('info', `PriceMonitoringWorker T+4 transient skip ${state.symbol} (will retry; T-3s armed)`, {
         reason: result.reason,
       });
     }
   }
 
-  private async phaseTMinus30(
+  /**
+   * T-3s placement — invoked precisely 3s before window close by a setTimeout
+   * scheduled in `phaseT4`. Also called inline by `phaseT0` Path E as a
+   * last-chance retry when T+4 never produced a signal.
+   *
+   * Idempotent via the `T-3s` emitted key (so timer + Path E + late T+4 races
+   * collapse to one placement).
+   */
+  private async phaseTMinus3(
     state: CoinState, cfg: CoinConfig, windowStart: number, windowEnd: number,
   ): Promise<void> {
-    const key = `${windowStart}:T-30s`;
+    const key = `${windowStart}:T-3s`;
     if (state.emitted.has(key)) return;
     state.emitted.add(key);
 
     // If T+4 phase never published a signal (e.g. candle was flipped during
-    // 240-270s and never recovered before phaseTMinus30 took over), do one
-    // last-chance evaluation here. If gates now pass we publish the T+4
-    // signal late and proceed with placement.
+    // the entire T+4 retry slot and never recovered), do one last-chance
+    // evaluation here so a late-emerging streak still gets placed.
     let t4 = state.lastT4;
     if (!t4 || t4.windowStart !== windowStart) {
       const result = await this.evaluateT4Gates(state, cfg, windowStart, windowEnd);
@@ -425,11 +514,11 @@ export class PriceMonitoringWorker {
         state.lastT4 = result.event;
         t4 = result.event;
         this.recordStreakAbs(state, result.event.streak);
-        log('info', `phaseTMinus30 late T+4 eval ok ${state.symbol}`, {
+        log('info', `phaseTMinus3 late T+4 eval ok ${state.symbol}`, {
           streak: result.event.streak, direction: result.event.direction,
         });
       } else {
-        log('info', `phaseTMinus30 late T+4 eval skip ${state.symbol}`, {
+        log('info', `phaseTMinus3 late T+4 eval skip ${state.symbol}`, {
           reason: result.reason,
         });
         return;
@@ -437,8 +526,8 @@ export class PriceMonitoringWorker {
     }
 
     if (cfg.mode === 'signal_only') {
-      await this.bus.publish<SignalTMinus30Event>({
-        type: 'T-30s', coin: state.symbol,
+      await this.bus.publish<SignalTMinus3Event>({
+        type: 'T-3s', coin: state.symbol,
         windowStart, windowEnd,
         action: 'signal_only_mode', emittedAt: Date.now(),
       });
@@ -447,8 +536,8 @@ export class PriceMonitoringWorker {
 
     const result = await this.tryPlaceBoundary(state, cfg, t4);
     if (result.placed && result.orderId) {
-      await this.bus.publish<SignalTMinus30Event>({
-        type: 'T-30s', coin: state.symbol,
+      await this.bus.publish<SignalTMinus3Event>({
+        type: 'T-3s', coin: state.symbol,
         windowStart, windowEnd,
         action: 'order_placed',
         orderId:   result.orderId,
@@ -460,8 +549,8 @@ export class PriceMonitoringWorker {
         emittedAt: Date.now(),
       });
     } else {
-      await this.bus.publish<SignalTMinus30Event>({
-        type: 'T-30s', coin: state.symbol,
+      await this.bus.publish<SignalTMinus3Event>({
+        type: 'T-3s', coin: state.symbol,
         windowStart, windowEnd,
         action: 'order_skipped',
         reason: result.reason ?? '(unknown)',
@@ -473,12 +562,27 @@ export class PriceMonitoringWorker {
   }
 
   /**
-   * Re-evaluate all T-30s gates and place a boundary order if they all pass.
-   * Pure function (no event publish, no log) — caller decides what to do.
-   * Returns `{placed, reason}` describing outcome.
+   * T-3s INITIAL ENTRY only — opens a fresh cycle by placing a boundary order
+   * for window N+1 when no cycle is active.
    *
-   * Called from phaseTMinus30 (primary) and phaseT0 (late retry — same gates,
-   * 30s later in case the candle/ask flipped back into a tradeable state).
+   * In-cycle DCA is no longer placed here. Reason: at T-3s the just-closed
+   * candle isn't in `t4.streak` yet, so checking `|t4.streak|` against the
+   * DCA whitelist mis-fires by one — e.g., whitelist=[4], current order at
+   * streak=3 about to lose, T-3s sees absStreak=3 (∉ [4]) and silently skips
+   * the DCA. By moving DCA to T+0 (`tryPlaceDcaAtBoundary`) we evaluate after
+   * window N closes, so the streak we check INCLUDES the loss.
+   *
+   * Gates here (cycle inactive):
+   *   1. Current candle direction still matches streak (no flip)
+   *   2. Effective streak (|t4.streak| + 1) ≥ adaptive threshold
+   *   3. N+1 market exists
+   *   4. No duplicate auto order already on N+1
+   *   5. Best ask ≤ cfg.limit_price_cents
+   *
+   * If cycle IS active when we get here, return early with reason — Path A is
+   * skipped because Path B (DCA) owns continuation, and it fires at T+0.
+   *
+   * Called from phaseTMinus3 (primary) and phaseT0 Path E (last-chance retry).
    */
   private async tryPlaceBoundary(
     state: CoinState, cfg: CoinConfig, t4: SignalT4Event,
@@ -488,6 +592,7 @@ export class PriceMonitoringWorker {
     orderId?:  string;
     price?:    number;
     sizeUsdc?: number;
+    signalPath?: 'boundary' | 'dca';
     adaptive?: {
       base:      number;
       threshold: number;
@@ -507,6 +612,16 @@ export class PriceMonitoringWorker {
       });
     }
 
+    // If a cycle is already running, T-3s does NOT place. DCA continuation
+    // fires at T+0 of the next window where we know the actual loss outcome.
+    if (state.cycleActive && state.cycleDirection != null) {
+      return {
+        placed: false,
+        reason: 'cycle active — DCA fires at T+0 of next window, not here',
+        adaptive,
+      };
+    }
+
     // Gate 1: current candle direction must still match streak
     const currentIcon = await fetchInProgressIcon(state.symbol, t4.windowStart);
     const expectedIcon = t4.streak > 0 ? '🟢' : '🔴';
@@ -518,8 +633,9 @@ export class PriceMonitoringWorker {
       };
     }
 
-    // Gate 2: effective streak (closed + 1 confirmed in-progress) ≥ auto_min
     const absStreak = Math.abs(t4.streak);
+
+    // Gate 2: effective streak (closed + current candle counted) ≥ threshold
     const effectiveStreak = absStreak + 1;
     if (effectiveStreak < adapt.threshold) {
       return {
@@ -534,13 +650,14 @@ export class PriceMonitoringWorker {
     const market = await state.poly.findMarketAt(Math.floor(nextWindowStartMs / 1000));
     if (!market) return { placed: false, reason: 'no N+1 market', adaptive };
 
-    // Gate 4: not already placed (dedup)
-    if (await hasAutoOrderFor(market.conditionId, 'boundary')) {
-      return { placed: false, reason: 'boundary order already exists for N+1', adaptive };
+    // Gate 4: not already placed (dedup) — any auto order on N+1.
+    if (await hasAutoOrderFor(market.conditionId)) {
+      return { placed: false, reason: 'auto order already exists for N+1', adaptive };
     }
 
     // Gate 5: ask ≤ limit
-    const tokenId = t4.direction === 'up' ? market.tokenUp : market.tokenDown;
+    const direction = t4.direction;
+    const tokenId = direction === 'up' ? market.tokenUp : market.tokenDown;
     const book = await state.poly.getOrderBook(tokenId);
     const ask = bestAskFromBook(book);
     if (ask == null) return { placed: false, reason: 'no valid ask', adaptive };
@@ -550,23 +667,38 @@ export class PriceMonitoringWorker {
         adaptive };
     }
 
-    // Place
+    // Place — initial entry, base size only.
+    const orderSize  = cfg.size_usdc;
+    const signalPath: 'boundary' = 'boundary';
+
     try {
       const r = await recordOrder({
-        conditionId: market.conditionId,
-        direction:   t4.direction,
-        sharePrice:  ask,
-        sizeUsdc:    cfg.size_usdc,
-        source:      'auto',
-        signalPath:  'boundary',
-        tpCents:     cfg.tp_cents,
-        slCents:     cfg.sl_cents,
+        conditionId:    market.conditionId,
+        direction,
+        sharePrice:     ask,
+        sizeUsdc:       orderSize,
+        source:         'auto',
+        signalPath,
+        tpCents:        cfg.tp_cents,
+        slCents:        cfg.sl_cents,
+        streakAtSignal: absStreak,
       });
+
+      // Cycle starts.
+      state.cycleActive        = true;
+      state.cycleDirection     = direction;
+      state.lastCycleOrderSize = null;
+      state.dcaFiredCount      = 0;
+      log('info', `Boundary placed (cycle start) ${state.symbol}`, {
+        streakAbs: absStreak, direction, size: orderSize,
+      });
+
       return {
-        placed:   true,
-        orderId:  r.id,
-        price:    ask,
-        sizeUsdc: cfg.size_usdc,
+        placed:    true,
+        orderId:   r.id,
+        price:     ask,
+        sizeUsdc:  orderSize,
+        signalPath,
         adaptive,
       };
     } catch (err) {
@@ -579,8 +711,118 @@ export class PriceMonitoringWorker {
   }
 
   /**
+   * Place a DCA continuation order at the window boundary, after the previous
+   * window's loss has been confirmed.
+   *
+   * Called from `phaseT0` once we know window N's outcome was a LOSS for the
+   * cycle direction. Targets window N+1 (the one that just opened).
+   *
+   * The streak we check against `dca_streak_whitelist` is computed via
+   * `fetchStreakWithVolume(symbol, nextWindowStart)` — which walks closed
+   * bars BEFORE `nextWindowStart`, i.e. INCLUDES window N. So whitelist=[4]
+   * fires when N's loss made the streak length exactly 4.
+   *
+   * Returns silently on any skip (whitelist mismatch, no market, no ask, etc).
+   */
+  private async tryPlaceDcaAtBoundary(
+    state: CoinState, cfg: CoinConfig,
+    justClosedWindowStart: number,
+  ): Promise<void> {
+    if (!state.cycleActive || state.cycleDirection == null) return;
+
+    const nextWindowStart = justClosedWindowStart + WINDOW_MS;
+
+    // Compute streak as of nextWindowStart — includes the just-closed loss.
+    const { streak } = await fetchStreakWithVolume(state.symbol, nextWindowStart);
+    const absStreak = Math.abs(streak);
+    const direction = state.cycleDirection;
+
+    // Whitelist gate. Empty whitelist = always fire on loss (legacy default).
+    const whitelist = cfg.dca_streak_whitelist ?? [];
+    if (whitelist.length > 0 && !whitelist.includes(absStreak)) {
+      log('info', `DCA skip ${state.symbol}: streak ${absStreak} ∉ whitelist [${whitelist.join(',')}]`, {
+        nextWindowStart, direction,
+      });
+      return;
+    }
+
+    // Sanity: streak direction must still oppose our (contrarian) bet.
+    // If somehow it flipped (data anomaly, etc), skip — Path A will reopen
+    // a fresh cycle if conditions justify.
+    const streakDirection = streak > 0 ? 'up' : 'down';
+    if (streakDirection === direction) {
+      log('warn', `DCA skip ${state.symbol}: streak direction matches our bet (no longer contrarian)`, {
+        nextWindowStart, streak, cycleDirection: direction,
+      });
+      return;
+    }
+
+    const market = await state.poly.findMarketAt(Math.floor(nextWindowStart / 1000));
+    if (!market) { log('info', `DCA skip ${state.symbol}: no N+1 market`, { nextWindowStart }); return; }
+
+    if (await hasAutoOrderFor(market.conditionId)) {
+      log('info', `DCA skip ${state.symbol}: auto order already exists for N+1`, {
+        conditionId: market.conditionId,
+      });
+      return;
+    }
+
+    const tokenId = direction === 'up' ? market.tokenUp : market.tokenDown;
+    const book = await state.poly.getOrderBook(tokenId);
+    const ask = bestAskFromBook(book);
+    if (ask == null) { log('info', `DCA skip ${state.symbol}: no valid ask`, { tokenId }); return; }
+    if (ask * 100 > cfg.limit_price_cents) {
+      log('info', `DCA skip ${state.symbol}: ask ${(ask * 100).toFixed(1)}¢ > limit ${cfg.limit_price_cents}¢`);
+      return;
+    }
+
+    const baseSize  = state.lastCycleOrderSize ?? cfg.size_usdc;
+    const orderSize = baseSize * cfg.dca_multiplier;
+
+    try {
+      const r = await recordOrder({
+        conditionId:    market.conditionId,
+        direction,
+        sharePrice:     ask,
+        sizeUsdc:       orderSize,
+        source:         'auto',
+        signalPath:     'dca',
+        tpCents:        cfg.tp_cents,
+        slCents:        cfg.sl_cents,
+        streakAtSignal: absStreak,
+      });
+
+      state.lastCycleOrderSize = orderSize;
+      state.dcaFiredCount     += 1;
+      log('info', `DCA placed at boundary ${state.symbol}`, {
+        orderId: r.id, streakAbs: absStreak, direction, ask,
+        size: orderSize, multiplier: cfg.dca_multiplier,
+        dcaCountInCycle: state.dcaFiredCount,
+      });
+
+      // Surface to bus so UI/Telegram see the placement under the new window.
+      const nextWindowEnd = nextWindowStart + WINDOW_MS;
+      await this.bus.publish<SignalTMinus3Event>({
+        type: 'T-3s', coin: state.symbol,
+        windowStart: nextWindowStart, windowEnd: nextWindowEnd,
+        action:     'order_placed',
+        orderId:    r.id,
+        direction,
+        price:      ask,
+        sizeUsdc:   orderSize,
+        signalPath: 'dca',
+        emittedAt:  Date.now(),
+      });
+    } catch (err) {
+      log('warn', `DCA place failed ${state.symbol}`, {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
    * T+0 — start of window N. Notifies (Telegram + UI) when there's an active
-   * (pending) auto order targeting N (placed at T-30s of N-1). Skips silently
+   * (pending) auto order targeting N (placed at T-3s of N-1). Skips silently
    * when no such order exists.
    */
   private async phaseT0Plus(
@@ -611,7 +853,7 @@ export class PriceMonitoringWorker {
    * T-0 — end of window N. Branches (mutually exclusive — at most one auto
    * order placed per call):
    *
-   *   (A) Incoming order (placed at N-1's T-30s, resolving at N) LOST AND
+   *   (A) Incoming order (placed at N-1's T-3s, resolving at N) LOST AND
    *       !dcaFiredInCycle → place ONE DCA for N+1 (size = loser ×
    *       cfg.dca_multiplier), set dcaFiredInCycle=true. Telegram includes
    *       "DCA recovery" line.
@@ -622,8 +864,8 @@ export class PriceMonitoringWorker {
    *   (D) No incoming + streak BROKE at N → cancel outgoing N+1 (Path B
    *       legacy logic, kept per user requirement).
    *   (E) No incoming + streak INTACT + signal_and_order → T-0 boundary
-   *       retry. Re-runs T-30s gates (current candle, ask). Lets us catch
-   *       signals where T-30s gates were temporarily volatile but flipped
+   *       retry. Re-runs T-3s gates (current candle, ask). Lets us catch
+   *       signals where T-3s gates were temporarily volatile but flipped
    *       back into a tradeable state in the last 30s.
    */
   private async phaseT0(
@@ -644,6 +886,28 @@ export class PriceMonitoringWorker {
       if (streakSign !== 0 && outcomeSign !== streakSign) streakBroken = true;
     }
 
+    // ── Cycle state update (applies whether or not we have an incoming order;
+    //    in particular: if we SKIPPED placement at last T-3s due to whitelist,
+    //    there is no incoming but the cycle should still progress based on the
+    //    underlying outcome).
+    if (state.cycleActive && state.cycleDirection != null && outcome !== 'unknown') {
+      if (outcome === state.cycleDirection) {
+        log('info', `cycle reset (strategy win, no-incoming-aware) ${state.symbol}`, {
+          previouslyFiredCount: state.dcaFiredCount,
+          previouslyLastSize:   state.lastCycleOrderSize,
+        });
+        state.cycleActive        = false;
+        delete state.cycleDirection;
+        state.lastCycleOrderSize = null;
+        state.dcaFiredCount      = 0;
+      } else {
+        // Loss → cycle continues. Fire DCA for the next window NOW that we
+        // know the loss is real and the streak length includes it. Whitelist
+        // gate (e.g. [4]) is checked inside; silent skip on miss.
+        await this.tryPlaceDcaAtBoundary(state, cfg, windowStart);
+      }
+    }
+
     const incomingMarket = await state.poly.findMarketAt(Math.floor(windowStart / 1000));
     const incoming = incomingMarket
       ? await fetchAutoOrderRef(incomingMarket.conditionId)
@@ -653,42 +917,29 @@ export class PriceMonitoringWorker {
     if (incoming) {
       const pnl = computeOrderPnl(incoming, outcome);
 
-      // Reset DCA cycle on win (Path C)
-      if (pnl && pnl.pnlUsdc > 0) {
-        if (state.dcaFiredInCycle) {
-          log('info', `dcaFiredInCycle reset (win) ${state.symbol}`);
-        }
-        state.dcaFiredInCycle = false;
+      // STRATEGY outcome at window close — based on the actual underlying
+      // direction at resolution, NOT the order's executed PnL. SL during the
+      // window can lock in a monetary loss even when the candle whipsaws back
+      // and the window resolves in our favor. Firing DCA on those whipsaw
+      // losses doubles down on a *strategy* that was actually correct, which
+      // is exactly the dangerous DCA case we want to avoid.
+      const strategyOutcome: 'win' | 'loss' | 'unknown' =
+        outcome === 'unknown'                ? 'unknown'
+        : outcome === incoming.direction      ? 'win'
+        :                                       'loss';
+
+      // (Cycle state already updated at the top of phaseT0 — applies whether
+      // or not there's an incoming order. Here we just surface SL-whipsaw
+      // for the auditing log.)
+      if (pnl && pnl.pnlUsdc < 0 && strategyOutcome === 'win') {
+        log('warn', `SL whipsaw: window resolved favorably — cycle reset ${state.symbol}`, {
+          direction: incoming.direction, outcome, slPnl: pnl.pnlUsdc,
+        });
       }
 
-      // Place DCA on loss (Path A — only once per cycle)
-      let dcaRef: OrderRef | undefined;
-      if (
-        pnl && pnl.pnlUsdc < 0
-        && !state.dcaFiredInCycle
-        && cfg.mode === 'signal_and_order'
-      ) {
-        const nextMarket = await state.poly.findMarketAt(
-          Math.floor((windowStart + WINDOW_MS) / 1000),
-        );
-        if (nextMarket) {
-          const dcaSize = incoming.sizeUsdc * cfg.dca_multiplier;
-          dcaRef = (await this.placeDcaForNextWindow(
-            state, cfg, nextMarket, incoming.direction, dcaSize,
-          )) ?? undefined;
-          if (dcaRef) {
-            state.dcaFiredInCycle = true;
-            log('info', `DCA fired ${state.symbol}`, {
-              loserSize: incoming.sizeUsdc,
-              dcaSize, multiplier: cfg.dca_multiplier,
-            });
-          }
-        }
-      } else if (pnl && pnl.pnlUsdc < 0 && state.dcaFiredInCycle) {
-        log('info', `DCA already fired in cycle ${state.symbol} (skipping new DCA)`);
-      }
-
-      // Cancel outgoing N+1 if streak broke (Path C/D combined)
+      // Cancel outgoing N+1 if streak broke (legacy Path C/D — usually not
+      // needed in the new model since the next T-3s won't place if cycle is
+      // inactive AND streak doesn't meet threshold; but kept for safety).
       let cancelled: (OrderRef & { pnlUsdc: number; exitPrice: number }) | undefined;
       if (streakBroken) {
         const nextMarket = await state.poly.findMarketAt(
@@ -710,13 +961,11 @@ export class PriceMonitoringWorker {
           pnlUsdc:   pnl?.pnlUsdc   ?? 0,
           exitPrice: pnl?.exitPrice ?? 0,
         },
-        ...(dcaRef    ? { dca:       dcaRef    } : {}),
         ...(cancelled ? { cancelled: cancelled } : {}),
         emittedAt: Date.now(),
       });
       log('info', `PriceMonitoringWorker T-0 (incoming) ${state.symbol}`, {
-        outcome, pnl: pnl?.pnlUsdc,
-        dcaPlaced: !!dcaRef, cancelled: !!cancelled,
+        outcome, pnl: pnl?.pnlUsdc, cancelled: !!cancelled,
       });
       return;
     }
@@ -747,7 +996,7 @@ export class PriceMonitoringWorker {
       }
     } else if (!streakBroken && cfg.mode === 'signal_and_order') {
       // Path E: T-0 boundary retry (streak intact OR unknown, no incoming).
-      // If we have no cached T+4 (T+4 + T-30s both missed), do an inline
+      // If we have no cached T+4 (T+4 + T-3s both missed), do an inline
       // last-chance eval here — this is our final shot before window close.
       let pathT4 = t4 && t4.windowStart === windowStart ? t4 : undefined;
       if (!pathT4) {
@@ -767,8 +1016,8 @@ export class PriceMonitoringWorker {
       if (pathT4) {
         const result = await this.tryPlaceBoundary(state, cfg, pathT4);
         if (result.placed && result.orderId) {
-          await this.bus.publish<SignalTMinus30Event>({
-            type: 'T-30s', coin: state.symbol,
+          await this.bus.publish<SignalTMinus3Event>({
+            type: 'T-3s', coin: state.symbol,
             windowStart, windowEnd,
             action: 'order_placed',
             orderId:   result.orderId,
@@ -785,7 +1034,7 @@ export class PriceMonitoringWorker {
           });
           return;
         }
-        // Result not placed → silent (T-30s already emitted skip event,
+        // Result not placed → silent (T-3s already emitted skip event,
         // or we never had one — either way, log is enough)
       }
     }
@@ -802,6 +1051,7 @@ export class PriceMonitoringWorker {
   private async placeDcaForNextWindow(
     state: CoinState, cfg: CoinConfig, market: PolyClobMarket,
     direction: 'up' | 'down', sizeUsdc: number,
+    parentStreak: number,
   ): Promise<OrderRef | null> {
     if (await hasAutoOrderFor(market.conditionId, 'dca')) return null;
     const tokenId = direction === 'up' ? market.tokenUp : market.tokenDown;
@@ -820,14 +1070,17 @@ export class PriceMonitoringWorker {
     }
     try {
       const r = await recordOrder({
-        conditionId: market.conditionId,
+        conditionId:    market.conditionId,
         direction,
-        sharePrice:  ask,
+        sharePrice:     ask,
         sizeUsdc,
-        source:      'auto',
-        signalPath:  'dca',
-        tpCents:     cfg.tp_cents,
-        slCents:     cfg.sl_cents,
+        source:         'auto',
+        signalPath:     'dca',
+        tpCents:        cfg.tp_cents,
+        slCents:        cfg.sl_cents,
+        // Inherit parent's streak so subsequent reasoning (analytics, future
+        // chained logic) can trace the trigger context.
+        streakAtSignal: Math.abs(parentStreak),
       });
       log('info', `DCA placed ${state.symbol}`, {
         orderId: r.id, direction, sizeUsdc, ask: (ask * 100).toFixed(1),
@@ -957,6 +1210,9 @@ type AutoOrderRow = OrderRef & {
   status:    'pending' | 'closed';
   pnlUsdc:   number | null;
   exitPrice: number | null;
+  /** |streak| at the moment this order was placed (from poly_orders.streak_5m).
+   *  0 = legacy/unknown — won't match a non-empty dca_streak_whitelist. */
+  streakAbs: number;
 };
 async function fetchAutoOrderRef(
   conditionId: string, requireStatus?: 'pending' | 'closed',
@@ -976,9 +1232,10 @@ async function fetchAutoOrderRef(
     status:      'pending' | 'closed';
     pnl_usdc:    number | null;
     exit_price:  number | null;
+    streak_5m:   number | null;
   }>(
     `SELECT id, direction, share_price, size_usdc, signal_path, status,
-            pnl_usdc, exit_price
+            pnl_usdc, exit_price, streak_5m
        FROM poly_orders
       WHERE market_id = $1 AND source = 'auto' AND side = 'buy' ${statusClause}
       ORDER BY ts_entry ASC
@@ -996,6 +1253,7 @@ async function fetchAutoOrderRef(
     status:     o.status,
     pnlUsdc:    o.pnl_usdc   != null ? Number(o.pnl_usdc)   : null,
     exitPrice:  o.exit_price != null ? Number(o.exit_price) : null,
+    streakAbs:  o.streak_5m != null ? Math.abs(Number(o.streak_5m)) : 0,
   };
 }
 
@@ -1077,6 +1335,54 @@ async function fetchStreakWithVolume(
     n++;
   }
   const streak = newest === 'up' ? n : -n;
+
+  // ── Poly cross-check ──────────────────────────────────────────────────────
+  // Per-coin policy: every window in the streak must agree with Polymarket's
+  // resolved outcome. If ANY window in the streak shows a Binance/Poly diff,
+  // the data is unreliable → return streak=0 → no T+4 signal → no T-3s order
+  // for the next window (the user-facing "cancel" effect).
+  //
+  // Batch-query the cached outcomes in one DB roundtrip; live-fetch only the
+  // windows that haven't been resolved yet.
+  const verifyStarts: number[] = [];
+  for (let i = 0; i < n; i++) verifyStarts.push(windowStart - (i + 1) * WINDOW_MS);
+
+  const { rows: cached } = await getPool().query<{
+    window_start: string; outcome: string | null; token_up: string;
+  }>(
+    `SELECT window_start, outcome, token_up FROM poly_clob_markets
+      WHERE symbol = $1 AND window_start = ANY($2::bigint[])`,
+    [symbol, verifyStarts],
+  );
+  const cacheMap = new Map(cached.map(r => [Number(r.window_start), r]));
+  const exec = getClobExecutor();
+
+  for (const wStart of verifyStarts) {
+    const row = cacheMap.get(wStart);
+    if (!row) continue;                          // no Poly market at this window — can't verify, skip
+    let polyOutcome: 'up' | 'down' | 'unknown' =
+      row.outcome === 'up' || row.outcome === 'down' ? row.outcome : 'unknown';
+
+    if (polyOutcome === 'unknown' && exec) {
+      polyOutcome = await exec.fetchResolvedOutcome(row.token_up, wStart + WINDOW_MS);
+      if (polyOutcome === 'up' || polyOutcome === 'down') {
+        await getPool().query(
+          `UPDATE poly_clob_markets
+             SET outcome = $1, outcome_fetched_at = $2
+           WHERE symbol = $3 AND window_start = $4`,
+          [polyOutcome, Date.now(), symbol, wStart],
+        );
+      }
+    }
+
+    if (polyOutcome !== 'unknown' && polyOutcome !== newest) {
+      log('warn', 'fetchStreakWithVolume: Binance/Poly mismatch in streak — suppress', {
+        symbol, windowStart, mismatchAt: wStart,
+        binance: newest, poly: polyOutcome,
+      });
+      return { streak: 0, volumeBuckets: [] };
+    }
+  }
 
   const avgVol = bars.reduce((a, b) => a + b.volume, 0) / bars.length;
   const streakBars = bars.slice(-n);
@@ -1162,7 +1468,40 @@ async function fetchPythBars(
   }
 }
 
+/**
+ * Window outcome — Polymarket-primary, Binance/Chainlink as cross-check.
+ *
+ * Returns:
+ *   'up' | 'down' — both sources agree, OR only one source is available.
+ *   'unknown'    — both sources known AND disagree → suppress all downstream
+ *                  decisions (streak break detect, DCA, signals). Cancels any
+ *                  pending action for the next window.
+ *
+ * Why prefer Poly: we BET on Poly's binary resolution, not on the underlying
+ * candle. When Polymarket's reference price source ticks differently from
+ * Binance (timing, exchange, or computed-mid vs single-feed), the ONLY
+ * outcome that matters for PnL is Poly's. Binance is the sanity rail —
+ * disagreement = data uncertainty, refuse to act.
+ */
 async function fetchWindowOutcome(
+  symbol: CoinSymbol, windowStart: number, windowEnd: number,
+): Promise<'up' | 'down' | 'unknown'> {
+  const [source, poly] = await Promise.all([
+    fetchSourceOutcome(symbol, windowStart, windowEnd),
+    fetchPolyWindowOutcome(symbol, windowStart, windowEnd),
+  ]);
+
+  if (source !== 'unknown' && poly !== 'unknown' && source !== poly) {
+    log('warn', 'fetchWindowOutcome: source/Poly mismatch — return unknown', {
+      symbol, windowStart, source, poly,
+    });
+    return 'unknown';
+  }
+  return poly !== 'unknown' ? poly : source;
+}
+
+/** Underlying-source outcome (Binance kline / Pyth bars / Chainlink-aligned ticks for BTC). */
+async function fetchSourceOutcome(
   symbol: CoinSymbol, windowStart: number, windowEnd: number,
 ): Promise<'up' | 'down' | 'unknown'> {
   // BTC uses our captured future_ticks_5s (matches Chainlink closely).
@@ -1185,6 +1524,43 @@ async function fetchWindowOutcome(
   const b = bars[0];
   if (!b) return 'unknown';
   return b.close >= b.open ? 'up' : 'down';
+}
+
+/**
+ * Polymarket's resolved outcome for a window.
+ * - Reads cached `outcome` from poly_clob_markets (free; no API call).
+ * - On cache miss, falls back to live `/prices-history` via the CLOB executor
+ *   and writes the answer back to the cache.
+ * - Returns 'unknown' if no Poly market exists for the window OR Poly hasn't
+ *   resolved it yet (transient — caller should retry on the next tick).
+ */
+async function fetchPolyWindowOutcome(
+  symbol: CoinSymbol, windowStart: number, windowEnd: number,
+): Promise<'up' | 'down' | 'unknown'> {
+  const { rows } = await getPool().query<{ outcome: string | null; token_up: string }>(
+    `SELECT outcome, token_up FROM poly_clob_markets
+      WHERE symbol = $1 AND window_start = $2 AND window_end = $3
+      LIMIT 1`,
+    [symbol, windowStart, windowEnd],
+  );
+  const row = rows[0];
+  if (!row) return 'unknown';                                // no Poly market for this window
+  if (row.outcome === 'up' || row.outcome === 'down') return row.outcome;
+
+  // Cache miss → live fetch + cache. Skips silently if executor not available
+  // (dev without POLY_PRIVATE_KEY) — falls through to source-only outcome.
+  const exec = getClobExecutor();
+  if (!exec) return 'unknown';
+  const live = await exec.fetchResolvedOutcome(row.token_up, windowEnd);
+  if (live === 'up' || live === 'down') {
+    await getPool().query(
+      `UPDATE poly_clob_markets
+         SET outcome = $1, outcome_fetched_at = $2
+       WHERE symbol = $3 AND window_start = $4`,
+      [live, Date.now(), symbol, windowStart],
+    );
+  }
+  return live;
 }
 
 function bestAskFromBook(

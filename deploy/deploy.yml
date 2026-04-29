@@ -1,0 +1,144 @@
+---
+# Code deploy. Run on every release.
+#
+# Connects DIRECTLY as the `bot` user (set up by bootstrap.yml) so the entire
+# play runs without sudo. Bot owns /opt/trading-bot, is in the docker group,
+# and has its own pm2 instance — nothing in this playbook needs root.
+#
+# Run:
+#   pnpm release                              # full deploy
+#   pnpm release:env                          # only re-render .env
+#   ansible-playbook deploy.yml --skip-tags env   # deploy without touching secrets
+
+- name: Deploy trading-bot code
+  hosts: all
+  # NOTE: setting `remote_user` here is NOT enough — the `synchronize` module
+  # uses `ansible_user` from inventory directly, not the play's remote_user.
+  # We override `ansible_user` in `vars:` so EVERY task (incl. synchronize)
+  # connects as the bot user.
+  vars:
+    ansible_user: "{{ app_user }}"
+  become: false                    # zero-sudo deploy — bot owns everything
+  gather_facts: true
+  vars_files:
+    - group_vars/all.yml
+
+  tasks:
+    # ── Source sync ────────────────────────────────────────────────────────
+    # rsync runs locally (controller) and pushes over SSH as `bot`. Files land
+    # owned by bot directly — no chown step. `use_ssh_args: true` makes rsync
+    # inherit StrictHostKeyChecking=no etc. from ansible.cfg.
+    - name: rsync — push repo to {{ app_dir }}
+      synchronize:
+        src: "{{ playbook_dir }}/../"    # repo root (deploy/ is one level down)
+        dest: "{{ app_dir }}/"
+        delete: true
+        recursive: true
+        use_ssh_args: true
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=node_modules"
+          - "--exclude=.turbo"
+          - "--exclude=dist"
+          - "--exclude=fe/dist"
+          - "--exclude=apps/web/dist"
+          - "--exclude=apps/api/dist"
+          - "--exclude=apps/workers/dist"
+          - "--exclude=packages/*/dist"
+          - "--exclude=logs"
+          - "--exclude=analysis/data"
+          - "--exclude=.env"
+          - "--exclude=.claude"
+          - "--exclude=*.log"
+          - "--exclude=deploy/inventory.yml"
+          - "--exclude=deploy/group_vars/all.yml"
+      tags: [source]
+
+    # ── .env (secrets file) ────────────────────────────────────────────────
+    - name: Template — .env
+      template:
+        src: templates/env.j2
+        dest: "{{ app_dir }}/.env"
+        mode: '0600'
+      tags: [env]
+      # No notify here — `pm2 startOrReload --update-env` below picks up env
+      # changes on every deploy.
+
+    # ── Install + build ────────────────────────────────────────────────────
+    - name: pnpm — install (frozen lockfile)
+      command: /usr/bin/pnpm install --frozen-lockfile
+      args:
+        chdir: "{{ app_dir }}"
+      changed_when: true     # pnpm is fast on no-op; hard to detect changes reliably
+      tags: [build]
+
+    - name: pnpm — build (turbo → all packages)
+      command: /usr/bin/pnpm build
+      args:
+        chdir: "{{ app_dir }}"
+      changed_when: true
+      tags: [build]
+
+    # ── PM2 process management ─────────────────────────────────────────────
+    # Render the ecosystem manifest, `startOrReload` (first deploy spawns,
+    # subsequent reload gracefully), then `pm2 save` so the systemd boot
+    # script set up in bootstrap can restore the process list on reboot.
+    - name: PM2 — render ecosystem manifest
+      template:
+        src: templates/ecosystem.config.cjs.j2
+        dest: "{{ app_dir }}/ecosystem.config.cjs"
+        mode: '0640'
+      tags: [pm2]
+
+    - name: PM2 — startOrReload (graceful restart on redeploy)
+      command: pm2 startOrReload {{ app_dir }}/ecosystem.config.cjs --update-env
+      args:
+        chdir: "{{ app_dir }}"
+      changed_when: true
+      tags: [pm2]
+
+    - name: PM2 — save process list (persist across reboots)
+      command: pm2 save
+      changed_when: true
+      tags: [pm2]
+
+    # ── Verify ─────────────────────────────────────────────────────────────
+    - name: Health — direct API (bypasses nginx, confirms PM2 app up)
+      uri:
+        url: "http://localhost:{{ api_port }}/api/health"
+        status_code: 200
+      register: health_api
+      retries: 12
+      delay: 5
+      until: health_api.status == 200
+      tags: [verify]
+
+    - name: Health — through nginx (HTTPS, self-signed → ignore cert)
+      uri:
+        url: "https://localhost/api/health"
+        status_code: 200
+        validate_certs: false
+      register: health_nginx
+      retries: 6
+      delay: 5
+      until: health_nginx.status == 200
+      tags: [verify]
+
+    - name: PM2 — list processes (visible in playbook output)
+      command: pm2 list
+      register: pm2_list
+      changed_when: false
+      tags: [verify]
+
+    - name: Health — report
+      debug:
+        msg: |-
+          ✅ API direct  : http://localhost:{{ api_port }}/api/health  ({{ health_api.status }})
+          ✅ via nginx   : https://localhost/api/health                  ({{ health_nginx.status }})
+
+          Public access: https://{{ ansible_host | default(inventory_hostname) }}/
+          (Browser will warn about self-signed cert — accept once.)
+
+          PM2 status:
+          {{ pm2_list.stdout }}
+      tags: [verify]

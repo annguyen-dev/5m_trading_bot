@@ -1,0 +1,61 @@
+// {{ ansible_managed }}
+// PM2 process manifest for trading-bot. Re-rendered by deploy.yml on every
+// deploy. Edit the j2 template + re-run, not this file directly.
+//
+// Manage with:
+//   pm2 list                              # see both apps + status
+//   pm2 logs trading-bot-api              # tail api logs (mostly startup —
+//                                         # actual logs go to logs/*.log via pino)
+//   pm2 restart trading-bot-workers       # quick restart one app
+//   pm2 reload all                        # zero-downtime restart of both
+//   pm2 stop trading-bot-workers          # stop just workers
+//   pm2 monit                             # full TUI monitor
+//   pm2 save                              # persist current process list
+//                                         # (auto-runs after deploy)
+
+module.exports = {
+  apps: [
+    {
+      name:          'trading-bot-api',
+      cwd:           '{{ app_dir }}/apps/api',
+      script:        'dist/api/server.js',
+      interpreter:   '/usr/bin/node',
+      env: {
+        NODE_ENV:    'production',
+        SERVICE_NAME: 'api',
+        LOG_DIR:     '{{ app_dir }}/logs',
+        // PORT, DATABASE_URL, JWT_SECRET, POLY_*, TELEGRAM_* etc. are loaded
+        // by the app itself via dotenv from {{ app_dir }}/.env at startup.
+      },
+      out_file:      '{{ app_dir }}/logs/api-pm2-out.log',
+      error_file:    '{{ app_dir }}/logs/api-pm2-err.log',
+      merge_logs:    true,
+      time:          true,
+      autorestart:   true,
+      max_restarts:  10,
+      min_uptime:    '10s',          // crash within 10s = treat as failed boot
+      restart_delay: 5000,
+      kill_timeout:  15000,           // SIGINT → wait up to 15s for graceful exit
+    },
+    {
+      name:          'trading-bot-workers',
+      cwd:           '{{ app_dir }}/apps/workers',
+      script:        'dist/main.js',
+      interpreter:   '/usr/bin/node',
+      env: {
+        NODE_ENV:    'production',
+        SERVICE_NAME: 'workers',
+        LOG_DIR:     '{{ app_dir }}/logs',
+      },
+      out_file:      '{{ app_dir }}/logs/workers-pm2-out.log',
+      error_file:    '{{ app_dir }}/logs/workers-pm2-err.log',
+      merge_logs:    true,
+      time:          true,
+      autorestart:   true,
+      max_restarts:  10,
+      min_uptime:    '10s',
+      restart_delay: 5000,
+      kill_timeout:  15000,
+    },
+  ],
+};

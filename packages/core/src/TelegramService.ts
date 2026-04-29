@@ -6,7 +6,7 @@
  *
  * Event → info_type mapping:
  *   T+4                    → 'signal'
- *   T+0, T-30s, T-0        → 'order'
+ *   T+0, T-3s, T-0        → 'order'
  *
  * Channel config lives in `settings.telegram_channels` (managed via the
  * dashboard Settings page). We cache it in memory for 30s — edits in the UI
@@ -21,7 +21,7 @@
 import { Bot } from 'grammy';
 import { log } from './observability/logger.js';
 import type {
-  SignalBusEvent, SignalT0PlusEvent, SignalT4Event, SignalTMinus30Event,
+  SignalBusEvent, SignalT0PlusEvent, SignalT4Event, SignalTMinus3Event,
   SignalT0Event,
 } from './SignalBus.js';
 import type { Signal } from '@trading-bot/shared';
@@ -87,6 +87,15 @@ export class TelegramService {
    * works out of the box.
    */
   async send(ev: SignalBusEvent): Promise<void> {
+    // Hard safety gate: never post to real Telegram chats outside production.
+    // Cheaper than the simulate-mode trick — short-circuits before formatting,
+    // DB lookups, and the grammy API call.
+    if (process.env['NODE_ENV'] !== 'production') {
+      log('debug', 'TelegramService.send skipped (NODE_ENV != production)', {
+        type: ev.type, coin: 'coin' in ev ? ev.coin : undefined,
+      });
+      return;
+    }
     if (!this.enabled || !this.bot) return;
 
     let text: string;
@@ -94,7 +103,7 @@ export class TelegramService {
       switch (ev.type) {
         case 'T+0':   text = formatT0Plus(ev);    break;
         case 'T+4':   text = formatT4(ev);        break;
-        case 'T-30s': text = formatTMinus30(ev);  break;
+        case 'T-3s': text = formatTMinus3(ev);  break;
         case 'T-0':   text = formatT0(ev);        break;
       }
     } catch (err) {
@@ -166,8 +175,8 @@ function formatT4(ev: SignalT4Event): string {
   ].filter(Boolean).join('\n');
 }
 
-function formatTMinus30(ev: SignalTMinus30Event): string {
-  const base   = `<b>${ev.coin}</b> · <b>T-30s</b> · <code>${fmtWindow(ev.windowStart, ev.windowEnd)}</code>`;
+function formatTMinus3(ev: SignalTMinus3Event): string {
+  const base   = `<b>${ev.coin}</b> · <b>T-3s</b> · <code>${fmtWindow(ev.windowStart, ev.windowEnd)}</code>`;
   const dcaTag = ev.signalPath === 'dca' ? ' · 🔄 <b>DCA</b>' : '';
   const lateTag = ev.lateRetry ? ' · ⏰ <i>T-0 retry</i>' : '';
   const adaptiveLine = ev.adaptive && (ev.adaptive.mode !== 'default' || ev.adaptive.threshold !== ev.adaptive.base)

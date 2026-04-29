@@ -34,6 +34,13 @@ export interface RecordOrderParams {
    */
   tpCents?:    number | null;
   slCents?:    number | null;
+  /**
+   * |streak| value at the moment of signal — persisted to `streak_5m` column.
+   * Used by the DCA gate to honor `cfg.dca_streak_whitelist` (only fire DCA
+   * when parent's streak is in the allowed set). For DCA orders themselves,
+   * pass the parent's streak so the DB row remains traceable.
+   */
+  streakAtSignal?: number;
 }
 
 export interface RecordOrderResult {
@@ -102,11 +109,12 @@ export async function recordOrder(p: RecordOrderParams): Promise<RecordOrderResu
     `INSERT INTO poly_orders
        (id, market_id, ts_entry, direction, share_price, size_usdc,
         p_signal, ev, mode, source, side, status,
-        tp_cents, sl_cents, signal_path, clob_order_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'buy','pending',$11,$12,$13,$14)`,
+        tp_cents, sl_cents, signal_path, clob_order_id, streak_5m)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'buy','pending',$11,$12,$13,$14,$15)`,
     [id, p.conditionId, ts, p.direction, recordedPrice, recordedSize,
      p.pSignal ?? 0, p.ev ?? 0, mode, p.source,
-     p.tpCents ?? null, p.slCents ?? null, p.signalPath ?? null, buyClobID],
+     p.tpCents ?? null, p.slCents ?? null, p.signalPath ?? null, buyClobID,
+     Math.abs(p.streakAtSignal ?? 0)],
   );
 
   // Create pending TP/SL SELL children so they're visible immediately.
@@ -159,52 +167,17 @@ async function createExitOrders(
   const shares = Math.floor(sharesExact * 100) / 100;
   const tpPrice = tpCents / 100;
 
-  // TP: for live mode, place a resting GTC limit SELL on CLOB so fills are
-  // passive (no polling latency). If CLOB call fails, fall back to DB-only
-  // pending row so OrderResolver still handles TP via market SELL on trigger.
+  // TP is always DB-watched now. We used to try a resting GTC limit SELL on
+  // CLOB for passive fills, but Polymarket rejects limit orders for small
+  // share counts (and our typical bot orders are small). OrderResolver polls
+  // the bid each tick and fires a MARKET SELL when bid >= TP price — same
+  // mechanism that already handles SL.
   //
-  // IMPORTANT: Polymarket has ~1-3s lag between BUY fill and CTF balance
-  // settlement. Without waiting, SELL rejects with "balance 0". Strategy:
-  //   1. Poll getBalanceAllowance until our shares appear (or 10s timeout)
-  //   2. Use the ACTUAL balance returned (handles FAK partial fills self-
-  //      correctingly — no mismatch between our calc and CLOB accounting)
-  //   3. Even on poll timeout, still attempt placement — withRetry treats
-  //      "not enough balance" as transient and retries with backoff.
-  let tpClobId: string | null = null;
-  let tpShares = shares;          // sized from BUY response by default
-  let tpSizeUsdc = shares * tpPrice;
-  if (mode === 'live') {
-    const ex = getClobExecutor();
-    if (ex) {
-      try {
-        const actualShares = await ex.waitForTokenBalance(tokenID, shares, 10_000);
-        // Prefer actual balance over computed when available — guards
-        // against partial fill / rounding drift between our math and CLOB.
-        if (actualShares > 0) {
-          tpShares = Math.min(actualShares, shares);  // never oversize
-          tpSizeUsdc = tpShares * tpPrice;
-        }
-        log('info', 'placeLimitSell attempt (TP)', {
-          tokenID, tpPrice, tpShares, computedShares: shares, actualShares,
-          conditionId: p.conditionId,
-        });
-        tpClobId = await ex.placeLimitSell(tokenID, tpPrice, tpShares);
-        log('info', 'placeLimitSell ok (TP resting on CLOB)', {
-          tokenID, tpClobId, tpPrice, tpShares,
-        });
-      } catch (err) {
-        // Don't fail the whole order — BUY already placed. Log and fall
-        // through to DB-only TP (OrderResolver polling fallback).
-        log('warn', 'placeLimitSell FAILED — falling back to polled TP', {
-          tokenID, tpPrice, tpShares,
-          error: err instanceof Error ? err.message : String(err),
-          stack:  err instanceof Error ? err.stack   : undefined,
-        });
-      }
-    } else {
-      log('warn', 'placeLimitSell skipped — no CLOB executor', { tokenID });
-    }
-  }
+  // tpClobId stays null → in OrderResolver, `tpRestingOnClob` is false →
+  // bid-trigger path runs unconditionally for TP just like SL.
+  const tpClobId: string | null = null;
+  const tpShares = shares;
+  const tpSizeUsdc = shares * tpPrice;
 
   await pool.query(
     `INSERT INTO poly_orders

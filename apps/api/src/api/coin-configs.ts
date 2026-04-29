@@ -28,6 +28,7 @@ const DEFAULT_CONFIG: CoinConfig = {
   tp_cents:              75,
   sl_cents:              25,
   dca_multiplier:        1.5,
+  dca_streak_whitelist:  [],
 };
 
 /** GET /api/coin-configs → array of { symbol, ...config } for all 7 coins. */
@@ -64,6 +65,7 @@ const patchSchema = z.object({
   tp_cents:              z.number().int().min(1).max(99).optional(),
   sl_cents:              z.number().int().min(1).max(99).optional(),
   dca_multiplier:        z.number().min(1.0).max(10.0).optional(),
+  dca_streak_whitelist:  z.array(z.number().int().min(2).max(20)).max(20).optional(),
 }).strict();
 
 export async function updateCoinConfigHandler(

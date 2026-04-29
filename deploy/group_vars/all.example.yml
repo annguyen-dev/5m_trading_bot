@@ -1,0 +1,49 @@
+# Copy to group_vars/all.yml and fill in values.
+# For secrets, prefer `ansible-vault encrypt` on the resulting file.
+#
+#   cp group_vars/all.example.yml group_vars/all.yml
+#   vi group_vars/all.yml              # fill in values
+#   ansible-vault encrypt group_vars/all.yml
+
+# ── Where the bot lives on the server ──────────────────────────────────────
+app_user: bot
+app_dir:  /opt/trading-bot
+
+# ── Database (local Postgres created by bootstrap.yml) ─────────────────────
+pg_user:     trading
+pg_password: CHANGE-ME-long-random
+pg_database: trading
+
+# ── Runtime env (written to /opt/trading-bot/.env) ──────────────────────────
+node_env:   production
+log_level:  info
+
+api_port:   3000
+
+# Auth (JWT). Generate with: openssl rand -hex 32
+jwt_secret: ""
+
+# Telegram bot (single token; channels configured in DB via the UI).
+telegram_token: ""
+telegram_channel_id: ""            # legacy fallback — leave empty if using channels config
+
+# Polymarket (live trading). Leave blank for simulate-only.
+poly_private_key:      ""           # 0x-prefixed hex
+poly_funder_address:   ""           # 0x-prefixed hex, the proxy/safe holding USDC
+poly_signature_type:   proxy        # 'proxy' | 'safe' | 'eoa'
+
+# Binance price feeds (read-only; safe to leave empty for public endpoints).
+exchange_id:     binance
+trading_symbol:  BTC/USDT
+
+# ── Optional: Grafana Cloud / Anthropic / Voyage ────────────────────────────
+# Safe to leave empty — the observability layer no-ops when these are missing.
+grafana_otlp_endpoint:    ""
+grafana_cloud_metrics_url: ""
+grafana_cloud_metrics_user: ""
+grafana_cloud_traces_url:  ""
+grafana_cloud_logs_url:    ""
+grafana_cloud_logs_user:   ""
+grafana_cloud_api_key:     ""
+anthropic_api_key: ""
+voyage_api_key:    ""

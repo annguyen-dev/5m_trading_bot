@@ -224,9 +224,9 @@ importers:
       '@opentelemetry/api-logs':
         specifier: ^0.57.0
         version: 0.57.2
-      '@polymarket/clob-client':
-        specifier: ^5.8.1
-        version: 5.8.1(typescript@5.9.3)(zod@3.25.76)
+      '@polymarket/clob-client-v2':
+        specifier: ^1.0.2
+        version: 1.0.2(typescript@5.9.3)(zod@3.25.76)
       '@trading-bot/db':
         specifier: workspace:*
         version: link:../db
@@ -1506,6 +1506,9 @@ packages:
   '@polymarket/builder-signing-sdk@1.0.0':
     resolution: {integrity: sha512-LNHc8Ox+2ITM6+VIEH5LH3SVh9ScE2mOUAJI789YfyNqhF4n1cNulk35Hb6IZfy1xtNfcEfNotanPLa/U8dCaw==}
 
+  '@polymarket/clob-client-v2@1.0.2':
+    resolution: {integrity: sha512-lC80Esug6s6y3uV8D5HnkxoXVZUnATjyP6PcK2IXO740iGDuLlp9Dvvkx3+VVygHahN+M3NY7JiYiTQkDfWoeQ==}
+
   '@polymarket/clob-client@5.8.1':
     resolution: {integrity: sha512-beKC4KPc9dYyFV9wFhKiGoA16q5xWz4PjkYcnEs3BzpsOKjGQGRlZQ7KQD4HQKUd3HC5RLQT0lqWHrFyaI+2fQ==}
     engines: {node: '>=20.10'}
@@ -1983,6 +1986,9 @@ packages:
 
   browser-or-node@2.1.1:
     resolution: {integrity: sha512-8CVjaLJGuSKMVTxJ2DpBl5XnlNDiT4cQFeuCJJrvJmts9YrTZDizTX7PjC2s6W4x+MBGZeEY6dGMrF04/6Hgqg==}
+
+  browser-or-node@3.0.0:
+    resolution: {integrity: sha512-iczIdVJzGEYhP5DqQxYM9Hh7Ztpqqi+CXZpSmX8ALFs9ecXkQIeqRyM6TfxEfMVpwhl3dSuDvxdzzo9sUOIVBQ==}
 
   browserslist@4.28.2:
     resolution: {integrity: sha512-48xSriZYYg+8qXna9kwqjIVzuQxi+KYWp2+5nCYnYKPTr0LvD89Jqk2Or5ogxz0NUMfIjhh2lIUX/LyX9B4oIg==}
@@ -4809,6 +4815,21 @@ snapshots:
     transitivePeerDependencies:
       - debug
 
+  '@polymarket/clob-client-v2@1.0.2(typescript@5.9.3)(zod@3.25.76)':
+    dependencies:
+      '@ethersproject/providers': 5.8.0
+      '@ethersproject/wallet': 5.8.0
+      axios: 1.15.0
+      browser-or-node: 3.0.0
+      tslib: 2.8.1
+      viem: 2.48.1(typescript@5.9.3)(zod@3.25.76)
+    transitivePeerDependencies:
+      - bufferutil
+      - debug
+      - typescript
+      - utf-8-validate
+      - zod
+
   '@polymarket/clob-client@5.8.1(typescript@5.9.3)(zod@3.25.76)':
     dependencies:
       '@polymarket/builder-signing-sdk': 1.0.0
@@ -5272,6 +5293,8 @@ snapshots:
   brorand@1.1.0: {}
 
   browser-or-node@2.1.1: {}
+
+  browser-or-node@3.0.0: {}
 
   browserslist@4.28.2:
     dependencies:

@@ -185,7 +185,7 @@ export class OrderResolver {
         }
         // Mid-window: check TP/SL.
         //   TP: active any time during the target window (capture profit ASAP).
-        //   SL: active only from T-30s of target window onwards (give the bet
+        //   SL: active only from T-3s of target window onwards (give the bet
         //       time to play out before stop-loss kicks in).
         if (we >= now) {
           const tp = order.tp_cents ?? globalTp;

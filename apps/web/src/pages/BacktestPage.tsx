@@ -4,6 +4,7 @@ import { api, type Environment, type SignalRow, type SummaryRow, type EquityPoin
 import EquityChart from '../components/EquityChart.js';
 import FormulaEditor from '../components/FormulaEditor.js';
 import SignalChart from '../components/SignalChart.js';
+import PolyBacktestTab from '../components/PolyBacktestTab.js';
 
 // ── Styles ────────────────────────────────────────────────────────────────────
 
@@ -163,7 +164,8 @@ function SessionCandlesPanel({
         <strong style={{ color: '#c9d1d9' }}>{signal.direction === 'BUY' ? '▲ up' : '▼ down'}</strong>
         {' '}prediction · entry {entry?.toFixed(2) ?? '—'} (prev 5m close) → exit {exit?.toFixed(2) ?? '—'} (+3m) · PnL {pnlLabel}
       </div>
-      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+      <div className="scroll-x">
+      <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 360 }}>
         <thead><tr style={{ background: '#161b22' }}>
           {['Time', 'Bar', 'Open', 'Close', 'Range'].map(h => (
             <th key={h} style={{ padding: '4px 8px', textAlign: 'left', fontSize: 10, color: '#8b949e', fontWeight: 500 }}>{h}</th>
@@ -174,6 +176,7 @@ function SessionCandlesPanel({
           {applied.map((c, i) => row(c, 'applied', i, applied.length))}
         </tbody>
       </table>
+      </div>
     </div>
   );
 }
@@ -209,8 +212,8 @@ function computeSummary(rows: SignalRow[]): FilteredSummary {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-type PageTab = 'run' | 'results' | 'formula';
-const BACKTEST_TABS: Record<PageTab, true> = { run: true, results: true, formula: true };
+type PageTab = 'run' | 'results' | 'formula' | 'poly';
+const BACKTEST_TABS: Record<PageTab, true> = { run: true, results: true, formula: true, poly: true };
 
 export default function BacktestPage() {
   // Derive active tab from URL so /backtest/run|results|formula deep-links work.
@@ -414,10 +417,10 @@ export default function BacktestPage() {
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
-    <div>
+    <div className="page-wrap">
       {/* Sub-tabs — each is a distinct URL so state survives deep-links & refresh */}
-      <div style={{ display: 'flex', gap: 4, marginBottom: 20, borderBottom: '1px solid #30363d', paddingBottom: 12 }}>
-        {([['run', 'Run Backtest'], ['results', 'Results'], ['formula', 'Formula']] as [PageTab, string][]).map(([id, label]) => (
+      <div style={{ display: 'flex', gap: 4, marginBottom: 20, borderBottom: '1px solid #30363d', paddingBottom: 12, overflowX: 'auto' }}>
+        {([['run', 'Run Backtest'], ['results', 'Results'], ['formula', 'Formula'], ['poly', 'Poly Backtest']] as [PageTab, string][]).map(([id, label]) => (
           <NavLink
             key={id}
             to={`/backtest/${id}`}
@@ -797,6 +800,9 @@ export default function BacktestPage() {
       {tab === 'formula' && (
         <FormulaEditor configs={configs} onConfigsChange={loadConfigs} />
       )}
+
+      {/* ── POLY BACKTEST TAB ── */}
+      {tab === 'poly' && <PolyBacktestTab />}
     </div>
   );
 }

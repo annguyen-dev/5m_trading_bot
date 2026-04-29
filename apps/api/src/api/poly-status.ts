@@ -6,8 +6,11 @@
  */
 
 import type { Request, Response } from 'express';
+import { randomUUID } from 'crypto';
 import { getPool } from '@trading-bot/db';
 import { recordOrder } from '@trading-bot/core/orderPlacement';
+import { getClobExecutor } from '@trading-bot/core/PolymarketClobExecutor';
+import { getTradingMode } from '@trading-bot/core/settings';
 import type { LiveTradingEngine } from '../services/LiveTradingEngine.js';
 
 // Optional live engine — wired in by the dashboard server bootstrap so order
@@ -543,7 +546,8 @@ export async function listOrders(req: Request, res: Response): Promise<void> {
               o.status, o.pnl_usdc,
               o.exit_price, o.close_reason, o.resolved_at,
               o.tp_cents, o.sl_cents, o.signal_path,
-              m.slug, m.question, m.window_start, m.window_end
+              m.slug, m.question, m.window_start, m.window_end,
+              m.token_up, m.token_down
          FROM poly_orders o
          LEFT JOIN poly_clob_markets m ON m.condition_id = o.market_id
         ${where}
@@ -554,5 +558,265 @@ export async function listOrders(req: Request, res: Response): Promise<void> {
     res.json({ orders: rows });
   } catch (err) {
     res.status(500).json({ error: String(err) });
+  }
+}
+
+// ── GET /api/poly/balance ──────────────────────────────────────────────────
+// Returns the user's USDC collateral balance + allowance from the CLOB.
+// In simulate-only contexts (no POLY_PRIVATE_KEY) or when the executor failed
+// to init, returns 200 with `{ available: false }` so the FE can render
+// gracefully instead of erroring.
+
+export async function getBalance(_req: Request, res: Response): Promise<void> {
+  const ex = getClobExecutor();
+  if (!ex) {
+    res.json({ available: false, reason: 'no executor (POLY_PRIVATE_KEY missing?)' });
+    return;
+  }
+  try {
+    const ba = await ex.getCollateralBalance();
+    res.json({ available: true, ...ba });
+  } catch (err) {
+    // Surface the CLOB error verbatim — usually informative (e.g. "401 not
+    // authenticated", "API key not allowed for this user", etc.).
+    const msg = err instanceof Error ? err.message : String(err);
+    res.json({ available: false, reason: `CLOB error: ${msg}` });
+  }
+}
+
+// ── GET /api/poly/positions/:conditionId ───────────────────────────────────
+// Aggregates open BUY orders into per-direction "shares owned" + cost basis.
+// Used by the Bán card so the user knows what's available to sell.
+
+interface PositionSide {
+  shares:         number;   // total shares from sum(size_usdc / share_price)
+  costBasis:      number;   // total $ paid (sum of size_usdc)
+  avgPrice:       number;   // costBasis / shares (0 if shares=0)
+  openOrderCount: number;
+}
+
+export async function getPolyPositions(req: Request, res: Response): Promise<void> {
+  try {
+    const conditionIdRaw = req.params['conditionId'];
+    const conditionId = Array.isArray(conditionIdRaw) ? conditionIdRaw[0] : conditionIdRaw;
+    if (!conditionId) { res.status(400).json({ error: 'conditionId required' }); return; }
+
+    const { rows } = await getPool().query<{
+      direction: string; cnt: string; total_usdc: string; total_shares: string;
+    }>(
+      `SELECT direction,
+              COUNT(*)::text                              AS cnt,
+              COALESCE(SUM(size_usdc), 0)::text          AS total_usdc,
+              COALESCE(SUM(size_usdc / share_price), 0)::text AS total_shares
+         FROM poly_orders
+        WHERE market_id = $1
+          AND side      = 'buy'
+          AND status    = 'pending'
+        GROUP BY direction`,
+      [conditionId],
+    );
+
+    const empty: PositionSide = { shares: 0, costBasis: 0, avgPrice: 0, openOrderCount: 0 };
+    const out: { conditionId: string; up: PositionSide; down: PositionSide } = {
+      conditionId, up: { ...empty }, down: { ...empty },
+    };
+    for (const r of rows) {
+      const shares    = Number(r.total_shares);
+      const costBasis = Number(r.total_usdc);
+      const cnt       = Number(r.cnt);
+      const side: PositionSide = {
+        shares, costBasis,
+        avgPrice: shares > 0 ? costBasis / shares : 0,
+        openOrderCount: cnt,
+      };
+      if (r.direction === 'up')   out.up = side;
+      if (r.direction === 'down') out.down = side;
+    }
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+}
+
+// ── POST /api/poly/orders/sell ─────────────────────────────────────────────
+// Manual sell — closes pending BUY orders LIFO at the user-supplied exit
+// price (FE passes current bid for the direction's token). In LIVE mode,
+// also cancels resting CLOB TP orders + posts a market SELL.
+//
+// Body: {
+//   conditionId:  string,
+//   direction:    'up' | 'down',
+//   sharesToSell: number,        // 0 = all
+//   exitPrice:    number,        // 0..1; user-provided (current bid)
+// }
+
+export async function sellPosition(req: Request, res: Response): Promise<void> {
+  try {
+    const { conditionId, direction, sharesToSell, exitPrice } = req.body as {
+      conditionId?: string; direction?: string;
+      sharesToSell?: number; exitPrice?: number;
+    };
+    if (!conditionId || (direction !== 'up' && direction !== 'down')) {
+      res.status(400).json({ error: 'conditionId + direction (up|down) required' });
+      return;
+    }
+    const exit = Number(exitPrice);
+    if (!(exit > 0 && exit < 1)) {
+      res.status(400).json({ error: 'exitPrice must be in (0, 1) — pass current bid' });
+      return;
+    }
+    const target = Math.max(0, Number(sharesToSell ?? 0));   // 0 = sell all
+
+    const pool = getPool();
+    const mode = await getTradingMode();
+
+    // Token id we'll be selling (live mode only).
+    const { rows: mktRows } = await pool.query<{ token_up: string; token_down: string }>(
+      `SELECT token_up, token_down FROM poly_clob_markets WHERE condition_id = $1`,
+      [conditionId],
+    );
+    if (!mktRows[0]) { res.status(404).json({ error: 'market not found' }); return; }
+    const tokenId = direction === 'up' ? mktRows[0].token_up : mktRows[0].token_down;
+
+    // Pending BUYs for this market+direction, newest first (LIFO close).
+    const { rows: buys } = await pool.query<{
+      id: string; share_price: string; size_usdc: string; mode: string;
+    }>(
+      `SELECT id, share_price::text, size_usdc::text, mode
+         FROM poly_orders
+        WHERE market_id = $1 AND direction = $2
+          AND side = 'buy' AND status = 'pending'
+        ORDER BY ts_entry DESC`,
+      [conditionId, direction],
+    );
+
+    if (buys.length === 0) {
+      res.status(400).json({ error: `no open ${direction.toUpperCase()} positions to sell` });
+      return;
+    }
+
+    // Pick BUYs to close. LIFO; close whole orders only (partial-fill semantics
+    // would need new schema columns — keep it simple).
+    const toClose: typeof buys = [];
+    let accumulated = 0;
+    for (const b of buys) {
+      const shares = Number(b.size_usdc) / Number(b.share_price);
+      toClose.push(b);
+      accumulated += shares;
+      if (target > 0 && accumulated >= target) break;
+    }
+
+    // LIVE: cancel resting TP CLOB orders for each closing BUY, then market sell.
+    let liveSoldShares: number | null = null;
+    if (mode === 'live' && toClose.some(b => b.mode === 'live')) {
+      const ex = getClobExecutor();
+      if (!ex) {
+        res.status(503).json({ error: 'CLOB executor unavailable (POLY_PRIVATE_KEY missing?)' });
+        return;
+      }
+      // Cancel any resting TP for the BUYs we're closing.
+      const liveBuyIds = toClose.filter(b => b.mode === 'live').map(b => b.id);
+      const { rows: tpRows } = await pool.query<{ clob_order_id: string }>(
+        `SELECT clob_order_id FROM poly_orders
+          WHERE parent_order_id = ANY($1::text[])
+            AND side = 'sell' AND status = 'pending'
+            AND clob_order_id IS NOT NULL`,
+        [liveBuyIds],
+      );
+      for (const t of tpRows) {
+        try { await ex.cancelOrder(t.clob_order_id); }
+        catch { /* best-effort; CLOB may have filled already */ }
+      }
+      // Source of truth for "how many shares we have" = on-chain CTF balance.
+      // `size_usdc / share_price` drifts on float math and may overshoot the
+      // actual balance → CLOB rejects "not enough balance". Query the chain
+      // directly via getBalanceAllowance instead.
+      const onChainShares = await ex.getTokenBalance(tokenId);
+      if (onChainShares <= 0) {
+        res.status(400).json({
+          error: `On-chain balance is 0 shares for this token — nothing to sell. ` +
+                 `(DB shows ${toClose.length} pending BUY(s); allowance/transfer may be missing.)`,
+        });
+        return;
+      }
+
+      // Cap by user-requested amount. If user said "sell 5 sh" but we hold
+      // 12.34 on-chain, sell only 5. If they said "sell all" (target=0), use
+      // the full on-chain balance. Floor to 0.01 (CLOB tick).
+      const requestedRaw = target > 0 ? Math.min(target, onChainShares) : onChainShares;
+      const totalShares  = Math.floor(requestedRaw * 100) / 100;
+
+      try {
+        await ex.placeMarketSell(tokenId, totalShares);
+        liveSoldShares = totalShares;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        res.status(400).json({ error: `CLOB market SELL rejected: ${msg}` });
+        return;
+      }
+    }
+
+    // DB writes — close BUYs + insert SELL transaction rows + cancel pending TP/SL children.
+    const now = Date.now();
+    let totalSharesSold = 0;
+    let totalProceed = 0;
+    let totalPnl = 0;
+    for (const b of toClose) {
+      const shares = Number(b.size_usdc) / Number(b.share_price);
+      const proceed = shares * exit;
+      const pnl     = (exit - Number(b.share_price)) * shares;
+
+      // 1. Close the BUY.
+      await pool.query(
+        `UPDATE poly_orders
+            SET status       = 'closed',
+                pnl_usdc     = $1,
+                exit_price   = $2,
+                close_reason = 'manual',
+                resolved_at  = $3
+          WHERE id = $4 AND status = 'pending' AND side = 'buy'`,
+        [pnl, exit, now, b.id],
+      );
+
+      // 2. Cancel pending TP/SL SELL children.
+      await pool.query(
+        `UPDATE poly_orders
+            SET status       = 'closed',
+                close_reason = 'cancelled',
+                resolved_at  = $1
+          WHERE parent_order_id = $2 AND side = 'sell' AND status = 'pending'`,
+        [now, b.id],
+      );
+
+      // 3. Insert a manual-SELL transaction row for the audit trail.
+      await pool.query(
+        `INSERT INTO poly_orders (
+           id, market_id, ts_entry, direction, share_price, size_usdc,
+           p_signal, ev, mode, source, side, status,
+           close_reason, exit_price, resolved_at, parent_order_id
+         ) VALUES (
+           $1, $2, $3, $4, $5, $6, 0, 0, $7, 'manual', 'sell', 'closed',
+           'manual', $5, $3, $8
+         )`,
+        [randomUUID(), conditionId, now, direction, exit, proceed, b.mode, b.id],
+      );
+
+      totalSharesSold += shares;
+      totalProceed    += proceed;
+      totalPnl        += pnl;
+    }
+
+    res.json({
+      ok:                true,
+      mode,
+      closed:            toClose.length,
+      sharesSold:        totalSharesSold,
+      proceedUsdc:       totalProceed,
+      pnlUsdc:           totalPnl,
+      exitPrice:         exit,
+      liveSoldShares,                   // null in simulate mode
+    });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 }

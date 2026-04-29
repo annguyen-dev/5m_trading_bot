@@ -59,7 +59,7 @@ export function polyStreamHandler(engine: LiveTradingEngine) {
     // Multi-coin worker events (PriceMonitoringWorker via SignalBus)
     const onCoinT0Plus = (e: unknown): void => send('coin_t0plus', e);
     const onCoinT4     = (e: unknown): void => send('coin_t4',     e);
-    const onCoinT30    = (e: unknown): void => send('coin_t30',    e);
+    const onCoinT3    = (e: unknown): void => send('coin_t3',    e);
     const onCoinT0     = (e: unknown): void => send('coin_t0',     e);
 
     engine.on('btc',     onBtc);
@@ -72,7 +72,7 @@ export function polyStreamHandler(engine: LiveTradingEngine) {
     engine.on('order',   onOrder);
     engine.on('coin_t0plus', onCoinT0Plus);
     engine.on('coin_t4',     onCoinT4);
-    engine.on('coin_t30',    onCoinT30);
+    engine.on('coin_t3',    onCoinT3);
     engine.on('coin_t0',     onCoinT0);
 
     // 3. Heartbeat
@@ -91,7 +91,7 @@ export function polyStreamHandler(engine: LiveTradingEngine) {
       engine.off('order',   onOrder);
       engine.off('coin_t0plus', onCoinT0Plus);
       engine.off('coin_t4',     onCoinT4);
-      engine.off('coin_t30',    onCoinT30);
+      engine.off('coin_t3',    onCoinT3);
       engine.off('coin_t0',     onCoinT0);
     };
     req.on('close', cleanup);

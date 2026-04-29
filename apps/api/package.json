@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "create-admin": "tsx scripts/create-admin.ts"
+    "create-admin": "tsx scripts/create-admin.ts",
+    "seed-defaults": "tsx scripts/seed-defaults.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.88.0",

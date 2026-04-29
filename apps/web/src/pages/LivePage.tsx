@@ -40,7 +40,10 @@ export default function LivePage() {
   const [switching, setSwitching] = useState(false);
   useEffect(() => { api.getSettings().then(setSettings).catch(console.error); }, []);
 
-  async function switchMode(mode: 'simulate' | 'live') {
+  // Stable identity — without useCallback, ModeBanner's React.memo would bust
+  // on every render because `switchMode` would be a new function reference
+  // each tick.
+  const switchMode = useCallback(async (mode: 'simulate' | 'live') => {
     if (!settings || settings.effectiveTradingMode === mode) return;
     setSwitching(true);
     try {
@@ -51,7 +54,7 @@ export default function LivePage() {
         effectiveTradingMode: r.effectiveTradingMode,
       });
     } finally { setSwitching(false); }
-  }
+  }, [settings]);
 
   // ── Live stream (single SSE connection, source of truth) ────────────────
   const stream = useLiveStream('/api/poly/stream');
@@ -98,7 +101,7 @@ export default function LivePage() {
   // ── Past windows (left-of-slots colored history) ─────────────────────────
   const [pastWindows, setPastWindows] = useState<PolyPastWindow[]>([]);
   const reloadPast = useCallback(async () => {
-    try { setPastWindows(await api.getPolyPastWindows(5)); } catch { /* ignore */ }
+    try { setPastWindows(await api.getPolyPastWindows(20)); } catch { /* ignore */ }
   }, []);
   useEffect(() => {
     reloadPast();
@@ -138,14 +141,12 @@ export default function LivePage() {
 
   // ── Render ───────────────────────────────────────────────────────────────
   return (
-    <div style={S.page}>
-      <ModeBanner settings={settings} switching={switching} onSwitch={switchMode} />
-
-      <CoinSignalsStrip coinEvents={stream.coinEvents} />
-
-      <div style={S.mainGrid}>
-        {/* LEFT: Market header + chart */}
-        <div style={S.leftPane}>
+    <>
+      {/* MarketHeader is a direct sibling of .page-wrap (NOT inside it) so its
+          sticky containing block is .app-content (the scroll container). Stays
+          pinned to viewport top no matter what page section is in view. */}
+      <div className="market-header-sticky">
+        <div className="market-header-sticky-inner">
           <MarketHeader
             market={selectedMarket}
             liveShares={liveShares}
@@ -155,42 +156,48 @@ export default function LivePage() {
             streamConnected={streamConnected}
             streamStats={streamStats}
           />
-
-          <PriceChart
-            range={range}
-            btcHistory={btcHistory}
-            btcLive={btcLive}
-            market={selectedMarket}
-          />
-
-          <RangeTabs range={range} onChange={setRange} />
-
-          <MarketSlots
-            current={currentMarket}
-            upcoming={upcoming}
-            pastWindows={pastWindows}
-            selected={selectedMarket?.conditionId ?? null}
-            onSelect={setSelectedConditionId}
-          />
-        </div>
-
-        {/* RIGHT: Trade panel */}
-        <div style={S.rightPane}>
-          <TradePanel
-            market={selectedMarket}
-            liveShares={liveShares}
-            mode={settings?.effectiveTradingMode ?? 'simulate'}
-            onPlaced={reloadOrders}
-          />
         </div>
       </div>
 
-      <MyOrders orders={orders} tpCents={settingsForOrders.tp} slCents={settingsForOrders.sl} />
+      <div className="page-wrap">
+        <ModeBanner settings={settings} switching={switching} onSwitch={switchMode} />
 
-      <SignalHistory signals={signalHistory} pastWindows={pastWindows} />
+        <CoinSignalsStrip coinEvents={stream.coinEvents} />
 
-      <RulesCard market={selectedMarket} />
-    </div>
+        {/* Single-column flow now — chart + slots first, trade panel below.
+            (Was previously a 2-col grid with TradePanel as a right sidebar.) */}
+        <PriceChart
+          range={range}
+          btcHistory={btcHistory}
+          btcLive={btcLive}
+          market={selectedMarket}
+        />
+
+        <RangeTabs range={range} onChange={setRange} />
+
+        <MarketSlots
+          current={currentMarket}
+          upcoming={upcoming}
+          pastWindows={pastWindows}
+          selected={selectedMarket?.conditionId ?? null}
+          onSelect={setSelectedConditionId}
+        />
+
+        <TradePanel
+          market={selectedMarket}
+          liveShares={liveShares}
+          mode={settings?.effectiveTradingMode ?? 'simulate'}
+          onPlaced={reloadOrders}
+          lastOrderTs={stream.lastOrder?.ts_entry ? Number(stream.lastOrder.ts_entry) : undefined}
+        />
+
+        <MyOrders orders={orders} tpCents={settingsForOrders.tp} slCents={settingsForOrders.sl} liveShares={liveShares} />
+
+        <SignalHistory signals={signalHistory} pastWindows={pastWindows} />
+
+        <RulesCard market={selectedMarket} />
+      </div>
+    </>
   );
 }
 
@@ -239,9 +246,9 @@ function MarketHeader({
 
   return (
     <div style={S.headerCard}>
-      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 16 }}>
+      <div className="market-header-top">
         <div style={S.btcIcon}>₿</div>
-        <div style={{ flex: 1 }}>
+        <div className="market-header-title-block">
           <div style={S.headerTitle}>Bitcoin Up or Down — 5 phút</div>
           <div style={S.headerSubtitle}>
             {fmtWindow(startMs, endMs)}
@@ -250,7 +257,7 @@ function MarketHeader({
             )}
           </div>
         </div>
-        <div style={{ textAlign: 'right' }}>
+        <div className="market-header-meta">
           <div style={S.label}>Còn lại</div>
           <div style={S.countdown}>
             <span style={S.countMin}>{String(min).padStart(2, '0')}</span>
@@ -278,7 +285,7 @@ function MarketHeader({
         </div>
       </div>
 
-      <div style={S.priceRow}>
+      <div className="market-header-prices">
         <div>
           <div style={S.label}>Giá hiện tại (BTC)</div>
           <div style={S.bigPrice}>
@@ -341,12 +348,15 @@ function PriceChart({
     seriesRef.current = series;
     lastTimeRef.current = 0;
 
-    const onResize = () => {
+    // ResizeObserver fires AT MOST once per browser frame (built-in throttle)
+    // and reacts to BOTH viewport changes AND container resize. Same pattern
+    // as EquityChart / CandleChart / SignalChart.
+    const ro = new ResizeObserver(() => {
       if (ref.current) chart.applyOptions({ width: ref.current.clientWidth });
-    };
-    window.addEventListener('resize', onResize);
+    });
+    ro.observe(ref.current);
     return () => {
-      window.removeEventListener('resize', onResize);
+      ro.disconnect();
       chart.remove();
       chartRef.current  = null;
       seriesRef.current = null;
@@ -398,7 +408,11 @@ function PriceChart({
 // Range tabs (5m / 15m / 1h / 1d / 3d)
 // ────────────────────────────────────────────────────────────────────────────
 
-function RangeTabs({ range, onChange }: { range: PolyRange; onChange: (r: PolyRange) => void }) {
+// React.memo — `onChange` is React's setState setter (always stable), `range`
+// only changes on user click. No reason to rebuild on price ticks.
+const RangeTabs = React.memo(function RangeTabs({
+  range, onChange,
+}: { range: PolyRange; onChange: (r: PolyRange) => void }) {
   return (
     <div style={S.tabsRow}>
       {RANGES.map(r => (
@@ -408,6 +422,88 @@ function RangeTabs({ range, onChange }: { range: PolyRange; onChange: (r: PolyRa
           style={{ ...S.tab, ...(range === r ? S.tabActive : {}) }}
         >{r}</button>
       ))}
+    </div>
+  );
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Past outcomes — show 8 most recent inline, the rest in a dropdown.
+// ────────────────────────────────────────────────────────────────────────────
+
+const PAST_VISIBLE_COUNT = 8;
+
+function PastOutcomes({ pastWindows }: { pastWindows: PolyPastWindow[] }) {
+  const [open, setOpen] = useState(false);
+
+  // pastWindows arrives NEWEST-first from the API.
+  const visible = pastWindows.slice(0, PAST_VISIBLE_COUNT);   // 8 most recent
+  const older   = pastWindows.slice(PAST_VISIBLE_COUNT);      // remainder (up to 12)
+
+  // Auto-close when clicking outside.
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [open]);
+
+  const dotFor = (w: PolyPastWindow) => ({
+    ...S.pastDot,
+    background: w.outcome === 'up' ? '#3fb950'
+              : w.outcome === 'down' ? '#f85149'
+              : '#30363d',
+    color: '#0d1117',
+  });
+  const tipFor = (w: PolyPastWindow) =>
+    w.outcome
+      ? `${fmtTime(w.windowStart)} → ${fmtTime(w.windowEnd)}: ${w.outcome.toUpperCase()} ` +
+        `($${w.btcOpen?.toFixed(2)} → $${w.btcClose?.toFixed(2)})`
+      : `${fmtTime(w.windowStart)} → ${fmtTime(w.windowEnd)}: no data`;
+
+  return (
+    <div style={S.pastGroup} ref={ref} title={`${pastWindows.length} window gần đây`}>
+      <span style={S.pastLabel}>Past</span>
+
+      {/* Older windows in a dropdown (chevron + count). */}
+      {older.length > 0 && (
+        <div style={{ position: 'relative' }}>
+          <button
+            onClick={() => setOpen(o => !o)}
+            style={S.pastDropdownBtn}
+            title={`Xem ${older.length} window cũ hơn`}
+          >
+            {open ? '▾' : '▸'} {older.length}
+          </button>
+          {open && (
+            <div style={S.pastDropdownPanel}>
+              <div style={{ fontSize: 11, color: '#6e7681', marginBottom: 6 }}>
+                {older.length} window cũ (newest → oldest)
+              </div>
+              {older.map(w => (
+                <div key={w.windowStart} style={S.pastDropdownRow} title={tipFor(w)}>
+                  <span style={{ fontFamily: 'monospace', fontSize: 11, color: '#8b949e' }}>
+                    {fmtTime(w.windowStart)}
+                  </span>
+                  <span style={dotFor(w)}>
+                    {w.outcome === 'up' ? '▲' : w.outcome === 'down' ? '▼' : '·'}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 8 most recent inline — display oldest → newest (left → right). */}
+      {[...visible].reverse().map(w => (
+        <span key={w.windowStart} style={dotFor(w)} title={tipFor(w)}>
+          {w.outcome === 'up' ? '▲' : w.outcome === 'down' ? '▼' : '·'}
+        </span>
+      ))}
+      <span style={{ width: 8 }} />
     </div>
   );
 }
@@ -428,31 +524,10 @@ const MarketSlots = React.memo(function MarketSlots({
   const slots = upcoming.length ? upcoming : (current ? [current] : []);
   return (
     <div style={S.slotsRow}>
-      {/* Past outcome dots — like Polymarket's "Past ▾" indicator */}
+      {/* Past outcomes — 8 most recent inline, rest in a dropdown.
+          API returns newest-first; we slice then reverse for display. */}
       {pastWindows.length > 0 && (
-        <div style={S.pastGroup} title="5 window gần đây (win/lose)">
-          <span style={S.pastLabel}>Past</span>
-          {/* Show oldest → newest left-to-right */}
-          {[...pastWindows].reverse().map(w => (
-            <span
-              key={w.windowStart}
-              style={{
-                ...S.pastDot,
-                background: w.outcome === 'up'
-                  ? '#3fb950'
-                  : w.outcome === 'down' ? '#f85149' : '#30363d',
-                color: '#0d1117',
-              }}
-              title={w.outcome
-                ? `${fmtTime(w.windowStart)} → ${fmtTime(w.windowEnd)}: ${w.outcome.toUpperCase()} ` +
-                  `($${w.btcOpen?.toFixed(2)} → $${w.btcClose?.toFixed(2)})`
-                : `${fmtTime(w.windowStart)} → ${fmtTime(w.windowEnd)}: no data`}
-            >
-              {w.outcome === 'up' ? '▲' : w.outcome === 'down' ? '▼' : '·'}
-            </span>
-          ))}
-          <span style={{ width: 8 }} />
-        </div>
+        <PastOutcomes pastWindows={pastWindows} />
       )}
       {slots.map(m => {
         const isCurrent = m.conditionId === current?.conditionId;
@@ -481,32 +556,38 @@ const MarketSlots = React.memo(function MarketSlots({
 // Trade panel — Polymarket-like Mua/Bán Up/Down with simulated submit
 // ────────────────────────────────────────────────────────────────────────────
 
+// USD quick-add buttons. Each click adds the listed amount to `usdAmount`.
+const QUICK_USD = [1, 5, 10, 20];
+
 function TradePanel({
-  market, liveShares, mode, onPlaced,
+  market, liveShares, mode, onPlaced, lastOrderTs,
 }: {
-  market:     LiveMarket | null;
-  liveShares: Record<string, LiveShare>;
-  mode:       'simulate' | 'live';
-  onPlaced:   () => void;
+  market:       LiveMarket | null;
+  liveShares:   Record<string, LiveShare>;
+  mode:         'simulate' | 'live';
+  onPlaced:     () => void;
+  /** ts of the most recent SSE order broadcast — bumps SellCard's position
+   *  refetch so newly-placed BUYs appear immediately in "Đang giữ". */
+  lastOrderTs?: number;
 }) {
-  const [side,      setSide]      = useState<'buy' | 'sell'>('buy');
   const [direction, setDirection] = useState<'up' | 'down'>('up');
-  const [shareCount, setShareCount] = useState<number>(10);
+  const [usdAmount, setUsdAmount] = useState<number>(1);     // dollars, NOT shares
   const [submitting, setSubmitting] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
 
   const upTick = market ? liveShares[market.tokenUp]   : undefined;
   const dnTick = market ? liveShares[market.tokenDown] : undefined;
   const latestForToken = direction === 'up' ? upTick : dnTick;
-  // Buy → ask (you're paying), Sell → bid (you're selling into the bid).
-  const tickPrice = side === 'buy' ? latestForToken?.bestAsk : latestForToken?.bestBid;
-  const sharePrice = tickPrice ?? null;
+  // Buy → pay the ask. Sell isn't supported in this UI.
+  const sharePrice = latestForToken?.bestAsk ?? null;
 
-  const total  = sharePrice && shareCount > 0 ? sharePrice * shareCount : 0;
-  const toWin  = side === 'buy' ? shareCount * 1.0 - total : 0;
+  // Derive shares from $ amount (display only — the API takes sizeUsdc directly).
+  const shares = sharePrice && sharePrice > 0 && usdAmount > 0 ? usdAmount / sharePrice : 0;
+  // toWin = shares × $1 (binary payout) − $ paid
+  const toWin = shares > 0 ? shares - usdAmount : 0;
 
   async function placeOrder() {
-    if (!market || !sharePrice || side !== 'buy') return;
+    if (!market || !sharePrice || usdAmount <= 0) return;
     setSubmitting(true);
     setFeedback(null);
     try {
@@ -514,9 +595,9 @@ function TradePanel({
         conditionId: market.conditionId,
         direction,
         sharePrice,
-        sizeUsdc: total,
+        sizeUsdc: usdAmount,
       });
-      setFeedback(`✓ ${r.mode.toUpperCase()} order placed — id=${r.id.slice(0, 8)}… · ${direction.toUpperCase()} @ ${(sharePrice * 100).toFixed(1)}¢ × ${shareCount} shares ($${total.toFixed(2)})`);
+      setFeedback(`✓ ${r.mode.toUpperCase()} order placed — id=${r.id.slice(0, 8)}… · ${direction.toUpperCase()} @ ${(sharePrice * 100).toFixed(1)}¢ · $${usdAmount.toFixed(2)} (≈ ${shares.toFixed(1)} shares)`);
       onPlaced();
     } catch (e) {
       // Extract backend's error message from "API /path → 500: {\"error\":\"...\"}"
@@ -534,86 +615,294 @@ function TradePanel({
 
   const isLive = mode === 'live';
   const modeLabel = isLive ? 'LIVE' : 'SIM';
-  const buttonLabel = side === 'buy'
-    ? `Mua ${direction === 'up' ? 'Up' : 'Down'} · ${modeLabel}`
-    : `Bán (chưa hỗ trợ)`;
-  const canSubmit = Boolean(market) && sharePrice != null
-    && side === 'buy' && !submitting && shareCount > 0;
+  const canSubmit = Boolean(market) && sharePrice != null && !submitting && usdAmount > 0;
 
   return (
-    <div style={S.tradeCard}>
-      {/* Buy / Sell tabs */}
-      <div style={S.miniTabs}>
-        <button onClick={() => setSide('buy')}
-                style={{ ...S.miniTab, ...(side === 'buy' ? S.miniTabActive : {}) }}>Mua</button>
-        <button onClick={() => setSide('sell')}
-                style={{ ...S.miniTab, ...(side === 'sell' ? S.miniTabActive : {}) }}>Bán</button>
-        <span style={{ marginLeft: 'auto', fontSize: 12, color: '#8b949e' }}>Giới hạn ▾</span>
+    <div style={S.tradeStack} className="live-trade-stack">
+      {/* ── Mua (Buy) ──────────────────────────────────────────────────────── */}
+      <div style={S.tradeCard} className="live-trade-card">
+        <div style={S.tradeCardTitle} className="live-trade-title">Mua</div>
+
+        {/* Up / Down direction */}
+        <div style={S.dirRow}>
+          <button onClick={() => setDirection('up')}
+                  className="live-dir-btn" style={{ ...S.dirBtn,
+                           background: direction === 'up' ? '#1a4731' : '#161b22',
+                           borderColor: direction === 'up' ? '#3fb950' : '#30363d',
+                           color: direction === 'up' ? '#3fb950' : '#c9d1d9' }}>
+            Up <span style={S.dirPrice} className="live-dir-price">
+              {upTick?.bestAsk != null ? `${Math.round(upTick.bestAsk * 100)}¢` : '—'}
+            </span>
+          </button>
+          <button onClick={() => setDirection('down')}
+                  className="live-dir-btn" style={{ ...S.dirBtn,
+                           background: direction === 'down' ? '#4a1a1a' : '#161b22',
+                           borderColor: direction === 'down' ? '#f85149' : '#30363d',
+                           color: direction === 'down' ? '#f85149' : '#c9d1d9' }}>
+            Down <span style={S.dirPrice} className="live-dir-price">
+              {dnTick?.bestAsk != null ? `${Math.round(dnTick.bestAsk * 100)}¢` : '—'}
+            </span>
+          </button>
+        </div>
+
+        {/* USD amount + quick adds. Dropped redundant "Giá đang dùng" + "Tổng"
+            (price already on Up/Down button, total = $ input value). */}
+        <div style={{ marginTop: 10 }}>
+          <div style={S.quickRow}>
+            {QUICK_USD.map(a => (
+              <button key={a} className="live-quick-btn" style={S.quickBtn}
+                onClick={() => setUsdAmount(u => Math.round((u + a) * 100) / 100)}>
+                +{a}
+              </button>
+            ))}
+            <button className="live-quick-btn" style={{ ...S.quickBtn, marginLeft: 'auto', color: '#8b949e' }}
+                    onClick={() => setUsdAmount(0)}>
+              clear
+            </button>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 6 }}>
+            <span style={{ color: '#8b949e', fontSize: 13 }}>$</span>
+            <input
+              type="number" min={0} step={0.5}
+              value={usdAmount}
+              onChange={e => setUsdAmount(Math.max(0, Number(e.target.value) || 0))}
+              style={{ ...S.qtyInput, width: '100%', textAlign: 'right' }}
+            />
+          </div>
+        </div>
+
+        {/* Compact 2-col stats: shares ≈ | toWin */}
+        <div style={S.statRow} className="live-stat-row">
+          <div>
+            <div style={S.statLabel}>Cổ phần (≈)</div>
+            <div style={S.statValue}>{shares > 0 ? shares.toFixed(1) : '—'}</div>
+          </div>
+          <div>
+            <div style={S.statLabel}>Để thắng</div>
+            <div style={{ ...S.statValue, color: '#3fb950' }}>${toWin.toFixed(2)}</div>
+          </div>
+        </div>
+
+        {/* Persistent LIVE warning ABOVE the button so the button stays anchored
+            at card bottom (aligns with Bán's button across the 2-col grid). */}
+        {isLive && (
+          <div style={{ marginTop: 8, fontSize: 11, color: '#f0a500' }}>
+            ⚠ LIVE mode — lệnh đi thẳng lên Polymarket CLOB. Dùng size nhỏ để test.
+          </div>
+        )}
+
+        <button
+          disabled={!canSubmit}
+          onClick={placeOrder}
+          className="live-place-btn" style={{ ...S.placeBtn,
+                   background: canSubmit ? '#1f6feb' : '#21262d',
+                   color: canSubmit ? '#fff' : '#8b949e',
+                   cursor: canSubmit ? 'pointer' : 'not-allowed' }}
+        >Mua {direction === 'up' ? 'Up' : 'Down'} · {modeLabel}</button>
+
+        {feedback && (
+          <div style={{ marginTop: 10, fontSize: 12,
+                        color: feedback.startsWith('✓') ? '#3fb950' : '#f85149',
+                        wordBreak: 'break-word', whiteSpace: 'pre-wrap',
+                        padding: '6px 8px',
+                        border: `1px solid ${feedback.startsWith('✓') ? '#238636' : '#5a1414'}`,
+                        borderRadius: 4, background: '#0d1117' }}>
+            {feedback}
+          </div>
+        )}
       </div>
 
-      {/* Up / Down direction */}
+      {/* ── Bán (Sell) — close open BUY positions at current bid ─────────── */}
+      <SellCard
+        market={market}
+        liveShares={liveShares}
+        mode={mode}
+        onSold={onPlaced}
+        lastOrderTs={lastOrderTs}
+      />
+    </div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// SellCard — Polymarket-style: pick direction, see shares owned, partial sell.
+// Closes pending BUYs LIFO at the current bid (server-side).
+// ────────────────────────────────────────────────────────────────────────────
+
+function SellCard({
+  market, liveShares, mode, onSold, lastOrderTs,
+}: {
+  market:       LiveMarket | null;
+  liveShares:   Record<string, LiveShare>;
+  mode:         'simulate' | 'live';
+  onSold:       () => void;
+  /** Bumps refetch — set when a new BUY/SELL hits the SSE order stream so the
+   *  "Đang giữ" counter reflects the new position immediately. */
+  lastOrderTs?: number;
+}) {
+  const [direction, setDirection] = useState<'up' | 'down'>('up');
+  const [sharesToSell, setSharesToSell] = useState<number>(0);
+  const [position, setPosition] = useState<{ up: PosSide; down: PosSide } | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [feedback, setFeedback] = useState<string | null>(null);
+  const [reloadTick, setReloadTick] = useState(0);
+
+  // Fetch position for this market. Re-fetch on market change, after a sell,
+  // OR on any new order event (BUYs from Mua should refresh the shares count).
+  useEffect(() => {
+    if (!market) { setPosition(null); return; }
+    let cancelled = false;
+    api.getPolyPosition(market.conditionId)
+      .then(p => { if (!cancelled) setPosition({ up: p.up, down: p.down }); })
+      .catch(() => { if (!cancelled) setPosition({ up: EMPTY_POS, down: EMPTY_POS }); });
+    return () => { cancelled = true; };
+  }, [market?.conditionId, reloadTick, lastOrderTs]);
+
+  const upTick = market ? liveShares[market.tokenUp]   : undefined;
+  const dnTick = market ? liveShares[market.tokenDown] : undefined;
+  // Selling → you receive the bid (someone buys from you at their bid).
+  const exitPrice = (direction === 'up' ? upTick?.bestBid : dnTick?.bestBid) ?? null;
+
+  const owned = position
+    ? (direction === 'up' ? position.up.shares : position.down.shares)
+    : 0;
+
+  // Reset sharesToSell when direction changes or owned drops below current value.
+  useEffect(() => { setSharesToSell(0); }, [direction, market?.conditionId]);
+
+  const proceed = exitPrice && sharesToSell > 0 ? sharesToSell * exitPrice : 0;
+
+  function setPercent(pct: number): void {
+    // Round down to 0.1 share precision so display stays clean.
+    setSharesToSell(Math.floor(owned * pct * 10) / 10);
+  }
+
+  async function sell() {
+    if (!market || !exitPrice || sharesToSell <= 0 || sharesToSell > owned + 0.001) return;
+    setSubmitting(true);
+    setFeedback(null);
+    try {
+      const r = await api.sellPolyPosition({
+        conditionId:  market.conditionId,
+        direction,
+        sharesToSell,
+        exitPrice,
+      });
+      const pnlSign = r.pnlUsdc >= 0 ? '+' : '';
+      setFeedback(`✓ Sold ${r.sharesSold.toFixed(1)} ${direction.toUpperCase()} shares @ ${(r.exitPrice * 100).toFixed(1)}¢ · proceed $${r.proceedUsdc.toFixed(2)} · PnL ${pnlSign}$${r.pnlUsdc.toFixed(2)}`);
+      setReloadTick(t => t + 1);   // re-fetch position
+      onSold();                     // tell parent to reload orders list
+    } catch (e) {
+      let msg = e instanceof Error ? e.message : String(e);
+      const m = msg.match(/:\s*(\{.*\})\s*$/);
+      if (m) {
+        try { msg = (JSON.parse(m[1]!) as { error?: string }).error ?? msg; }
+        catch { /* keep original */ }
+      }
+      setFeedback(`✗ ${msg}`);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const isLive = mode === 'live';
+  const modeLabel = isLive ? 'LIVE' : 'SIM';
+  const canSubmit = Boolean(market) && exitPrice != null
+    && sharesToSell > 0 && sharesToSell <= owned + 0.001 && !submitting;
+
+  return (
+    <div style={S.tradeCard} className="live-trade-card">
+      <div style={S.tradeCardTitle} className="live-trade-title">Bán</div>
+
+      {/* Direction tabs — show shares owned per side, not the price */}
       <div style={S.dirRow}>
         <button onClick={() => setDirection('up')}
-                style={{ ...S.dirBtn,
+                className="live-dir-btn" style={{ ...S.dirBtn,
                          background: direction === 'up' ? '#1a4731' : '#161b22',
                          borderColor: direction === 'up' ? '#3fb950' : '#30363d',
                          color: direction === 'up' ? '#3fb950' : '#c9d1d9' }}>
-          Up <span style={S.dirPrice}>
-            {upTick?.bestAsk != null ? `${Math.round(upTick.bestAsk * 100)}¢` : '—'}
+          Up <span style={S.dirPrice} className="live-dir-price">
+            {position ? `${position.up.shares.toFixed(1)} sh` : '—'}
           </span>
         </button>
         <button onClick={() => setDirection('down')}
-                style={{ ...S.dirBtn,
+                className="live-dir-btn" style={{ ...S.dirBtn,
                          background: direction === 'down' ? '#4a1a1a' : '#161b22',
                          borderColor: direction === 'down' ? '#f85149' : '#30363d',
                          color: direction === 'down' ? '#f85149' : '#c9d1d9' }}>
-          Down <span style={S.dirPrice}>
-            {dnTick?.bestAsk != null ? `${Math.round(dnTick.bestAsk * 100)}¢` : '—'}
+          Down <span style={S.dirPrice} className="live-dir-price">
+            {position ? `${position.down.shares.toFixed(1)} sh` : '—'}
           </span>
         </button>
       </div>
 
-      <div style={{ height: 14 }} />
-
-      <div style={S.tradeRow}>
-        <div style={S.label}>Giá đang dùng</div>
-        <div style={{ fontSize: 14, fontWeight: 600 }}>
-          {sharePrice != null ? `${(sharePrice * 100).toFixed(1)}¢` : '—'}
+      {/* Compact 2-col stats: bid | đang giữ. (Cổ phần bán moved below input.) */}
+      <div style={S.statRow} className="live-stat-row">
+        <div>
+          <div style={S.statLabel}>Bid hiện tại</div>
+          <div style={S.statValue}>
+            {exitPrice != null ? `${(exitPrice * 100).toFixed(1)}¢` : '—'}
+          </div>
+        </div>
+        <div>
+          <div style={S.statLabel}>Đang giữ</div>
+          <div style={S.statValue}>
+            {owned > 0 ? `${owned.toFixed(2)} sh` : '—'}
+          </div>
         </div>
       </div>
 
-      <div style={S.tradeRow}>
-        <div style={S.label}>Cổ phần</div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <button style={S.qtyBtn} onClick={() => setShareCount(s => Math.max(0, s - 10))}>-10</button>
-          <input
-            type="number"
-            min={0}
-            value={shareCount}
-            onChange={e => setShareCount(Math.max(0, Number(e.target.value) || 0))}
-            style={S.qtyInput}
-          />
-          <button style={S.qtyBtn} onClick={() => setShareCount(s => s + 10)}>+10</button>
+      {/* Shares input + 25/50/Tối đa quick percents */}
+      <div style={{ marginTop: 10 }}>
+        <div style={S.quickRow}>
+          <button className="live-quick-btn" style={S.quickBtn} disabled={owned <= 0}
+                  onClick={() => setPercent(0.25)}>25%</button>
+          <button className="live-quick-btn" style={S.quickBtn} disabled={owned <= 0}
+                  onClick={() => setPercent(0.50)}>50%</button>
+          <button className="live-quick-btn" style={S.quickBtn} disabled={owned <= 0}
+                  onClick={() => setSharesToSell(owned)}>Tối đa</button>
+          <button className="live-quick-btn" style={{ ...S.quickBtn, marginLeft: 'auto', color: '#8b949e' }}
+                  onClick={() => setSharesToSell(0)}>clear</button>
+        </div>
+        <input
+          type="number" min={0} step={0.1} max={owned}
+          value={sharesToSell}
+          onChange={e => setSharesToSell(
+            Math.min(owned, Math.max(0, Number(e.target.value) || 0)),
+          )}
+          style={{ ...S.qtyInput, width: '100%', textAlign: 'right', marginTop: 6 }}
+        />
+      </div>
+
+      {/* Compact: shares to sell | nhận về */}
+      <div style={S.statRow} className="live-stat-row">
+        <div>
+          <div style={S.statLabel}>Cổ phần bán</div>
+          <div style={S.statValue}>{sharesToSell > 0 ? sharesToSell.toFixed(1) : '—'}</div>
+        </div>
+        <div>
+          <div style={S.statLabel}>Nhận về</div>
+          <div style={{ ...S.statValue, color: '#79c0ff' }}>${proceed.toFixed(2)}</div>
         </div>
       </div>
 
-      <div style={S.tradeRow}>
-        <div style={S.label}>Tổng</div>
-        <div style={{ fontSize: 14, color: '#79c0ff' }}>${total.toFixed(2)}</div>
-      </div>
-      <div style={S.tradeRow}>
-        <div style={S.label}>Để thắng</div>
-        <div style={{ fontSize: 14, color: '#3fb950' }}>${toWin.toFixed(2)}</div>
-      </div>
+      {/* "No position" note ABOVE the button — keeps button anchored at the
+          bottom of the card (otherwise it'd push it up and break alignment
+          with Mua's button across the 2-col grid). */}
+      {owned === 0 && position != null && (
+        <div style={{ marginTop: 8, fontSize: 11, color: '#6e7681', fontStyle: 'italic' }}>
+          Chưa có vị thế {direction.toUpperCase()} cho window này.
+        </div>
+      )}
 
       <button
         disabled={!canSubmit}
-        onClick={placeOrder}
-        style={{ ...S.placeBtn,
-                 background: canSubmit ? '#1f6feb' : '#21262d',
+        onClick={sell}
+        className="live-place-btn" style={{ ...S.placeBtn,
+                 background: canSubmit ? '#da3633' : '#21262d',
                  color: canSubmit ? '#fff' : '#8b949e',
                  cursor: canSubmit ? 'pointer' : 'not-allowed' }}
-      >{buttonLabel}</button>
+      >Bán {direction === 'up' ? 'Up' : 'Down'} · {modeLabel}</button>
 
       {feedback && (
         <div style={{ marginTop: 10, fontSize: 12,
@@ -625,26 +914,26 @@ function TradePanel({
           {feedback}
         </div>
       )}
-
-      {isLive && (
-        <div style={{ marginTop: 8, fontSize: 11, color: '#f0a500' }}>
-          ⚠ LIVE mode — lệnh sẽ đi thẳng lên Polymarket CLOB. Dùng size nhỏ để test.
-        </div>
-      )}
     </div>
   );
 }
+
+interface PosSide { shares: number; costBasis: number; avgPrice: number; openOrderCount: number }
+const EMPTY_POS: PosSide = { shares: 0, costBasis: 0, avgPrice: 0, openOrderCount: 0 };
 
 // ────────────────────────────────────────────────────────────────────────────
 // My orders
 // ────────────────────────────────────────────────────────────────────────────
 
-const MyOrders = React.memo(function MyOrders({
-  orders,
+// NOT memoized — `liveShares` reference changes every SSE flush so any memo
+// would always bust. We need re-renders for live PnL on pending positions.
+function MyOrders({
+  orders, liveShares,
 }: {
-  orders:  PolyOrderRow[];
-  tpCents: number;     // kept for API compat; per-order values used directly now
-  slCents: number;
+  orders:     PolyOrderRow[];
+  tpCents:    number;     // kept for API compat; per-order values used directly now
+  slCents:    number;
+  liveShares: Record<string, LiveShare>;
 }) {
   const [filter, setFilter] = useState<'all' | PolyOrderKind>('all');
 
@@ -750,13 +1039,13 @@ const MyOrders = React.memo(function MyOrders({
             Không có lệnh trong tab "{tabs.find(t => t.key === filter)?.label}"
           </div>
         : groups.map(([marketId, rows]) => (
-          <WindowGroup key={marketId} marketId={marketId} rows={rows} />
+          <WindowGroup key={marketId} marketId={marketId} rows={rows} liveShares={liveShares} />
         ))}
     </div>
   );
-});
+}
 
-function WindowGroup({ marketId, rows }: { marketId: string; rows: PolyOrderRow[] }) {
+function WindowGroup({ marketId, rows, liveShares }: { marketId: string; rows: PolyOrderRow[]; liveShares: Record<string, LiveShare> }) {
   const buy = rows.find(r => r.side === 'buy');
   const windowStart = buy?.window_start ? Number(buy.window_start) : null;
   const windowEnd   = buy?.window_end   ? Number(buy.window_end)   : null;
@@ -764,11 +1053,35 @@ function WindowGroup({ marketId, rows }: { marketId: string; rows: PolyOrderRow[
     ? `${fmtTime(windowStart)} → ${fmtTime(windowEnd)}`
     : `market ${marketId.slice(0, 10)}…`;
 
-  // Window-level stats
-  const buys = rows.filter(r => r.side === 'buy');
-  const pnlSum = buys.reduce((s, r) => s + (r.pnl_usdc ?? 0), 0);
-  const allClosed = buys.every(r => r.status === 'closed');
-  const pnlColor = !allClosed ? '#8b949e' : pnlSum > 0 ? '#3fb950' : pnlSum < 0 ? '#f85149' : '#8b949e';
+  // ── Display model ──────────────────────────────────────────────────────
+  // Hide pending TP/SL SELL rows — they're noise (just resting waitlists).
+  // When TP or SL fires, the SELL row flips to status='closed' AND its parent
+  // BUY closes too. Those FILLED SELLs are interesting events to show.
+  //
+  // Aggregate pending BUYs by direction so multi-DCA stacks render as ONE
+  // "position" row (size=Σ, entry=weighted avg). Closed BUYs render as-is
+  // (historical resolved trades).
+  const pendingBuys: PolyOrderRow[] = [];
+  const closedBuys:  PolyOrderRow[] = [];
+  const filledSells: PolyOrderRow[] = [];
+  for (const r of rows) {
+    if (r.side === 'buy') {
+      (r.status === 'pending' ? pendingBuys : closedBuys).push(r);
+    } else if (r.status === 'closed') {
+      // Skip cancelled siblings (the OCO half that didn't fire).
+      if (r.close_reason !== 'cancelled') filledSells.push(r);
+    }
+    // pending SELL rows (TP/SL waiting): hidden
+  }
+
+  const positions = aggregatePendingBuys(pendingBuys, liveShares);
+
+  // PnL aggregation: realized (closed BUYs) + unrealized (open positions)
+  const realizedPnl   = closedBuys.reduce((s, r) => s + (r.pnl_usdc ?? 0), 0);
+  const unrealizedPnl = positions.reduce((s, p) => s + (p.unrealizedPnl ?? 0), 0);
+  const totalPnl      = realizedPnl + unrealizedPnl;
+  const isOpen        = pendingBuys.length > 0;
+  const pnlColor      = totalPnl > 0 ? '#3fb950' : totalPnl < 0 ? '#f85149' : '#8b949e';
 
   return (
     <div style={S.windowGroup}>
@@ -776,9 +1089,9 @@ function WindowGroup({ marketId, rows }: { marketId: string; rows: PolyOrderRow[
         <span style={{ fontWeight: 600 }}>Window {windowLabel}</span>
         <span style={{ flex: 1 }} />
         <span style={{ fontFamily: 'monospace', color: pnlColor }}>
-          {allClosed
-            ? `PnL ${pnlSum >= 0 ? '+' : ''}$${pnlSum.toFixed(2)}`
-            : 'Open'}
+          {isOpen
+            ? `PnL ≈ ${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)} (live)`
+            : `PnL ${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}`}
         </span>
       </div>
       <div style={S.ordersTable}>
@@ -787,18 +1100,147 @@ function WindowGroup({ marketId, rows }: { marketId: string; rows: PolyOrderRow[
           <span>Price</span><span>Size</span>
           <span>PnL</span><span>Loại</span><span>Status</span>
         </div>
-        {rows.map(o => <OrderRow key={o.id} o={o} />)}
+        {/* Open positions (aggregated). One row per direction. */}
+        {positions.map(p => (
+          <PositionRow key={`pos-${p.direction}`} p={p} />
+        ))}
+        {/* Closed BUYs (historical, with realized PnL). */}
+        {closedBuys.map(o => <OrderRow key={o.id} o={o} liveShares={liveShares} />)}
+        {/* Filled SELL rows (TP/SL/resolution exits that actually fired). */}
+        {filledSells.map(o => <OrderRow key={o.id} o={o} liveShares={liveShares} />)}
       </div>
     </div>
   );
 }
 
-function OrderRow({ o }: { o: PolyOrderRow }) {
+// Aggregated open-position view (sum of stacked BUYs in same direction).
+interface AggregatedPosition {
+  direction:      'up' | 'down';
+  orderCount:     number;     // how many BUYs are stacked
+  totalSize:      number;     // Σ size_usdc
+  totalShares:    number;     // Σ size_usdc / share_price
+  avgEntryPrice:  number;     // weighted by shares
+  hasDca:         boolean;    // true if any included BUY is a DCA
+  hasManual:      boolean;    // true if any is source=manual
+  liveBid:        number | null;
+  unrealizedPnl:  number | null;
+}
+
+function aggregatePendingBuys(
+  buys: PolyOrderRow[],
+  liveShares: Record<string, LiveShare>,
+): AggregatedPosition[] {
+  const byDirection = new Map<'up' | 'down', AggregatedPosition>();
+  for (const b of buys) {
+    const tokenId = b.direction === 'up' ? b.token_up : b.token_down;
+    const shares = b.size_usdc / b.share_price;
+    const ex = byDirection.get(b.direction);
+    if (ex) {
+      ex.orderCount  += 1;
+      ex.totalSize   += b.size_usdc;
+      ex.totalShares += shares;
+      // weighted avg: avg = (Σ price × shares) / (Σ shares); track sum here.
+      ex.avgEntryPrice = (ex.avgEntryPrice * (ex.totalShares - shares) + b.share_price * shares) / ex.totalShares;
+      ex.hasDca    = ex.hasDca    || b.signal_path === 'dca';
+      ex.hasManual = ex.hasManual || b.source === 'manual';
+    } else {
+      byDirection.set(b.direction, {
+        direction:     b.direction,
+        orderCount:    1,
+        totalSize:     b.size_usdc,
+        totalShares:   shares,
+        avgEntryPrice: b.share_price,
+        hasDca:        b.signal_path === 'dca',
+        hasManual:     b.source === 'manual',
+        liveBid:       tokenId ? liveShares[tokenId]?.bestBid ?? null : null,
+        unrealizedPnl: null,
+      });
+    }
+  }
+  // Compute unrealized PnL after summing.
+  for (const p of byDirection.values()) {
+    if (p.liveBid != null) {
+      p.unrealizedPnl = (p.liveBid - p.avgEntryPrice) * p.totalShares;
+    }
+  }
+  return Array.from(byDirection.values()).sort((a, b) =>
+    a.direction === 'up' ? -1 : 1   // UP first, then DOWN
+  );
+}
+
+function PositionRow({ p }: { p: AggregatedPosition }) {
+  const dirColor = p.direction === 'up' ? '#3fb950' : '#f85149';
+  const pnlColor = p.unrealizedPnl == null ? '#8b949e'
+                 : p.unrealizedPnl >= 0   ? '#3fb950' : '#f85149';
+  const tags: string[] = [];
+  if (p.hasManual) tags.push('MAN');
+  if (p.hasDca)    tags.push('DCA');
+  if (tags.length === 0) tags.push('BND');
+
+  return (
+    <div style={S.ordersRow}>
+      <span style={{ fontFamily: 'monospace', fontSize: 11, color: '#8b949e' }}>
+        ×{p.orderCount}
+      </span>
+      <span style={{
+        padding: '2px 5px', borderRadius: 3,
+        fontSize: 10, fontWeight: 700, width: 'fit-content',
+        background: '#1a3a4a', color: '#79c0ff',
+      }}>
+        POS
+      </span>
+      <span style={{ color: dirColor, fontWeight: 600 }}>{p.direction.toUpperCase()}</span>
+      <span style={{ fontFamily: 'monospace' }} title="weighted avg entry">
+        {(p.avgEntryPrice * 100).toFixed(1)}¢
+      </span>
+      <span title="total size = Σ of all stacked BUYs">
+        ${p.totalSize.toFixed(2)} <span style={{ color: '#6e7681', fontSize: 10 }}>· {p.totalShares.toFixed(1)} sh</span>
+      </span>
+      <span title={p.liveBid != null ? `unrealized — bid ${(p.liveBid * 100).toFixed(1)}¢` : ''}
+        style={{ color: pnlColor, fontStyle: 'italic',
+                 fontVariantNumeric: 'tabular-nums' as const }}>
+        {p.unrealizedPnl != null ? `≈ $${p.unrealizedPnl.toFixed(2)}` : '—'}
+      </span>
+      <span style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
+        {tags.map(t => (
+          <span key={t} style={{ ...S.sourceMini,
+            color: t === 'MAN' ? '#bc8cff' : t === 'DCA' ? '#79c0ff' : '#3fb950',
+            borderColor: t === 'MAN' ? '#7d4faa' : '#30363d' }}>
+            {t}
+          </span>
+        ))}
+      </span>
+      <span style={{ fontSize: 11, color: '#f0a500' }}>
+        HOLDING
+      </span>
+    </div>
+  );
+}
+
+function OrderRow({ o, liveShares }: { o: PolyOrderRow; liveShares: Record<string, LiveShare> }) {
   const dir = o.direction.toUpperCase();
   const dirColor = o.direction === 'up' ? '#3fb950' : '#f85149';
   const kind = polyOrderKind(o);
   const kindBadge = KIND_BADGE[kind];
   const isSell = o.side === 'sell';
+
+  // Live unrealized PnL — pending BUYs use the current bid for their token
+  // to compute mark-to-market value. `o.pnl_usdc` is the realized number,
+  // populated only at close. We mark unrealized values with a leading "≈".
+  const pendingBuy = o.status === 'pending' && o.side === 'buy';
+  const tokenId = pendingBuy
+    ? (o.direction === 'up' ? o.token_up : o.token_down)
+    : null;
+  const liveBid = tokenId ? liveShares[tokenId]?.bestBid ?? null : null;
+  const unrealizedPnl =
+    pendingBuy && liveBid != null
+      ? (liveBid - o.share_price) * (o.size_usdc / o.share_price)
+      : null;
+  const displayPnl =
+    o.pnl_usdc != null ? o.pnl_usdc :
+    unrealizedPnl != null ? unrealizedPnl :
+    null;
+  const pnlIsLive = unrealizedPnl != null && o.pnl_usdc == null;
 
   // Status labels — BUY and SELL tell different stories.
   //   BUY pending:  HOLDING
@@ -846,23 +1288,34 @@ function OrderRow({ o }: { o: PolyOrderRow }) {
       <span style={{ color: dirColor, fontWeight: 600 }}>{dir}</span>
       <span style={{ fontFamily: 'monospace' }}>{(o.share_price * 100).toFixed(1)}¢</span>
       <span>${o.size_usdc.toFixed(2)}</span>
-      <span style={{ color: o.pnl_usdc != null
-                      ? (o.pnl_usdc >= 0 ? '#3fb950' : '#f85149') : '#8b949e' }}>
-        {o.pnl_usdc != null ? `$${o.pnl_usdc.toFixed(2)}` : '—'}
+      <span title={pnlIsLive ? `unrealized — bid ${liveBid != null ? (liveBid * 100).toFixed(1) + '¢' : '?'}` : ''}
+        style={{ color: displayPnl != null
+                          ? (displayPnl >= 0 ? '#3fb950' : '#f85149')
+                          : '#8b949e',
+                 fontStyle: pnlIsLive ? 'italic' : 'normal' }}>
+        {displayPnl != null
+          ? `${pnlIsLive ? '≈ ' : ''}$${displayPnl.toFixed(2)}`
+          : '—'}
       </span>
-      <span style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+      <span style={{ display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' }}>
         <span style={{ ...S.kindBadge,
                         background: kindBadge.bg, color: kindBadge.fg }}
               title={`mode=${o.mode} source=${o.source} path=${o.signal_path ?? 'manual'}`}>
           {kindBadge.label}
         </span>
-        {o.signal_path === 'boundary' && (
+        {/* MAN badge — placed via FE (manual buy or manual sell), distinguish
+            from auto bot orders. Always show when source=manual. */}
+        {o.source === 'manual' && (
+          <span style={{ ...S.sourceMini, color: '#bc8cff', borderColor: '#7d4faa' }}
+                title="MANUAL — placed via UI by user (not auto signal)">MAN</span>
+        )}
+        {o.source === 'auto' && o.signal_path === 'boundary' && (
           <span style={{ ...S.sourceMini, color: '#3fb950' }} title="BOUNDARY — pre-position for next window">BND</span>
         )}
-        {o.signal_path === 'dca' && (
+        {o.source === 'auto' && o.signal_path === 'dca' && (
           <span style={{ ...S.sourceMini, color: '#79c0ff' }} title="DCA — average down existing BOUNDARY position">DCA</span>
         )}
-        {o.signal_path === 'panic' && (
+        {o.source === 'auto' && o.signal_path === 'panic' && (
           <span style={{ ...S.sourceMini, color: '#ff9f43' }} title="PANIC — bottom-fishing in current window">PNC</span>
         )}
       </span>
@@ -1198,7 +1651,9 @@ const RulesCard = React.memo(function RulesCard({ market }: { market: LiveMarket
 // Mode banner (kept from previous LivePage)
 // ────────────────────────────────────────────────────────────────────────────
 
-function ModeBanner({
+// React.memo — settings/switching change rarely; price ticks shouldn't
+// rebuild this banner. Parent must pass a stable onSwitch (useCallback).
+const ModeBanner = React.memo(function ModeBanner({
   settings, switching, onSwitch,
 }: {
   settings:  SettingsResponse | null;
@@ -1252,13 +1707,18 @@ function ModeBanner({
       )}
     </div>
   );
-}
+});
 
 // ────────────────────────────────────────────────────────────────────────────
-// CoinSignalsStrip — per-coin worker events (T+4 / T-30s / T-0)
+// CoinSignalsStrip — per-coin worker events (T+4 / T-3s / T-0)
 // ────────────────────────────────────────────────────────────────────────────
 
-function CoinSignalsStrip({ coinEvents }: { coinEvents: LiveStreamState['coinEvents'] }) {
+// React.memo: re-render only when `coinEvents` reference changes (i.e., when
+// a coin_t* event arrives). Without this, every BTC/share SSE tick (~60Hz)
+// rebuilt all 7 CoinCards' JSX even though their data was identical.
+const CoinSignalsStrip = React.memo(function CoinSignalsStrip({
+  coinEvents,
+}: { coinEvents: LiveStreamState['coinEvents'] }) {
   return (
     <div style={CS.strip}>
       <div style={CS.stripTitle}>Per-coin signals</div>
@@ -1269,14 +1729,18 @@ function CoinSignalsStrip({ coinEvents }: { coinEvents: LiveStreamState['coinEve
       </div>
     </div>
   );
-}
+});
 
-function CoinCard({ coin, entry }: { coin: CoinSymbol; entry?: CoinEventsEntry }) {
+// React.memo: per-coin entry references are stable across BTC/share ticks
+// (only mutated when that specific coin gets a new T+0/T+4/T-3s/T-0 event).
+const CoinCard = React.memo(function CoinCard({
+  coin, entry,
+}: { coin: CoinSymbol; entry?: CoinEventsEntry }) {
   const t0plus = entry?.t0plus;
   const t4     = entry?.t4;
-  const t30    = entry?.t30;
+  const t3    = entry?.t3;
   const t0     = entry?.t0;
-  const hasAny = !!(t0plus || t4 || t30 || t0);
+  const hasAny = !!(t0plus || t4 || t3 || t0);
 
   return (
     <div style={{ ...CS.card, opacity: hasAny ? 1 : 0.55 }}>
@@ -1323,24 +1787,24 @@ function CoinCard({ coin, entry }: { coin: CoinSymbol; entry?: CoinEventsEntry }
         <div style={CS.emptySection}>T+4  —</div>
       )}
 
-      {t30 && (
+      {t3 && (
         <div style={CS.section}>
           <div style={CS.phase}>
-            T-30s · <span style={CS.windowChip}>{fmtWindowChip(t30.windowStart, t30.windowEnd)}</span>
-            {t30.signalPath === 'dca' && (
+            T-3s · <span style={CS.windowChip}>{fmtWindowChip(t3.windowStart, t3.windowEnd)}</span>
+            {t3.signalPath === 'dca' && (
               <span style={CS.dcaTag}>🔄 DCA</span>
             )}
-            {t30.lateRetry && (
+            {t3.lateRetry && (
               <span style={{ ...CS.dcaTag, background: '#3a2d0a', color: '#f0a500' }}>⏰ T-0 retry</span>
             )}
           </div>
           <div>
-            {t30.action === 'order_placed'
-              ? <>✅ <strong>{(t30.direction ?? '?').toUpperCase()}</strong>
-                  {' @ '}{t30.price != null ? `${(t30.price * 100).toFixed(0)}¢` : '?'}
-                  {' · $'}{t30.sizeUsdc ?? '?'}</>
-              : t30.action === 'order_skipped'
-              ? <span style={{ color: '#f0a500' }}>⚠ skip: {t30.reason ?? '—'}</span>
+            {t3.action === 'order_placed'
+              ? <>✅ <strong>{(t3.direction ?? '?').toUpperCase()}</strong>
+                  {' @ '}{t3.price != null ? `${(t3.price * 100).toFixed(0)}¢` : '?'}
+                  {' · $'}{t3.sizeUsdc ?? '?'}</>
+              : t3.action === 'order_skipped'
+              ? <span style={{ color: '#f0a500' }}>⚠ skip: {t3.reason ?? '—'}</span>
               : <span style={{ color: '#8b949e' }}>ℹ signal-only mode</span>}
           </div>
         </div>
@@ -1381,7 +1845,7 @@ function CoinCard({ coin, entry }: { coin: CoinSymbol; entry?: CoinEventsEntry }
       )}
     </div>
   );
-}
+});
 
 function fmtClock(ms: number): string {
   const d = new Date(ms);
@@ -1463,14 +1927,14 @@ function fmtWindow(startMs: number, endMs: number): string {
 }
 
 const S: Record<string, React.CSSProperties> = {
-  page:        { padding: '0 4px' },
+  // Page is single-column flow now — chart, slots, trade panel, orders all
+  // stack vertically inside .page-wrap.
   errorBar:    { color: '#f85149', padding: '8px 12px', background: '#21262d', borderRadius: 6, marginBottom: 12, fontSize: 13 },
 
-  mainGrid:    { display: 'grid', gridTemplateColumns: '1fr 320px', gap: 16, marginBottom: 16 },
-  leftPane:    { display: 'flex', flexDirection: 'column', gap: 12 },
-  rightPane:   {},
-
-  headerCard:  { background: '#161b22', border: '1px solid #30363d', borderRadius: 8, padding: 16 },
+  // Pinned behavior lives on the wrapper (.market-header-sticky in index.css).
+  // Box-shadow here so the card stands out from content scrolling under it.
+  headerCard:  { background: '#161b22', border: '1px solid #30363d', borderRadius: 8, padding: 16,
+                 boxShadow: '0 4px 12px rgba(0,0,0,0.45)' },
   btcIcon:     { width: 40, height: 40, borderRadius: 8, background: '#f0a500', color: '#000',
                  display: 'grid', placeItems: 'center', fontSize: 20, fontWeight: 700 },
   headerTitle: { fontSize: 18, fontWeight: 700, color: '#c9d1d9' },
@@ -1481,9 +1945,17 @@ const S: Record<string, React.CSSProperties> = {
   countMin:    { fontSize: 28, fontWeight: 700, color: '#f85149', fontFamily: 'monospace', lineHeight: 1 },
   countLabel:  { fontSize: 9, color: '#8b949e', letterSpacing: 0.5, marginRight: 6 },
 
-  priceRow:    { display: 'flex', gap: 32, marginTop: 16 },
-  bigPrice:    { fontSize: 22, fontWeight: 600, color: '#f0a500', marginTop: 2 },
-  midPrice:    { fontSize: 22, fontWeight: 600, marginTop: 2 },
+  // priceRow → moved to .market-header-prices in src/index.css (responsive).
+  // tabular-nums: each digit takes the same width — no jitter when 1↔0↔8 etc.
+  // min-width: reserves enough space for the full "$XX,XXX.XX" so neighbours
+  // don't shift when total digit count changes (e.g. $76,889.5 → $76,889.55).
+  // 170px covers up to "$999,999.99" at 22px without truncation.
+  bigPrice:    { fontSize: 22, fontWeight: 600, color: '#f0a500', marginTop: 2,
+                 fontVariantNumeric: 'tabular-nums' as const,
+                 minWidth: 170, display: 'inline-block' },
+  midPrice:    { fontSize: 22, fontWeight: 600, marginTop: 2,
+                 fontVariantNumeric: 'tabular-nums' as const,
+                 minWidth: 50, display: 'inline-block' },
 
   chartCard:   { background: '#161b22', border: '1px solid #30363d', borderRadius: 8, padding: 12 },
   chartLegend: { fontSize: 11, color: '#8b949e', marginTop: 6 },
@@ -1506,10 +1978,29 @@ const S: Record<string, React.CSSProperties> = {
   pastDot:     { width: 18, height: 18, borderRadius: '50%', display: 'inline-grid',
                  placeItems: 'center', fontSize: 10, fontWeight: 700, color: '#0d1117' },
 
-  tradeCard:   { background: '#161b22', border: '1px solid #30363d', borderRadius: 8, padding: 16 },
-  miniTabs:    { display: 'flex', gap: 16, alignItems: 'center', borderBottom: '1px solid #21262d', paddingBottom: 8, marginBottom: 12 },
-  miniTab:     { background: 'transparent', border: 'none', color: '#8b949e', fontSize: 14, cursor: 'pointer', padding: '4px 0' },
-  miniTabActive:{ color: '#c9d1d9', fontWeight: 600, borderBottom: '2px solid #1f6feb' },
+  // Dropdown for older past windows (>8 back).
+  pastDropdownBtn: { padding: '2px 8px', borderRadius: 4, border: '1px solid #30363d',
+                     background: '#0d1117', color: '#c9d1d9', fontSize: 11,
+                     cursor: 'pointer', minWidth: 36 },
+  pastDropdownPanel: { position: 'absolute' as const, top: '100%', left: 0,
+                       marginTop: 4, background: '#0d1117', border: '1px solid #30363d',
+                       borderRadius: 6, padding: '8px 10px', minWidth: 160, maxHeight: 320,
+                       overflowY: 'auto' as const, zIndex: 20,
+                       boxShadow: '0 4px 12px rgba(0,0,0,0.5)' },
+  pastDropdownRow:   { display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                       gap: 12, padding: '4px 2px' },
+
+  // Stack two cards (Mua, Bán) vertically inside the right pane.
+  // 2-column grid (Mua | Bán) on desktop. Drops to 1-col on mobile via the
+  // .live-trade-stack media query in src/index.css.
+  tradeStack:  { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 },
+  // Flex column so the place button can anchor to the bottom (margin-top:
+  // auto on the button itself), aligning Mua/Bán submit buttons across the
+  // 2-col grid even when one card has more content above.
+  tradeCard:   { background: '#161b22', border: '1px solid #30363d', borderRadius: 8, padding: 16,
+                 display: 'flex', flexDirection: 'column' },
+  tradeCardTitle: { fontSize: 15, fontWeight: 700, color: '#c9d1d9', marginBottom: 12,
+                    paddingBottom: 8, borderBottom: '1px solid #21262d' },
 
   dirRow:      { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 },
   dirBtn:      { padding: '12px 8px', borderRadius: 6, border: '1px solid', cursor: 'pointer',
@@ -1517,24 +2008,44 @@ const S: Record<string, React.CSSProperties> = {
   dirPrice:    { fontSize: 13, fontWeight: 500, opacity: 0.9 },
 
   tradeRow:    { display: 'flex', alignItems: 'center', justifyContent: 'space-between', margin: '8px 0' },
-  qtyBtn:      { padding: '4px 8px', background: '#21262d', color: '#c9d1d9', border: '1px solid #30363d',
-                 borderRadius: 4, cursor: 'pointer', fontSize: 11 },
+  // Compact 2-col stat row: label above value. Used in Mua/Bán cards to
+  // pack 2 derived numbers (e.g. Cổ phần | Để thắng) without taking 2
+  // separate vertical rows. Mobile-first density.
+  statRow:     { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 10 },
+  statLabel:   { fontSize: 11, color: '#8b949e' },
+  statValue:   { fontSize: 14, fontWeight: 600, color: '#c9d1d9',
+                 fontVariantNumeric: 'tabular-nums' as const },
+  // Quick +$X buttons (USD increments) for the Mua amount input.
+  quickRow:    { display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' },
+  quickBtn:    { padding: '4px 10px', background: '#21262d', color: '#79c0ff',
+                 border: '1px solid #30363d', borderRadius: 4, cursor: 'pointer',
+                 fontSize: 12, fontWeight: 600, minWidth: 38 },
   qtyInput:    { width: 70, padding: '4px 8px', background: '#0d1117', border: '1px solid #30363d',
                  color: '#c9d1d9', borderRadius: 4, fontSize: 13, textAlign: 'right' },
+  // marginTop: 'auto' pushes the button to the card's bottom inside the
+  // flex column, so Mua/Bán submit buttons align horizontally across the
+  // 2-col grid regardless of how much content is above.
   placeBtn:    { width: '100%', padding: '12px', borderRadius: 6, border: 'none',
-                 fontSize: 14, fontWeight: 600, marginTop: 12 },
+                 fontSize: 14, fontWeight: 600, marginTop: 'auto' as const },
 
   ordersCard:    { background: '#161b22', border: '1px solid #30363d', borderRadius: 8, padding: 16, marginBottom: 16 },
   ordersTitleRow:{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 },
   ordersTitle:   { fontSize: 14, fontWeight: 600, color: '#c9d1d9' },
   orderTab:      { padding: '4px 10px', borderRadius: 14, border: '1px solid #30363d',
                    background: '#161b22', color: '#8b949e', fontSize: 11, cursor: 'pointer' },
-  ordersTable:   { display: 'flex', flexDirection: 'column', gap: 4 },
+  // Table scrolls horizontally on narrow viewports — 8 columns × min-width
+  // doesn't fit on phones. minWidth forces the scrollbar to engage instead
+  // of squeezing columns past their content width.
+  ordersTable:   { display: 'flex', flexDirection: 'column', gap: 4,
+                   overflowX: 'auto' as const,
+                   WebkitOverflowScrolling: 'touch' as const },
   ordersHeader:  { display: 'grid',
-                   gridTemplateColumns: '90px 50px 55px 55px 60px 65px 90px 1fr',
+                   gridTemplateColumns: '90px 50px 55px 55px 70px 80px 90px 110px',
+                   minWidth: 590,
                    fontSize: 11, color: '#8b949e', padding: '4px 0', borderBottom: '1px solid #21262d' },
   ordersRow:     { display: 'grid',
-                   gridTemplateColumns: '90px 50px 55px 55px 60px 65px 90px 1fr',
+                   gridTemplateColumns: '90px 50px 55px 55px 70px 80px 90px 110px',
+                   minWidth: 590,
                    fontSize: 13, color: '#c9d1d9', padding: '6px 0', alignItems: 'center' },
 
   windowGroup:       { border: '1px solid #21262d', borderRadius: 6, marginBottom: 12,

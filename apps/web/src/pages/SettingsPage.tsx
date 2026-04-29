@@ -45,13 +45,14 @@ export default function SettingsPage() {
                   <th style={S.th}>Enabled</th>
                   <th style={S.th}>Mode</th>
                   <th style={{ ...S.th, textAlign: 'right' }} title="Emit T+4 signal when |streak| ≥ this">Signal ≥</th>
-                  <th style={{ ...S.th, textAlign: 'right' }} title="Place order at T-30s when |streak| ≥ this">Auto ≥</th>
+                  <th style={{ ...S.th, textAlign: 'right' }} title="Place order at T-3s when |streak| ≥ this">Auto ≥</th>
                   <th style={{ ...S.th, textAlign: 'right' }}>Size $</th>
                   <th style={{ ...S.th, textAlign: 'right' }}>Limit ¢</th>
                   <th style={{ ...S.th, textAlign: 'right' }}>TP ¢</th>
                   <th style={{ ...S.th, textAlign: 'right' }}>SL ¢</th>
                   <th style={{ ...S.th, textAlign: 'right' }} title="DCA size = previous_loser_size × this. Default 1.5">DCA mult</th>
                   <th style={S.th} title="Hour-of-day (UTC) overrides for Auto ≥. Empty = always use base.">Schedule</th>
+                  <th style={S.th} title="DCA fires only when parent boundary streak matches one of these. Empty = always.">DCA streaks</th>
                   <th style={S.th}></th>
                 </tr>
               </thead>
@@ -85,11 +86,12 @@ function CoinRow({
   initial: CoinConfigRow;
   onSaved: () => void;
 }) {
-  const [draft,    setDraft]    = useState<CoinConfigRow>(initial);
-  const [saving,   setSaving]   = useState(false);
-  const [err,      setErr]      = useState<string | null>(null);
-  const [flash,    setFlash]    = useState(false);
-  const [expanded, setExpanded] = useState(false);
+  const [draft,           setDraft]           = useState<CoinConfigRow>(initial);
+  const [saving,          setSaving]          = useState(false);
+  const [err,             setErr]             = useState<string | null>(null);
+  const [flash,           setFlash]           = useState(false);
+  const [scheduleOpen,    setScheduleOpen]    = useState(false);
+  const [dcaOpen,         setDcaOpen]         = useState(false);
 
   useEffect(() => { setDraft(initial); }, [initial]);
 
@@ -97,6 +99,9 @@ function CoinRow({
   // (small, flat). Falls back to string compare, O(n) per row.
   const scheduleDirty =
     JSON.stringify(draft.auto_schedule ?? []) !== JSON.stringify(initial.auto_schedule ?? []);
+  const dcaWhitelistDirty =
+    JSON.stringify([...(draft.dca_streak_whitelist ?? [])].sort())
+      !== JSON.stringify([...(initial.dca_streak_whitelist ?? [])].sort());
 
   const dirty =
        draft.enabled               !== initial.enabled
@@ -108,7 +113,8 @@ function CoinRow({
     || draft.tp_cents              !== initial.tp_cents
     || draft.sl_cents              !== initial.sl_cents
     || draft.dca_multiplier        !== initial.dca_multiplier
-    || scheduleDirty;
+    || scheduleDirty
+    || dcaWhitelistDirty;
 
   const scheduleValid = (draft.auto_schedule ?? []).every(e =>
        Number.isInteger(e.start_hour)     && e.start_hour     >= 0 && e.start_hour     <= 23
@@ -143,6 +149,7 @@ function CoinRow({
         tp_cents:              draft.tp_cents,
         sl_cents:              draft.sl_cents,
         dca_multiplier:        draft.dca_multiplier,
+        dca_streak_whitelist:  [...(draft.dca_streak_whitelist ?? [])].sort((a, b) => a - b),
       });
       setFlash(true);
       setTimeout(() => setFlash(false), 1500);
@@ -236,7 +243,7 @@ function CoinRow({
         </td>
         <td style={S.td}>
           <button
-            onClick={() => setExpanded(!expanded)}
+            onClick={() => setScheduleOpen(o => !o)}
             disabled={saving || !draft.enabled}
             style={{
               ...S.scheduleBtn,
@@ -245,8 +252,29 @@ function CoinRow({
             }}
             title={scheduleTitle(draft.auto_schedule ?? [])}
           >
-            {expanded ? '▾' : '▸'}
+            {scheduleOpen ? '▾' : '▸'}
             &nbsp;{scheduleSummary(draft.auto_schedule ?? [])}
+          </button>
+        </td>
+        <td style={S.td}>
+          <button
+            onClick={() => setDcaOpen(o => !o)}
+            disabled={saving || !draft.enabled}
+            style={{
+              ...S.scheduleBtn,
+              borderColor: dcaWhitelistDirty ? '#58a6ff' : '#30363d',
+              color: (draft.dca_streak_whitelist?.length ?? 0) > 0 ? '#c9d1d9' : '#6e7681',
+            }}
+            title={
+              (draft.dca_streak_whitelist?.length ?? 0) > 0
+                ? `DCA fires only at parent streak: ${draft.dca_streak_whitelist!.join(', ')}`
+                : 'DCA fires on every loss (no whitelist)'
+            }
+          >
+            {dcaOpen ? '▾' : '▸'}
+            &nbsp;{(draft.dca_streak_whitelist?.length ?? 0) === 0
+              ? '—'
+              : draft.dca_streak_whitelist!.join(',')}
           </button>
         </td>
         <td style={S.td}>
@@ -264,9 +292,9 @@ function CoinRow({
           </button>
         </td>
       </tr>
-      {expanded && (
+      {scheduleOpen && (
         <tr style={{ background: '#0a0d12' }}>
-          <td colSpan={12} style={{ padding: '12px 24px', borderBottom: '1px solid #21262d' }}>
+          <td colSpan={13} style={{ padding: '12px 24px', borderBottom: '1px solid #21262d' }}>
             <ScheduleEditor
               value={draft.auto_schedule ?? []}
               baseThreshold={draft.auto_order_min_streak}
@@ -276,9 +304,20 @@ function CoinRow({
           </td>
         </tr>
       )}
+      {dcaOpen && (
+        <tr style={{ background: '#0a0d12' }}>
+          <td colSpan={13} style={{ padding: '12px 24px', borderBottom: '1px solid #21262d' }}>
+            <DcaWhitelistEditor
+              value={draft.dca_streak_whitelist ?? []}
+              disabled={saving || !draft.enabled}
+              onChange={ws => setDraft({ ...draft, dca_streak_whitelist: ws })}
+            />
+          </td>
+        </tr>
+      )}
       {err && (
         <tr>
-          <td colSpan={12} style={{ ...S.td, color: '#f85149', fontSize: 11 }}>
+          <td colSpan={13} style={{ ...S.td, color: '#f85149', fontSize: 11 }}>
             {err}
           </td>
         </tr>
@@ -485,6 +524,75 @@ function NumInput({
   );
 }
 
+// ── DCA streak whitelist editor ─────────────────────────────────────────────
+
+/** Range of streak values shown as togglable chips. */
+const DCA_STREAK_CHIPS: number[] = Array.from({ length: 14 }, (_, i) => i + 2);   // 2..15
+
+function DcaWhitelistEditor({
+  value, onChange, disabled,
+}: {
+  value:    number[];
+  onChange: (next: number[]) => void;
+  disabled?: boolean;
+}) {
+  const set = new Set(value);
+  const toggle = (n: number) => {
+    if (set.has(n)) set.delete(n); else set.add(n);
+    onChange(Array.from(set).sort((a, b) => a - b));
+  };
+  const clear = () => onChange([]);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ fontSize: 12, color: '#8b949e' }}>
+        DCA <b>only fires</b> when the parent boundary's |streak| matches one of
+        the selected values — at <b>any hour</b>, independent of the schedule.
+        <b> None selected</b> = DCA fires on every loss (default).
+        Example: BTC <code>4, 6, 9, 10</code> → DCA fires only after a streak-4
+        / 6 / 9 / 10 boundary loss.
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, alignItems: 'center' }}>
+        {DCA_STREAK_CHIPS.map(n => {
+          const on = set.has(n);
+          return (
+            <button
+              key={n}
+              onClick={() => toggle(n)}
+              disabled={disabled}
+              style={{
+                ...S.chip,
+                background: on ? '#3fb950' : 'transparent',
+                color:      on ? '#fff'    : '#8b949e',
+                borderColor: on ? '#3fb950' : '#30363d',
+                minWidth: 30,
+              }}
+              title={on ? `Remove streak ${n}` : `Add streak ${n}`}
+            >
+              {n}
+            </button>
+          );
+        })}
+        {value.length > 0 && (
+          <button
+            onClick={clear}
+            disabled={disabled}
+            style={{ ...S.chip, color: '#f85149', borderColor: '#30363d', marginLeft: 6 }}
+            title="Clear all (= DCA fires on every loss)"
+          >
+            clear
+          </button>
+        )}
+        {value.length === 0 && (
+          <span style={{ fontSize: 11, color: '#6e7681', marginLeft: 8, fontStyle: 'italic' }}>
+            (none — DCA always fires on loss)
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Telegram channels section ─────────────────────────────────────────────
 
 function uid(): string {
@@ -554,7 +662,7 @@ function TelegramChannelsSection() {
         Gửi tin nhắn tới nhiều channel với filter theo coin + loại thông tin.
         Bỏ trống <b>Coins</b> = nhận tất cả coins. Bỏ trống <b>Info</b> = nhận cả
         signal và order. Info mapping: <code>signal</code> = T+4, <code>order</code>
-        = T+0 / T-30s / T-0. Bot cần <code>TELEGRAM_TOKEN</code> trong .env.
+        = T+0 / T-3s / T-0. Bot cần <code>TELEGRAM_TOKEN</code> trong .env.
       </div>
       {err && <div style={S.errorBar}>{err}</div>}
 
@@ -745,7 +853,8 @@ const S: Record<string, React.CSSProperties> = {
   errorBar:   { color: '#f85149', padding: '8px 12px', background: '#21262d',
                 borderRadius: 6, fontSize: 13 },
 
-  tableWrap:  { background: '#161b22', border: '1px solid #30363d', borderRadius: 8, overflow: 'hidden' },
+  tableWrap:  { background: '#161b22', border: '1px solid #30363d', borderRadius: 8,
+                overflowX: 'auto' as const, WebkitOverflowScrolling: 'touch' as const },
   table:      { width: '100%', borderCollapse: 'collapse' as const, fontSize: 13 },
   th:         { padding: '10px 12px', textAlign: 'left' as const, fontWeight: 600,
                 color: '#8b949e', fontSize: 12, borderBottom: '1px solid #30363d',
@@ -772,6 +881,8 @@ const S: Record<string, React.CSSProperties> = {
   removeBtn:  { padding: '2px 8px', borderRadius: 4, border: '1px solid #30363d',
                 background: '#0d1117', color: '#f85149', fontSize: 14, fontWeight: 700,
                 cursor: 'pointer', width: 28 },
+  subSection: { padding: '12px 14px', background: '#0d1117',
+                border: '1px solid #21262d', borderRadius: 6 },
 
   note:       { fontSize: 12, color: '#79c0ff', background: '#0d1f33',
                 border: '1px solid #1e3a5f', borderRadius: 6, padding: '8px 12px',

@@ -33,7 +33,7 @@ export interface CoinConfig {
   mode:                 CoinMode;
   /** Emit T+4 signal (notification) when |streak| ≥ this. */
   streak_min:           number;
-  /** Place order at T-30s when |streak| ≥ this (AND mode=signal_and_order). */
+  /** Place order at T-3s when |streak| ≥ this (AND mode=signal_and_order). */
   auto_order_min_streak: number;
   /**
    * Optional hour-of-day override for auto_order_min_streak. If empty or no
@@ -48,6 +48,19 @@ export interface CoinConfig {
   sl_cents:             number;
   /** DCA size = previous_loser_size × dca_multiplier. Default 1.5. */
   dca_multiplier:       number;
+  /**
+   * Whitelist of |parent_streak| values at which DCA is allowed to fire.
+   * Empty (default) = DCA fires on every loss cycle (backward compat).
+   * Non-empty: DCA only fires when the parent boundary's signal streak abs
+   * matches one of these values.
+   *
+   * Example: BTC `[4, 6, 9, 10]` → DCA only after a streak-4/6/9/10 loss.
+   *          SOL `[6, 12]`       → DCA only after a streak-6 or streak-12 loss.
+   *
+   * Orders placed before this field existed have `streak_5m=0` in DB and will
+   * NOT match any non-zero whitelist (DCA skipped — safe-by-default).
+   */
+  dca_streak_whitelist: number[];
 }
 
 export type CoinConfigs = Partial<Record<CoinSymbol, CoinConfig>>;
@@ -64,6 +77,7 @@ const DEFAULT_CONFIG: CoinConfig = {
   tp_cents:              75,
   sl_cents:              25,
   dca_multiplier:        1.5,
+  dca_streak_whitelist:  [],
 };
 
 export const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB'];

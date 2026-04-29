@@ -29,23 +29,26 @@ import {
   Chain,
   Side,
   OrderType,
-  SignatureType,
+  SignatureTypeV2,
   AssetType,
   type ApiKeyCreds,
-} from '@polymarket/clob-client';
+} from '@polymarket/clob-client-v2';
 import { log } from './observability/logger.js';
 import { withRetry } from './retry.js';
 
 const CLOB_HOST = 'https://clob.polymarket.com';
 
-function resolveSignatureType(raw: string | undefined, funderSet: boolean): SignatureType {
+// SignatureTypeV2 is the post-CLOB-V2 enum (April 2026 cutover). Same values
+// as the old SignatureType (EOA=0, POLY_PROXY=1, POLY_GNOSIS_SAFE=2) — only
+// the import name changed.
+function resolveSignatureType(raw: string | undefined, funderSet: boolean): SignatureTypeV2 {
   const key = (raw ?? '').trim().toLowerCase();
-  if (key === 'eoa')   return SignatureType.EOA;
-  if (key === 'proxy') return SignatureType.POLY_PROXY;
-  if (key === 'safe')  return SignatureType.POLY_GNOSIS_SAFE;
+  if (key === 'eoa')   return SignatureTypeV2.EOA;
+  if (key === 'proxy') return SignatureTypeV2.POLY_PROXY;
+  if (key === 'safe')  return SignatureTypeV2.POLY_GNOSIS_SAFE;
   // Default: MetaMask-connected Polymarket wallets are Gnosis Safes, so
   // if a funder is set we assume Safe. Bare EOA setups fall back to EOA.
-  return funderSet ? SignatureType.POLY_GNOSIS_SAFE : SignatureType.EOA;
+  return funderSet ? SignatureTypeV2.POLY_GNOSIS_SAFE : SignatureTypeV2.EOA;
 }
 
 interface OrderResponse {
@@ -87,17 +90,26 @@ export class PolymarketClobExecutor {
       process.env['POLY_SIGNATURE_TYPE'], Boolean(funderEnv),
     );
 
+    // V2 SDK: constructor takes an options object (was positional in V1).
+    // `chain` replaced `chainId`. signer/funder semantics unchanged.
+
     // Stage 1: L1-only client (for deriveApiKey).
-    const l1 = new ClobClient(CLOB_HOST, Chain.POLYGON, wallet, undefined, sigType, funder);
+    const l1 = new ClobClient({
+      host: CLOB_HOST, chain: Chain.POLYGON,
+      signer: wallet, signatureType: sigType, funderAddress: funder,
+    });
     const creds: ApiKeyCreds = await l1.createOrDeriveApiKey();
 
     // Stage 2: re-init with creds for L2 auth (order placement).
-    this.client = new ClobClient(CLOB_HOST, Chain.POLYGON, wallet, creds, sigType, funder);
+    this.client = new ClobClient({
+      host: CLOB_HOST, chain: Chain.POLYGON,
+      signer: wallet, creds, signatureType: sigType, funderAddress: funder,
+    });
 
     log('info', 'PolymarketClobExecutor initialized', {
       address: this.address,
       funder,
-      sigType: SignatureType[sigType],
+      sigType: SignatureTypeV2[sigType],
     });
 
     // Preflight: dump collateral balance + allowance so the user can see
@@ -139,20 +151,27 @@ export class PolymarketClobExecutor {
     const client = this.mustClient();
     log('info', 'CLOB market BUY attempt', {
       tokenID, usdcAmount, maxPrice,
-      sigType: SignatureType[client.orderBuilder.signatureType],
+      sigType: SignatureTypeV2[client.orderBuilder.signatureType],
       signer:  this.address,
     });
+    // CRITICAL: throw on resp.success=false INSIDE the retry callback so
+    // withRetry can classify the message and retry on transient failures
+    // (FAK no-match, balance lag, etc.). If we instead returned the bad
+    // resp and threw outside, the retry layer never sees the failure.
+    //
+    // 5 attempts × 300ms base → up to ~4.5s. FAK no-match typically resolves
+    // in 200-500ms as new asks land; this gives the book a few chances.
     const resp: OrderResponse = await withRetry('CLOB market BUY', async () => {
-      return await client.createAndPostMarketOrder(
+      const r: OrderResponse = await client.createAndPostMarketOrder(
         { tokenID, amount: usdcAmount, side: Side.BUY, price: maxPrice },
         undefined,
         OrderType.FAK,
       );
-    });
-    if (!resp.success || !resp.orderID) {
-      log('warn', 'CLOB market BUY rejected', { tokenID, usdcAmount, maxPrice, resp });
-      throw new Error(`CLOB market BUY failed: ${respErrorMessage(resp)}`);
-    }
+      if (!r.success || !r.orderID) {
+        throw new Error(respErrorMessage(r));
+      }
+      return r;
+    }, { maxAttempts: 5, baseDelayMs: 300 });
     // FAK response: makingAmount = USDC we spent, takingAmount = shares acquired.
     const filledUsdc   = Number(resp.makingAmount ?? 0);
     const filledShares = Number(resp.takingAmount ?? 0);
@@ -165,7 +184,7 @@ export class PolymarketClobExecutor {
     if (filledShares === 0) {
       throw new Error('CLOB market BUY filled 0 shares (FAK kill — book empty at limit)');
     }
-    return { orderID: resp.orderID, filledUsdc, filledShares };
+    return { orderID: resp.orderID!, filledUsdc, filledShares };
   }
 
   /**
@@ -187,16 +206,22 @@ export class PolymarketClobExecutor {
     const client = this.mustClient();
     log('info', 'CLOB market SELL attempt', {
       tokenID, shares,
-      sigType: SignatureType[client.orderBuilder.signatureType],
+      sigType: SignatureTypeV2[client.orderBuilder.signatureType],
       signer:  this.address,
     });
+    // Throw on resp.success=false INSIDE retry callback (same reasoning as
+    // placeMarketBuy) so withRetry can classify + retry transient failures.
     const resp: OrderResponse = await withRetry('CLOB market SELL', async () => {
-      return await client.createAndPostMarketOrder(
+      const r: OrderResponse = await client.createAndPostMarketOrder(
         { tokenID, amount: shares, side: Side.SELL, orderType: OrderType.FAK },
         undefined,
         OrderType.FAK,
       );
-    });
+      if (!r.success || !r.orderID) {
+        throw new Error(respErrorMessage(r));
+      }
+      return r;
+    }, { maxAttempts: 5, baseDelayMs: 300 });
     log('info', 'CLOB market SELL response (FAK)', {
       tokenID, requested_shares: shares,
       makingAmount: resp.makingAmount,    // shares actually sold
@@ -204,10 +229,7 @@ export class PolymarketClobExecutor {
       status: resp.status,
       success: resp.success,
     });
-    if (!resp.success || !resp.orderID) {
-      throw new Error(`CLOB market SELL failed: ${respErrorMessage(resp)}`);
-    }
-    return resp.orderID;
+    return resp.orderID!;
   }
 
   /**
@@ -219,11 +241,15 @@ export class PolymarketClobExecutor {
   ): Promise<string> {
     const client = this.mustClient();
     const resp: OrderResponse = await withRetry('CLOB limit SELL', async () => {
-      return await client.createAndPostOrder(
+      const r: OrderResponse = await client.createAndPostOrder(
         { tokenID, price, size: shares, side: Side.SELL },
         undefined,
         OrderType.GTC,
       );
+      if (!r.success || !r.orderID) {
+        throw new Error(respErrorMessage(r));
+      }
+      return r;
     });
     log('info', 'CLOB limit SELL response', { tokenID, price, shares, resp });
     if (!resp.success || !resp.orderID) {
@@ -282,6 +308,59 @@ export class PolymarketClobExecutor {
       tokenID, minShares, lastBal, timeoutMs,
     });
     return 0;
+  }
+
+  /**
+   * Read the user's USDC collateral balance + allowance from the CLOB.
+   * Both values are returned as USDC (with 6-decimal scaling unwrapped).
+   * Throws on failure so callers can surface the underlying CLOB error
+   * (instead of swallowing it as "unavailable").
+   */
+  async getCollateralBalance(): Promise<{ balance: number; allowance: number; address: string }> {
+    const ba = await this.mustClient().getBalanceAllowance({
+      asset_type: AssetType.COLLATERAL,
+    });
+    // V2 SDK type claims { balance, allowance } but actual response shape may
+    // differ — log the raw payload once so we can see what's actually there.
+    log('debug', 'getBalanceAllowance raw response', { ba });
+    // Tolerant parse: accept either string or number, missing → 0.
+    const parseAtomic = (v: unknown): number => {
+      if (v == null) return 0;
+      try { return Number(BigInt(String(v))) / 1e6; }
+      catch { return Number(v) || 0; }
+    };
+    const raw = ba as unknown as Record<string, unknown>;
+    return {
+      balance:   parseAtomic(raw['balance']),
+      allowance: parseAtomic(raw['allowance']),
+      address:   this.address,
+    };
+  }
+
+  /**
+   * One-shot read of the actual on-chain CTF balance for a token. Returns
+   * shares floored to 2 decimals (so the value is safe to pass straight back
+   * to placeMarketSell — Polymarket rejects high-precision sizes).
+   *
+   * Source of truth for "how many shares do I own" — use this instead of
+   * recomputing from `size_usdc / share_price`, which drifts on float math.
+   *
+   * Returns 0 on any error (no executor / API down / no allowance set).
+   */
+  async getTokenBalance(tokenID: string): Promise<number> {
+    try {
+      const ba = await this.mustClient().getBalanceAllowance({
+        asset_type: AssetType.CONDITIONAL,
+        token_id:   tokenID,
+      });
+      const sharesFloat = Number(BigInt(ba.balance)) / 1e6;
+      return Math.floor(sharesFloat * 100) / 100;
+    } catch (err) {
+      log('warn', 'getTokenBalance failed', {
+        tokenID, error: err instanceof Error ? err.message : String(err),
+      });
+      return 0;
+    }
   }
 
   /**

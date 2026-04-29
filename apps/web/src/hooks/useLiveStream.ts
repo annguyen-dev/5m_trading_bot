@@ -139,8 +139,8 @@ export interface CoinT4Event {
   emittedAt:           number;
 }
 
-export interface CoinT30Event {
-  type:        'T-30s';
+export interface CoinT3Event {
+  type:        'T-3s';
   coin:        CoinSymbol;
   windowStart: number;
   windowEnd:   number;
@@ -152,7 +152,7 @@ export interface CoinT30Event {
   reason?:     string;
   /** 'dca' → previous_size × dca_multiplier after a prior boundary loss. */
   signalPath?: 'boundary' | 'dca';
-  /** True if placement happened at T-0 retry (not the original T-30s tick). */
+  /** True if placement happened at T-0 retry (not the original T-3s tick). */
   lateRetry?:  boolean;
   emittedAt:   number;
 }
@@ -176,7 +176,7 @@ export interface CoinT0Event {
 export interface CoinEventsEntry {
   t0plus?: CoinT0PlusEvent;
   t4?:     CoinT4Event;
-  t30?:    CoinT30Event;
+  t3?:     CoinT3Event;
   t0?:     CoinT0Event;
 }
 
@@ -221,10 +221,16 @@ export function useLiveStream(url = '/api/poly/stream'): LiveStreamState {
   useEffect(() => {
     let cancelled = false;
     let es: EventSource | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+    let reconnectAttempts = 0;
 
     // Sliding-window event counter (last 1s) for rate display
     const eventTimes: number[] = [];
     let totalEvents = 0;
+    // Last event timestamp — used by the watchdog to detect stale streams
+    // (Cloudflare etc. sometimes silently kills SSE without firing onerror).
+    let lastEventAt = Date.now();
 
     // Coalesce by browser frame (~16ms @ 60fps). Pass-through latency ≤ 1 frame
     // — the browser caps at one paint per frame anyway, so flushing more often
@@ -246,7 +252,31 @@ export function useLiveStream(url = '/api/poly/stream'): LiveStreamState {
 
     const tickStat = (): void => {
       totalEvents++;
-      eventTimes.push(Date.now());
+      const now = Date.now();
+      eventTimes.push(now);
+      lastEventAt = now;
+      reconnectAttempts = 0;
+      // Events flowing = stream is alive. Restore `connected` if a stale
+      // onerror earlier had flipped it false on a transient blip (the EventSource
+      // may have recovered without firing a fresh onopen). Without this, the
+      // "offline" badge gets stuck on while data continues to arrive.
+      if (!stateRef.current.connected) {
+        stateRef.current = { ...stateRef.current, connected: true };
+      }
+    };
+
+    const scheduleReconnect = (): void => {
+      if (cancelled) return;
+      // Exponential backoff: 1s, 2s, 4s, ..., capped at 15s.
+      const delay = Math.min(15_000, 1_000 * 2 ** Math.min(reconnectAttempts, 4));
+      reconnectAttempts++;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        if (cancelled) return;
+        try { es?.close(); } catch { /* ignore */ }
+        es = null;
+        connect();
+      }, delay);
     };
 
     const patch = (delta: Partial<LiveStreamState>): void => {
@@ -264,31 +294,55 @@ export function useLiveStream(url = '/api/poly/stream'): LiveStreamState {
         : url;
       es = new EventSource(fullUrl);
 
-      es.onopen = () => patch({ connected: true });
+      es.onopen = () => {
+        lastEventAt = Date.now();
+        reconnectAttempts = 0;
+        patch({ connected: true });
+      };
       es.onerror = () => {
-        // EventSource reconnects automatically; surface "disconnected" until next open.
-        patch({ connected: false });
+        // EventSource's native auto-reconnect is unreliable behind Cloudflare:
+        // when CF returns its HTML 5xx page, the wrong content-type makes the
+        // browser give up. Force an explicit reconnect with backoff.
+        //
+        // BUT: onerror also fires on TRANSIENT issues (e.g. a brief network
+        // hiccup) where the connection auto-recovers without ever transitioning
+        // to CLOSED. In that case data keeps flowing on the same ES — we
+        // should NOT flip the badge to "offline" or the user sees a phantom
+        // disconnect. Only act when truly closed.
+        if (es && es.readyState === EventSource.CLOSED) {
+          patch({ connected: false });
+          scheduleReconnect();
+        }
       };
 
       es.addEventListener('snapshot', (ev) => {
         try {
           const snap = JSON.parse((ev as MessageEvent).data);
           const lastSignal = (snap.lastSignal ?? null) as LiveSignal | null;
+          // MERGE snapshot data with existing state instead of overwriting.
+          // Reconnects (Cloudflare blip / network drop / explicit reconnect)
+          // emit a fresh snapshot whose `shares`/`btc`/`scan` may be empty if
+          // the engine hasn't received live events yet on the new connection.
+          // Overwriting → blank UI moment until events repopulate. Merging →
+          // existing data persists until newer values arrive (and snapshot
+          // values still win for keys it covers, since spread order respects
+          // last-wins).
           stateRef.current = {
             ...stateRef.current,
             currentMarket: snap.currentMarket
               ? normalizeMarket(snap.currentMarket)
-              : null,
-            upcoming: Array.isArray(snap.upcoming)
+              : stateRef.current.currentMarket,
+            upcoming: Array.isArray(snap.upcoming) && snap.upcoming.length > 0
               ? snap.upcoming.map(normalizeMarket)
-              : [],
-            shares:     snap.shares ?? {},
-            btc:        snap.btc ?? null,
-            scan:       snap.scan ? normalizeScan(snap.scan) : null,
-            lastSignal,
+              : stateRef.current.upcoming,
+            // Merge per-token shares — snapshot data wins for tokens it covers.
+            shares:  { ...stateRef.current.shares, ...(snap.shares ?? {}) },
+            btc:     snap.btc ?? stateRef.current.btc,
+            scan:    snap.scan ? normalizeScan(snap.scan) : stateRef.current.scan,
+            lastSignal: lastSignal ?? stateRef.current.lastSignal,
             // Seed history with the current signal (if any) so the panel isn't empty
             // right after page load.
-            signals:    lastSignal && stateRef.current.signals.length === 0
+            signals: lastSignal && stateRef.current.signals.length === 0
               ? [lastSignal]
               : stateRef.current.signals,
           };
@@ -416,13 +470,13 @@ export function useLiveStream(url = '/api/poly/stream'): LiveStreamState {
         } catch { /* ignore */ }
       });
 
-      es.addEventListener('coin_t30', (ev) => {
+      es.addEventListener('coin_t3', (ev) => {
         try {
-          const e = JSON.parse((ev as MessageEvent).data) as CoinT30Event;
+          const e = JSON.parse((ev as MessageEvent).data) as CoinT3Event;
           const prev = stateRef.current.coinEvents[e.coin] ?? {};
           stateRef.current = {
             ...stateRef.current,
-            coinEvents: { ...stateRef.current.coinEvents, [e.coin]: { ...prev, t30: e } },
+            coinEvents: { ...stateRef.current.coinEvents, [e.coin]: { ...prev, t3: e } },
           };
           tickStat();
           scheduleFlush();
@@ -442,10 +496,31 @@ export function useLiveStream(url = '/api/poly/stream'): LiveStreamState {
         } catch { /* ignore */ }
       });
 
-      // 'spike' and 'ping' — currently no UI consumer; accept silently
+      // 'ping' — keep-alive heartbeat from backend (every 15s). No UI use,
+      // but we need to register the listener so EventSource fires it; this
+      // updates lastEventAt and prevents the watchdog from false-triggering
+      // when there's no other data flowing (e.g. between candles).
+      es.addEventListener('ping', () => { lastEventAt = Date.now(); });
+
+      // 'spike' — no UI consumer; accept silently
     }
 
     connect();
+
+    // Watchdog: if no event has arrived for STALE_MS, force reconnect.
+    // Backend sends `ping` every 15s, so a 30s gap means the stream is dead
+    // (CF/network silently dropped) even if onerror didn't fire.
+    const STALE_MS = 30_000;
+    watchdogTimer = setInterval(() => {
+      if (cancelled) return;
+      if (Date.now() - lastEventAt > STALE_MS) {
+        // Force a reconnect cycle — close current ES and schedule a new one.
+        try { es?.close(); } catch { /* ignore */ }
+        es = null;
+        patch({ connected: false });
+        scheduleReconnect();
+      }
+    }, 5_000);
 
     return () => {
       cancelled = true;
@@ -453,6 +528,8 @@ export function useLiveStream(url = '/api/poly/stream'): LiveStreamState {
         window.cancelAnimationFrame(flushFrameRef.current);
         flushFrameRef.current = null;
       }
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (watchdogTimer)  clearInterval(watchdogTimer);
       es?.close();
     };
   }, [url]);

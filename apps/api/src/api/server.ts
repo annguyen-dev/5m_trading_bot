@@ -25,16 +25,19 @@ import { getSimulateCandles, runSimulate } from './simulate.js';
 import { runPolySimulate } from './poly-simulate.js';
 import { startBacktest, backtestProgress } from './backtest-runner.js';
 import { deleteBacktestRun } from './backtest-delete.js';
+import { startPolyBacktest, streamPolyBacktest } from '../backtest/poly/handler.js';
 import { listFormulaConfigs, getActiveFormulaConfig, createFormulaConfig, updateFormulaConfig, activateFormulaConfig, deleteFormulaConfig } from './formula.js';
 import { analyzeFormula } from './formula-analyze.js';
 import { listSettings, updateSetting } from './settings.js';
 import { getPolyStatus, getUpcomingMarkets, getCurrentMarket,
          getShareHistory, getBtcHistory, getPastWindows,
          placeSimulatedOrder, listOrders, attachLiveEngine,
-         resetTestData, getPortfolio } from './poly-status.js';
+         resetTestData, getPortfolio,
+         getPolyPositions, sellPosition, getBalance } from './poly-status.js';
 import { verifyCoinSlugs } from './poly-verify.js';
 import { listCoinConfigs, updateCoinConfigHandler } from './coin-configs.js';
 import { listTelegramChannels, replaceTelegramChannels } from './telegram-channels.js';
+import { getStreakStats } from './analyze-streaks.js';
 import { polyStreamHandler } from './poly-stream.js';
 import { loginHandler, meHandler } from './auth.js';
 import { requireAuth } from '../auth/middleware.js';
@@ -95,6 +98,10 @@ app.post('/api/backtest/run',                startBacktest);
 app.get('/api/backtest/progress/:jobId',     backtestProgress);
 app.delete('/api/backtest/runs/:envId',      deleteBacktestRun);
 
+// Poly-driven backtest (mirrors live PMW strategy on historical Poly ticks)
+app.post('/api/backtest/poly/run',                  startPolyBacktest);
+app.get('/api/backtest/poly/progress/:jobId',       streamPolyBacktest);
+
 // ── Formula configs ──────────────────────────────────────────────────────────
 app.get('/api/formula/configs',              listFormulaConfigs);
 app.get('/api/formula/configs/active',       getActiveFormulaConfig);
@@ -128,6 +135,9 @@ app.get('/api/poly/share-history',     getShareHistory);
 app.get('/api/poly/btc-history',       getBtcHistory);
 app.get('/api/poly/past-windows',      getPastWindows);
 app.post('/api/poly/orders/simulate',  placeSimulatedOrder);
+app.post('/api/poly/orders/sell',      sellPosition);
+app.get('/api/poly/balance',           getBalance);
+app.get('/api/poly/positions/:conditionId', getPolyPositions);
 app.get('/api/poly/orders',            listOrders);
 app.get('/api/poly/portfolio',         getPortfolio);
 app.delete('/api/poly/admin/reset-test-data', resetTestData);
@@ -140,6 +150,9 @@ app.put('/api/coin-configs/:symbol',   updateCoinConfigHandler);
 // ── Telegram channel routing ──────────────────────────────────────────────
 app.get('/api/telegram-channels',      listTelegramChannels);
 app.put('/api/telegram-channels',      replaceTelegramChannels);
+
+// ── Streak pattern analyzer ────────────────────────────────────────────────
+app.get('/api/analyze/streak-stats',   getStreakStats);
 
 // ── Polymarket — SSE live stream (set up below after engine boots) ─────────
 //    SSE needs auth too — polyStreamHandler is mounted under /api, so the
@@ -199,7 +212,7 @@ async function bootstrap(): Promise<void> {
   bus.onSignal((ev: SignalBusEvent) => {
     if (ev.type === 'T+0')   engine.emit('coin_t0plus', ev);
     if (ev.type === 'T+4')   engine.emit('coin_t4',     ev);
-    if (ev.type === 'T-30s') engine.emit('coin_t30',    ev);
+    if (ev.type === 'T-3s')  engine.emit('coin_t3',     ev);
     if (ev.type === 'T-0')   engine.emit('coin_t0',     ev);
   });
 

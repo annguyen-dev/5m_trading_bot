@@ -85,8 +85,11 @@ export default function LoginPage() {
 
 const S: Record<string, React.CSSProperties> = {
   page:  { minHeight: '100vh', display: 'flex', alignItems: 'center',
-           justifyContent: 'center', background: '#0d1117', color: '#c9d1d9' },
-  card:  { width: 360, display: 'flex', flexDirection: 'column', gap: 14,
+           justifyContent: 'center', background: '#0d1117', color: '#c9d1d9',
+           padding: 16 },
+  // width: 100% lets the card shrink on phones < 360 wide; maxWidth caps it
+  // at the original 360 on bigger screens.
+  card:  { width: '100%', maxWidth: 360, display: 'flex', flexDirection: 'column', gap: 14,
            padding: 28, background: '#161b22', border: '1px solid #30363d',
            borderRadius: 10, boxShadow: '0 4px 24px rgba(0,0,0,0.4)' },
   title: { fontSize: 22, fontWeight: 700 },
