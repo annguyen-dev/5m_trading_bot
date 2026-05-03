@@ -82,6 +82,7 @@ export default function AnalyzePage() {
           <SuggestedCard data={data} />
           <StreakLengthTable data={data} />
           <HighVolCard data={data} />
+          <StreakGapCard data={data} />
           <PostExtremeTable data={data} />
           <DayOfWeekHotnessCard data={data} />
           <HourlyHotnessRow data={data} />
@@ -164,6 +165,115 @@ function HighVolCard({ data }: { data: StreakStatsResponse }) {
       <div style={{ ...S.dim, marginTop: 8 }}>
         A "high-vol run" = one continuous streak of length ≥ threshold. Duration ≈ length × 5 min.
       </div>
+    </div>
+  );
+}
+
+function fmtMins(m: number): string {
+  if (m <= 0)        return '—';
+  if (m < 60)        return `${Math.round(m)}m`;
+  if (m < 24 * 60) {
+    const h = Math.floor(m / 60);
+    const mm = Math.round(m - h * 60);
+    return mm > 0 ? `${h}h ${mm}m` : `${h}h`;
+  }
+  const d = Math.floor(m / 1440);
+  const h = Math.round((m - d * 1440) / 60);
+  return h > 0 ? `${d}d ${h}h` : `${d}d`;
+}
+
+function StreakGapCard({ data }: { data: StreakStatsResponse }) {
+  const { byThreshold, recentEvents } = data.streakGaps;
+  return (
+    <div style={{ ...S.card, marginTop: 16 }}>
+      <div style={S.cardTitle}>Gap giữa các high-streak events</div>
+      <div style={{ ...S.dim, marginBottom: 10 }}>
+        Cứ mỗi lần streak ≥ N kết thúc (đảo chiều), tính khoảng cách thời gian
+        đến lần kế tiếp. Dùng để tune chiến lược "trade-after-extreme":
+        <i> arm window từ T+30m → T+(median gap)</i>.
+      </div>
+
+      <table style={S.table}>
+        <thead>
+          <tr>
+            <th style={{ ...S.th, textAlign: 'right' }}>Streak ≥ N</th>
+            <th style={{ ...S.th, textAlign: 'right' }}>Lần</th>
+            <th style={{ ...S.th, textAlign: 'right' }} title="Trung bình gap">
+              Mean
+            </th>
+            <th style={{ ...S.th, textAlign: 'right' }} title="Median (p50)">
+              Median
+            </th>
+            <th style={{ ...S.th, textAlign: 'right' }} title="10th percentile — gap ngắn nhất bình thường">
+              p10
+            </th>
+            <th style={{ ...S.th, textAlign: 'right' }} title="90th percentile — gap dài bất thường">
+              p90
+            </th>
+            <th style={{ ...S.th, textAlign: 'right' }}>Max</th>
+          </tr>
+        </thead>
+        <tbody>
+          {byThreshold.map(b => (
+            <tr key={b.thresholdLength}>
+              <td style={{ ...S.td, textAlign: 'right', fontWeight: 600, color: '#f0a500' }}>
+                {b.thresholdLength}
+              </td>
+              <td style={{ ...S.td, textAlign: 'right' }}>{b.occurrences}</td>
+              <td style={{ ...S.td, textAlign: 'right' }}>{fmtMins(b.meanGapMin)}</td>
+              <td style={{ ...S.td, textAlign: 'right', fontWeight: 600 }}>
+                {fmtMins(b.medianGapMin)}
+              </td>
+              <td style={{ ...S.td, textAlign: 'right', color: '#8b949e' }}>
+                {fmtMins(b.p10GapMin)}
+              </td>
+              <td style={{ ...S.td, textAlign: 'right', color: '#8b949e' }}>
+                {fmtMins(b.p90GapMin)}
+              </td>
+              <td style={{ ...S.td, textAlign: 'right', color: '#6e7681' }}>
+                {fmtMins(b.maxGapMin)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <div style={{ ...S.cardTitle, marginTop: 18 }}>
+        Recent events (length ≥ 5, mới nhất trước)
+      </div>
+      {recentEvents.length === 0 ? (
+        <div style={S.dim}>Không có streak ≥ 5 nào trong phạm vi đã chọn.</div>
+      ) : (
+        <table style={S.table}>
+          <thead>
+            <tr>
+              <th style={S.th}>Khi (UTC)</th>
+              <th style={{ ...S.th, textAlign: 'center' }}>Dir</th>
+              <th style={{ ...S.th, textAlign: 'right' }}>Length</th>
+              <th style={{ ...S.th, textAlign: 'right' }}>Gap so với event trước</th>
+            </tr>
+          </thead>
+          <tbody>
+            {recentEvents.map(e => (
+              <tr key={e.endedAt}>
+                <td style={{ ...S.td, color: '#c9d1d9', fontFamily: 'monospace', fontSize: 12 }}>
+                  {new Date(e.endedAt).toISOString().slice(0, 16).replace('T', ' ')}
+                </td>
+                <td style={{ ...S.td, textAlign: 'center', fontSize: 14, fontWeight: 700,
+                              color: e.signed > 0 ? '#3fb950' : '#f85149' }}>
+                  {e.signed > 0 ? '↑' : '↓'}
+                </td>
+                <td style={{ ...S.td, textAlign: 'right', fontWeight: 600, color: '#f0a500' }}>
+                  {e.length}
+                </td>
+                <td style={{ ...S.td, textAlign: 'right', color: '#8b949e' }}>
+                  {e.gapBeforeMin == null ? '—' : fmtMins(e.gapBeforeMin)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   );
 }

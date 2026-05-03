@@ -16,7 +16,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api, polyOrderKind, type PolyBtcTick, type PolyOrderRow, type PolyRange,
-  type PolyOrderKind, type PolyPastWindow, type SettingsResponse,
+  type PolyOrderKind, type PolyPastWindow, type PolyTradeRow, type SettingsResponse,
 } from '../api/client.js';
 import { createChart, type IChartApi, type ISeriesApi, type Time } from 'lightweight-charts';
 import { useLiveStream, type LiveMarket, type LiveShare,
@@ -162,6 +162,8 @@ export default function LivePage() {
       <div className="page-wrap">
         <ModeBanner settings={settings} switching={switching} onSwitch={switchMode} />
 
+        <EchoStatusPanel coinEvents={stream.coinEvents} />
+
         <CoinSignalsStrip coinEvents={stream.coinEvents} />
 
         {/* Single-column flow now — chart + slots first, trade panel below.
@@ -235,10 +237,12 @@ function MarketHeader({
   const min = Math.floor(remainingMs / 60000);
   const sec = Math.floor((remainingMs % 60000) / 1000);
 
-  const upTick = liveShares[market.tokenUp];
-  const dnTick = liveShares[market.tokenDown];
-  const upMid = midPrice(upTick?.bestBid, upTick?.bestAsk);
-  const dnMid = midPrice(dnTick?.bestBid, dnTick?.bestAsk);
+  // Treat stale ticks (> STALE_TICK_MS old) as if missing — better to render
+  // "—" than a misleading price the WS zombie has been holding stale.
+  const upTickFresh = freshTick(liveShares[market.tokenUp], now);
+  const dnTickFresh = freshTick(liveShares[market.tokenDown], now);
+  const upMid = midPrice(upTickFresh?.bestBid, upTickFresh?.bestAsk);
+  const dnMid = midPrice(dnTickFresh?.bestBid, dnTickFresh?.bestAsk);
 
   const currentPrice = btcLive;
   const openPrice    = null as number | null;   // TODO: snapshot first tick of window
@@ -575,8 +579,17 @@ function TradePanel({
   const [submitting, setSubmitting] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
 
-  const upTick = market ? liveShares[market.tokenUp]   : undefined;
-  const dnTick = market ? liveShares[market.tokenDown] : undefined;
+  // Drive freshness gating so a zombied WS doesn't let the user place an order
+  // at a stale (and likely wrong) ¢ value. 1s tick is enough — bid/ask move on
+  // far slower timescales for our display purposes.
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  const upTick = market ? freshTick(liveShares[market.tokenUp],   now) : null;
+  const dnTick = market ? freshTick(liveShares[market.tokenDown], now) : null;
   const latestForToken = direction === 'up' ? upTick : dnTick;
   // Buy → pay the ask. Sell isn't supported in this UI.
   const sharePrice = latestForToken?.bestAsk ?? null;
@@ -747,6 +760,14 @@ function SellCard({
   const [feedback, setFeedback] = useState<string | null>(null);
   const [reloadTick, setReloadTick] = useState(0);
 
+  // Same freshness gating as TradePanel — selling at a stale bid is just as
+  // dangerous as buying at a stale ask. 1s tick is enough.
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
   // Fetch position for this market. Re-fetch on market change, after a sell,
   // OR on any new order event (BUYs from Mua should refresh the shares count).
   useEffect(() => {
@@ -758,8 +779,8 @@ function SellCard({
     return () => { cancelled = true; };
   }, [market?.conditionId, reloadTick, lastOrderTs]);
 
-  const upTick = market ? liveShares[market.tokenUp]   : undefined;
-  const dnTick = market ? liveShares[market.tokenDown] : undefined;
+  const upTick = market ? freshTick(liveShares[market.tokenUp],   now) : null;
+  const dnTick = market ? freshTick(liveShares[market.tokenDown], now) : null;
   // Selling → you receive the bid (someone buys from you at their bid).
   const exitPrice = (direction === 'up' ? upTick?.bestBid : dnTick?.bestBid) ?? null;
 
@@ -767,8 +788,27 @@ function SellCard({
     ? (direction === 'up' ? position.up.shares : position.down.shares)
     : 0;
 
-  // Reset sharesToSell when direction changes or owned drops below current value.
-  useEffect(() => { setSharesToSell(0); }, [direction, market?.conditionId]);
+  // Auto-pick direction based on which side actually has shares, so the user
+  // doesn't need to click a tab before they can sell. Single-side cases just
+  // use that side; when both have shares we prefer DOWN per user request.
+  useEffect(() => {
+    if (!position) return;
+    const upN = position.up.shares;
+    const dnN = position.down.shares;
+    if      (dnN > 0 && upN === 0) setDirection('down');
+    else if (upN > 0 && dnN === 0) setDirection('up');
+    else if (dnN > 0)              setDirection('down');   // both > 0 → prefer DOWN
+    // both 0 → keep current selection (nothing useful to flip to anyway)
+  }, [position]);
+
+  // Default sell quantity to 100% of owned. Re-applies on direction switch,
+  // market switch, or position reload (after a Mua / partial Sell). User can
+  // still type a partial number manually, but the next refresh resets it.
+  useEffect(() => {
+    if (!position) return;
+    const ownedNow = direction === 'up' ? position.up.shares : position.down.shares;
+    setSharesToSell(ownedNow);
+  }, [direction, position, market?.conditionId]);
 
   const proceed = exitPrice && sharesToSell > 0 ? sharesToSell * exitPrice : 0;
 
@@ -1054,140 +1094,222 @@ function WindowGroup({ marketId, rows, liveShares }: { marketId: string; rows: P
     : `market ${marketId.slice(0, 10)}…`;
 
   // ── Display model ──────────────────────────────────────────────────────
-  // Hide pending TP/SL SELL rows — they're noise (just resting waitlists).
-  // When TP or SL fires, the SELL row flips to status='closed' AND its parent
-  // BUY closes too. Those FILLED SELLs are interesting events to show.
-  //
-  // Aggregate pending BUYs by direction so multi-DCA stacks render as ONE
-  // "position" row (size=Σ, entry=weighted avg). Closed BUYs render as-is
-  // (historical resolved trades).
-  const pendingBuys: PolyOrderRow[] = [];
-  const closedBuys:  PolyOrderRow[] = [];
-  const filledSells: PolyOrderRow[] = [];
+  // ALL BUYs (pending + closed) collapse into a single row per direction so
+  // multi-DCA stacks and resolved trades both show as one "position" with
+  // weighted-avg entry and combined realized + unrealized PnL. SELLs aren't
+  // rendered: their PnL is already captured on the parent BUY's pnl_usdc,
+  // and showing them duplicates the same trade as multiple rows.
+  const allBuys: PolyOrderRow[] = [];
   for (const r of rows) {
-    if (r.side === 'buy') {
-      (r.status === 'pending' ? pendingBuys : closedBuys).push(r);
-    } else if (r.status === 'closed') {
-      // Skip cancelled siblings (the OCO half that didn't fire).
-      if (r.close_reason !== 'cancelled') filledSells.push(r);
-    }
-    // pending SELL rows (TP/SL waiting): hidden
+    if (r.side === 'buy') allBuys.push(r);
   }
+  const positions = aggregateBuysByDirection(allBuys, liveShares);
 
-  const positions = aggregatePendingBuys(pendingBuys, liveShares);
-
-  // PnL aggregation: realized (closed BUYs) + unrealized (open positions)
-  const realizedPnl   = closedBuys.reduce((s, r) => s + (r.pnl_usdc ?? 0), 0);
+  // Window-total PnL: realized + unrealized across both directions.
+  const realizedPnl   = positions.reduce((s, p) => s + p.realizedPnl, 0);
   const unrealizedPnl = positions.reduce((s, p) => s + (p.unrealizedPnl ?? 0), 0);
   const totalPnl      = realizedPnl + unrealizedPnl;
-  const isOpen        = pendingBuys.length > 0;
+  const isOpen        = positions.some(p => p.pendingCount > 0);
   const pnlColor      = totalPnl > 0 ? '#3fb950' : totalPnl < 0 ? '#f85149' : '#8b949e';
+
+  // ── Poly cross-check view (lazy fetch) ─────────────────────────────────
+  // App view = our DB aggregated. Poly view = on-chain trades from the
+  // Polymarket data-api. Useful when bot's local ledger and reality
+  // disagree (manual orders placed via Polymarket UI, partial fills, etc).
+  const [view, setView] = useState<'app' | 'poly'>('app');
+  const [polyTrades, setPolyTrades]     = useState<PolyTradeRow[] | null>(null);
+  const [polyError, setPolyError]       = useState<string | null>(null);
+  const [polyLoading, setPolyLoading]   = useState(false);
+  useEffect(() => {
+    if (view !== 'poly' || polyTrades !== null || polyLoading) return;
+    let cancelled = false;
+    setPolyLoading(true);
+    setPolyError(null);
+    api.getPolyTrades(marketId)
+      .then(r => { if (!cancelled) setPolyTrades(r.trades); })
+      .catch(e => { if (!cancelled) setPolyError(e instanceof Error ? e.message : String(e)); })
+      .finally(() => { if (!cancelled) setPolyLoading(false); });
+    return () => { cancelled = true; };
+  }, [view, marketId, polyTrades, polyLoading]);
 
   return (
     <div style={S.windowGroup}>
       <div style={S.windowGroupHeader}>
         <span style={{ fontWeight: 600 }}>Window {windowLabel}</span>
         <span style={{ flex: 1 }} />
-        <span style={{ fontFamily: 'monospace', color: pnlColor }}>
+        {/* Toggle App ↔ Poly view. Poly fetched on first switch, then cached. */}
+        <button
+          onClick={() => setView(v => v === 'app' ? 'poly' : 'app')}
+          title={view === 'app'
+            ? 'View on-chain trades from Polymarket data-api'
+            : 'Back to bot ledger view'}
+          style={{
+            padding: '2px 8px', fontSize: 10, borderRadius: 4,
+            border: '1px solid #30363d',
+            background: view === 'poly' ? '#1f6feb' : 'transparent',
+            color: view === 'poly' ? '#fff' : '#8b949e', cursor: 'pointer',
+          }}
+        >
+          {view === 'app' ? 'Poly view' : 'App view'}
+        </button>
+        <span style={{ fontFamily: 'monospace', color: pnlColor, marginLeft: 8 }}>
           {isOpen
             ? `PnL ≈ ${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)} (live)`
             : `PnL ${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}`}
         </span>
       </div>
-      <div style={S.ordersTable}>
-        <div style={S.ordersHeader}>
-          <span>Lệnh</span><span>Side</span><span>Hướng</span>
-          <span>Price</span><span>Size</span>
-          <span>PnL</span><span>Loại</span><span>Status</span>
+      {view === 'app' && (
+        <div style={S.ordersTable}>
+          <div style={S.ordersHeader}>
+            <span>Time</span><span>×N</span><span>Hướng</span>
+            <span>Price</span><span>Size</span>
+            <span>PnL</span><span>Loại</span><span>Status</span>
+          </div>
+          {positions.map(p => (
+            <PositionRow key={`pos-${p.direction}`} p={p} />
+          ))}
         </div>
-        {/* Open positions (aggregated). One row per direction. */}
-        {positions.map(p => (
-          <PositionRow key={`pos-${p.direction}`} p={p} />
-        ))}
-        {/* Closed BUYs (historical, with realized PnL). */}
-        {closedBuys.map(o => <OrderRow key={o.id} o={o} liveShares={liveShares} />)}
-        {/* Filled SELL rows (TP/SL/resolution exits that actually fired). */}
-        {filledSells.map(o => <OrderRow key={o.id} o={o} liveShares={liveShares} />)}
-      </div>
+      )}
+      {view === 'poly' && (
+        <PolyTradesView trades={polyTrades} loading={polyLoading} error={polyError} />
+      )}
     </div>
   );
 }
 
-// Aggregated open-position view (sum of stacked BUYs in same direction).
+// Aggregated position view — ONE row per (direction × window) combining ALL
+// BUYs (pending + closed) plus a derived realized/unrealized PnL pair. SELLs
+// (TP/SL/manual exits) aren't rendered separately because their PnL is
+// already accounted for in the parent BUY's pnl_usdc — duplicating them as
+// rows clutters the table.
 interface AggregatedPosition {
   direction:      'up' | 'down';
-  orderCount:     number;     // how many BUYs are stacked
-  totalSize:      number;     // Σ size_usdc
+  orderCount:     number;     // total BUYs (pending + closed)
+  pendingCount:   number;
+  closedCount:    number;
+  totalSize:      number;     // Σ size_usdc across ALL buys
   totalShares:    number;     // Σ size_usdc / share_price
-  avgEntryPrice:  number;     // weighted by shares
-  hasDca:         boolean;    // true if any included BUY is a DCA
-  hasManual:      boolean;    // true if any is source=manual
-  liveBid:        number | null;
+  avgEntryPrice:  number;     // shares-weighted across ALL buys
+  realizedPnl:    number;     // Σ pnl_usdc of closed buys
+  /** Mark-to-market unrealized PnL across pending shares only.
+   *  null when there are no pending buys (use realized for display). */
   unrealizedPnl:  number | null;
+  liveBid:        number | null;
+  hasDca:         boolean;
+  hasManual:      boolean;
+  /** ms timestamp of the most recent BUY entry — used for desc sort. */
+  latestEntryMs:  number;
+  /** Distinct close_reasons seen across closed buys. Used for the status
+   *  badge (one of: TP / SL / MAN / RES, or MIX when more than one). */
+  closeReasons:   Set<string>;
 }
 
-function aggregatePendingBuys(
+function aggregateBuysByDirection(
   buys: PolyOrderRow[],
   liveShares: Record<string, LiveShare>,
 ): AggregatedPosition[] {
-  const byDirection = new Map<'up' | 'down', AggregatedPosition>();
+  const byDir = new Map<'up' | 'down', AggregatedPosition>();
   for (const b of buys) {
-    const tokenId = b.direction === 'up' ? b.token_up : b.token_down;
-    const shares = b.size_usdc / b.share_price;
-    const ex = byDirection.get(b.direction);
-    if (ex) {
-      ex.orderCount  += 1;
-      ex.totalSize   += b.size_usdc;
-      ex.totalShares += shares;
-      // weighted avg: avg = (Σ price × shares) / (Σ shares); track sum here.
-      ex.avgEntryPrice = (ex.avgEntryPrice * (ex.totalShares - shares) + b.share_price * shares) / ex.totalShares;
-      ex.hasDca    = ex.hasDca    || b.signal_path === 'dca';
-      ex.hasManual = ex.hasManual || b.source === 'manual';
-    } else {
-      byDirection.set(b.direction, {
+    const tokenId   = b.direction === 'up' ? b.token_up : b.token_down;
+    const liveBid   = tokenId ? (liveShares[tokenId]?.bestBid ?? null) : null;
+    const shares    = b.size_usdc / b.share_price;
+    const isPending = b.status === 'pending';
+    const isClosed  = b.status === 'closed';
+    const tsMs      = Date.parse(b.ts_entry);
+
+    let ex = byDir.get(b.direction);
+    if (!ex) {
+      ex = {
         direction:     b.direction,
-        orderCount:    1,
-        totalSize:     b.size_usdc,
-        totalShares:   shares,
-        avgEntryPrice: b.share_price,
-        hasDca:        b.signal_path === 'dca',
-        hasManual:     b.source === 'manual',
-        liveBid:       tokenId ? liveShares[tokenId]?.bestBid ?? null : null,
-        unrealizedPnl: null,
-      });
+        orderCount:    0, pendingCount: 0, closedCount: 0,
+        totalSize:     0, totalShares: 0,
+        avgEntryPrice: 0,        // computed at the end (Σ price·shares / Σ shares)
+        realizedPnl:   0,
+        unrealizedPnl: 0,        // accumulator; nulled at the end if no pending
+        liveBid,
+        hasDca:        false,
+        hasManual:     false,
+        latestEntryMs: 0,
+        closeReasons:  new Set(),
+      };
+      byDir.set(b.direction, ex);
     }
-  }
-  // Compute unrealized PnL after summing.
-  for (const p of byDirection.values()) {
-    if (p.liveBid != null) {
-      p.unrealizedPnl = (p.liveBid - p.avgEntryPrice) * p.totalShares;
+    ex.orderCount   += 1;
+    if (isPending) ex.pendingCount += 1;
+    if (isClosed)  ex.closedCount  += 1;
+    ex.totalSize    += b.size_usdc;
+    ex.totalShares  += shares;
+    // Weighted-avg numerator — divide by totalShares once at the end.
+    ex.avgEntryPrice = ex.avgEntryPrice + b.share_price * shares;
+    if (isClosed)  ex.realizedPnl += (b.pnl_usdc ?? 0);
+    // Unrealized PnL is per-pending-buy (entry price differs across DCAs):
+    //   Σ (liveBid − share_price) × shares  for pending only.
+    if (isPending && liveBid != null) {
+      ex.unrealizedPnl = (ex.unrealizedPnl ?? 0) + (liveBid - b.share_price) * shares;
     }
+    if (b.signal_path === 'dca')  ex.hasDca = true;
+    if (b.source === 'manual')    ex.hasManual = true;
+    if (tsMs > ex.latestEntryMs)  ex.latestEntryMs = tsMs;
+    if (isClosed && b.close_reason) ex.closeReasons.add(b.close_reason);
+    // Keep the freshest liveBid we saw across this direction's buys.
+    if (liveBid != null) ex.liveBid = liveBid;
   }
-  return Array.from(byDirection.values()).sort((a, b) =>
-    a.direction === 'up' ? -1 : 1   // UP first, then DOWN
-  );
+  // Finalize derived fields.
+  const out: AggregatedPosition[] = [];
+  for (const p of byDir.values()) {
+    p.avgEntryPrice = p.totalShares > 0 ? p.avgEntryPrice / p.totalShares : 0;
+    if (p.pendingCount === 0) p.unrealizedPnl = null;
+    out.push(p);
+  }
+  // Newest activity first. User asked for desc-by-time within window.
+  return out.sort((a, b) => b.latestEntryMs - a.latestEntryMs);
 }
 
 function PositionRow({ p }: { p: AggregatedPosition }) {
   const dirColor = p.direction === 'up' ? '#3fb950' : '#f85149';
-  const pnlColor = p.unrealizedPnl == null ? '#8b949e'
-                 : p.unrealizedPnl >= 0   ? '#3fb950' : '#f85149';
+  // Combined PnL (realized + unrealized) drives the row color and number.
+  // Unrealized only applies when there are still pending shares.
+  const totalPnl  = p.realizedPnl + (p.unrealizedPnl ?? 0);
+  const isOpen    = p.pendingCount > 0;
+  const pnlColor  = totalPnl > 0 ? '#3fb950' : totalPnl < 0 ? '#f85149' : '#8b949e';
+
   const tags: string[] = [];
   if (p.hasManual) tags.push('MAN');
   if (p.hasDca)    tags.push('DCA');
   if (tags.length === 0) tags.push('BND');
 
+  // Status: HOLDING if any pending; otherwise CLOSED · {reason or MIX}.
+  let statusText: string;
+  let statusColor: string;
+  if (isOpen) {
+    statusText  = p.closedCount > 0
+      ? `HOLDING ${p.pendingCount}/${p.orderCount}`
+      : `HOLDING ×${p.pendingCount}`;
+    statusColor = '#f0a500';
+  } else {
+    const reasons = Array.from(p.closeReasons);
+    const reasonLabel = reasons.length === 1
+      ? reasons[0]!.toUpperCase().slice(0, 3)
+      : reasons.length > 1 ? 'MIX' : '—';
+    statusText  = `CLOSED · ${reasonLabel}`;
+    statusColor = totalPnl >= 0 ? '#3fb950' : '#f85149';
+  }
+
+  // Local time of latest BUY entry — formatted compact (HH:MM:SS) so the
+  // narrow 90px column fits without wrapping.
+  const timeText = p.latestEntryMs
+    ? new Date(p.latestEntryMs).toLocaleTimeString('en-GB', { hour12: false })
+    : '—';
+
   return (
     <div style={S.ordersRow}>
-      <span style={{ fontFamily: 'monospace', fontSize: 11, color: '#8b949e' }}>
-        ×{p.orderCount}
+      <span style={{ fontFamily: 'monospace', fontSize: 11, color: '#8b949e' }}
+            title={p.latestEntryMs ? new Date(p.latestEntryMs).toISOString() : ''}>
+        {timeText}
       </span>
-      <span style={{
-        padding: '2px 5px', borderRadius: 3,
-        fontSize: 10, fontWeight: 700, width: 'fit-content',
-        background: '#1a3a4a', color: '#79c0ff',
-      }}>
-        POS
+      <span style={{ fontFamily: 'monospace', fontSize: 11, color: '#8b949e' }}
+            title={`${p.pendingCount} pending · ${p.closedCount} closed`}>
+        ×{p.orderCount}
       </span>
       <span style={{ color: dirColor, fontWeight: 600 }}>{p.direction.toUpperCase()}</span>
       <span style={{ fontFamily: 'monospace' }} title="weighted avg entry">
@@ -1196,10 +1318,15 @@ function PositionRow({ p }: { p: AggregatedPosition }) {
       <span title="total size = Σ of all stacked BUYs">
         ${p.totalSize.toFixed(2)} <span style={{ color: '#6e7681', fontSize: 10 }}>· {p.totalShares.toFixed(1)} sh</span>
       </span>
-      <span title={p.liveBid != null ? `unrealized — bid ${(p.liveBid * 100).toFixed(1)}¢` : ''}
-        style={{ color: pnlColor, fontStyle: 'italic',
-                 fontVariantNumeric: 'tabular-nums' as const }}>
-        {p.unrealizedPnl != null ? `≈ $${p.unrealizedPnl.toFixed(2)}` : '—'}
+      <span title={
+              `realized $${p.realizedPnl.toFixed(2)}`
+              + (p.unrealizedPnl != null ? ` · unrealized $${p.unrealizedPnl.toFixed(2)}` : '')
+              + (p.liveBid != null ? ` · bid ${(p.liveBid * 100).toFixed(1)}¢` : '')
+            }
+            style={{ color: pnlColor,
+                     fontStyle: isOpen ? 'italic' : 'normal',
+                     fontVariantNumeric: 'tabular-nums' as const }}>
+        {isOpen ? '≈ ' : ''}{totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}
       </span>
       <span style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
         {tags.map(t => (
@@ -1210,127 +1337,78 @@ function PositionRow({ p }: { p: AggregatedPosition }) {
           </span>
         ))}
       </span>
-      <span style={{ fontSize: 11, color: '#f0a500' }}>
-        HOLDING
-      </span>
-    </div>
-  );
-}
-
-function OrderRow({ o, liveShares }: { o: PolyOrderRow; liveShares: Record<string, LiveShare> }) {
-  const dir = o.direction.toUpperCase();
-  const dirColor = o.direction === 'up' ? '#3fb950' : '#f85149';
-  const kind = polyOrderKind(o);
-  const kindBadge = KIND_BADGE[kind];
-  const isSell = o.side === 'sell';
-
-  // Live unrealized PnL — pending BUYs use the current bid for their token
-  // to compute mark-to-market value. `o.pnl_usdc` is the realized number,
-  // populated only at close. We mark unrealized values with a leading "≈".
-  const pendingBuy = o.status === 'pending' && o.side === 'buy';
-  const tokenId = pendingBuy
-    ? (o.direction === 'up' ? o.token_up : o.token_down)
-    : null;
-  const liveBid = tokenId ? liveShares[tokenId]?.bestBid ?? null : null;
-  const unrealizedPnl =
-    pendingBuy && liveBid != null
-      ? (liveBid - o.share_price) * (o.size_usdc / o.share_price)
-      : null;
-  const displayPnl =
-    o.pnl_usdc != null ? o.pnl_usdc :
-    unrealizedPnl != null ? unrealizedPnl :
-    null;
-  const pnlIsLive = unrealizedPnl != null && o.pnl_usdc == null;
-
-  // Status labels — BUY and SELL tell different stories.
-  //   BUY pending:  HOLDING
-  //   BUY closed:   CLOSED · {reason}
-  //   SELL pending: "Limit TP/SL @ X¢" — these are the actual resting exit orders
-  //   SELL filled:  FILLED · TP/SL
-  //   SELL cancel:  CANCELLED
-  const statusLabel =
-    o.status === 'pending' && isSell
-      ? (o.close_reason === 'tp' ? `Limit TP @ ${(o.share_price * 100).toFixed(0)}¢`
-       : o.close_reason === 'sl' ? `Limit SL @ ${(o.share_price * 100).toFixed(0)}¢`
-       :                           'Pending')
-    : o.status === 'pending'                      ? 'HOLDING'
-    : isSell && o.close_reason === 'tp'           ? 'FILLED · TP'
-    : isSell && o.close_reason === 'sl'           ? 'FILLED · SL'
-    : isSell && o.close_reason === 'cancelled'    ? 'CANCELLED'
-    : isSell && o.close_reason === 'resolution'   ? 'SETTLED'
-    : !isSell && o.close_reason === 'tp'          ? 'CLOSED · TP'
-    : !isSell && o.close_reason === 'sl'          ? 'CLOSED · SL'
-    : !isSell && o.close_reason === 'resolution'  ? 'EXPIRED'
-    :                                               'closed';
-
-  const statusColor =
-    o.status === 'pending' && isSell              ? '#79c0ff'  // limit order resting
-    : o.status === 'pending'                      ? '#f0a500'
-    : o.close_reason === 'tp'                     ? '#3fb950'
-    : o.close_reason === 'sl'                     ? '#f85149'
-    : o.close_reason === 'cancelled'              ? '#8b949e'
-    : o.close_reason === 'resolution'             ? '#8b949e'
-    :                                               '#8b949e';
-
-  return (
-    <div style={S.ordersRow}>
-      <span style={{ fontFamily: 'monospace', fontSize: 11, color: '#8b949e' }}>
-        {o.id.slice(0, 8)}…
-      </span>
-      <span style={{
-        padding: '2px 5px', borderRadius: 3,
-        fontSize: 10, fontWeight: 700, width: 'fit-content',
-        background: isSell ? '#3a1a4a' : '#1a3a4a',
-        color:      isSell ? '#bc8cff' : '#79c0ff',
-      }}>
-        {isSell ? 'SELL' : 'BUY'}
-      </span>
-      <span style={{ color: dirColor, fontWeight: 600 }}>{dir}</span>
-      <span style={{ fontFamily: 'monospace' }}>{(o.share_price * 100).toFixed(1)}¢</span>
-      <span>${o.size_usdc.toFixed(2)}</span>
-      <span title={pnlIsLive ? `unrealized — bid ${liveBid != null ? (liveBid * 100).toFixed(1) + '¢' : '?'}` : ''}
-        style={{ color: displayPnl != null
-                          ? (displayPnl >= 0 ? '#3fb950' : '#f85149')
-                          : '#8b949e',
-                 fontStyle: pnlIsLive ? 'italic' : 'normal' }}>
-        {displayPnl != null
-          ? `${pnlIsLive ? '≈ ' : ''}$${displayPnl.toFixed(2)}`
-          : '—'}
-      </span>
-      <span style={{ display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' }}>
-        <span style={{ ...S.kindBadge,
-                        background: kindBadge.bg, color: kindBadge.fg }}
-              title={`mode=${o.mode} source=${o.source} path=${o.signal_path ?? 'manual'}`}>
-          {kindBadge.label}
-        </span>
-        {/* MAN badge — placed via FE (manual buy or manual sell), distinguish
-            from auto bot orders. Always show when source=manual. */}
-        {o.source === 'manual' && (
-          <span style={{ ...S.sourceMini, color: '#bc8cff', borderColor: '#7d4faa' }}
-                title="MANUAL — placed via UI by user (not auto signal)">MAN</span>
-        )}
-        {o.source === 'auto' && o.signal_path === 'boundary' && (
-          <span style={{ ...S.sourceMini, color: '#3fb950' }} title="BOUNDARY — pre-position for next window">BND</span>
-        )}
-        {o.source === 'auto' && o.signal_path === 'dca' && (
-          <span style={{ ...S.sourceMini, color: '#79c0ff' }} title="DCA — average down existing BOUNDARY position">DCA</span>
-        )}
-        {o.source === 'auto' && o.signal_path === 'panic' && (
-          <span style={{ ...S.sourceMini, color: '#ff9f43' }} title="PANIC — bottom-fishing in current window">PNC</span>
-        )}
-      </span>
       <span style={{ fontSize: 11, color: statusColor }}>
-        {statusLabel}
+        {statusText}
       </span>
     </div>
   );
 }
 
-const KIND_BADGE: Record<PolyOrderKind, { label: string; bg: string; fg: string }> = {
-  simulate: { label: 'SIM',  bg: '#3a2c0d', fg: '#f0a500' },
-  backtest: { label: 'BT',   bg: '#0d2438', fg: '#79c0ff' },
-  live:     { label: 'LIVE', bg: '#0e3a1c', fg: '#3fb950' },
-};
+// On-chain trades pulled straight from Polymarket data-api (read-only). Used
+// by WindowGroup's "Poly view" toggle to cross-check the bot's local ledger.
+function PolyTradesView({
+  trades, loading, error,
+}: { trades: PolyTradeRow[] | null; loading: boolean; error: string | null }) {
+  if (loading && trades === null) {
+    return <div style={{ padding: 12, fontSize: 12, color: '#8b949e' }}>Loading from Polymarket…</div>;
+  }
+  if (error) {
+    return <div style={{ padding: 12, fontSize: 12, color: '#f85149' }}>Lỗi: {error}</div>;
+  }
+  if (!trades || trades.length === 0) {
+    return <div style={{ padding: 12, fontSize: 12, color: '#8b949e' }}>Không có trade nào trên Polymarket cho window này.</div>;
+  }
+  return (
+    <div style={S.ordersTable}>
+      <div style={S.polyTradesHeader}>
+        <span>Time</span><span>Side</span><span>Outcome</span>
+        <span>Price</span><span>Shares</span><span>Total</span><span>Tx</span>
+      </div>
+      {trades.map(t => {
+        const isUp     = /up/i.test(t.outcome);
+        const isDown   = /down/i.test(t.outcome);
+        const dirColor = isUp ? '#3fb950' : isDown ? '#f85149' : '#c9d1d9';
+        const sideBg   = t.side === 'BUY' ? '#1a3a4a' : '#3a1a4a';
+        const sideFg   = t.side === 'BUY' ? '#79c0ff' : '#bc8cff';
+        const total    = t.price * t.size;
+        const dt       = t.timestamp ? new Date(t.timestamp * 1000) : null;
+        return (
+          <div key={t.transactionHash} style={S.polyTradesRow}>
+            <span style={{ fontFamily: 'monospace', fontSize: 11, color: '#8b949e' }}
+                  title={dt ? dt.toISOString() : ''}>
+              {dt ? dt.toLocaleTimeString('en-GB', { hour12: false }) : '—'}
+            </span>
+            <span style={{
+              padding: '2px 5px', borderRadius: 3,
+              fontSize: 10, fontWeight: 700, width: 'fit-content',
+              background: sideBg, color: sideFg,
+            }}>
+              {t.side}
+            </span>
+            <span style={{ color: dirColor, fontWeight: 600 }}>
+              {t.outcome.toUpperCase()}
+            </span>
+            <span style={{ fontFamily: 'monospace' }}>
+              {(t.price * 100).toFixed(1)}¢
+            </span>
+            <span style={{ fontFamily: 'monospace' }}>
+              {t.size.toFixed(2)}
+            </span>
+            <span style={{ fontFamily: 'monospace', color: '#c9d1d9' }}>
+              ${total.toFixed(2)}
+            </span>
+            <a href={`https://polygonscan.com/tx/${t.transactionHash}`}
+               target="_blank" rel="noopener noreferrer"
+               title={t.transactionHash}
+               style={{ fontFamily: 'monospace', fontSize: 11, color: '#79c0ff', textDecoration: 'none' }}>
+              {t.transactionHash.slice(0, 8)}…
+            </a>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // Signal history — rolling log of emitted signals this session
@@ -1710,6 +1788,116 @@ const ModeBanner = React.memo(function ModeBanner({
 });
 
 // ────────────────────────────────────────────────────────────────────────────
+// EchoStatusPanel — prominent strategy state display above the chart.
+// Shows ALL coins running echo strategy with full state (armed/idle, current
+// threshold, defensive countdown). Hydrated from the snapshot on connect so
+// it renders immediately, not after the next bus event.
+// ────────────────────────────────────────────────────────────────────────────
+
+const EchoStatusPanel = React.memo(function EchoStatusPanel({
+  coinEvents,
+}: { coinEvents: LiveStreamState['coinEvents'] }) {
+  const echoCoins = ALL_COINS.filter(c => coinEvents[c]?.echo);
+  if (echoCoins.length === 0) return null;
+  return (
+    <div style={ES.panel}>
+      <div style={ES.title}>Echo strategy state</div>
+      <div style={ES.rows}>
+        {echoCoins.map(coin => (
+          <EchoStatusRow key={coin} coin={coin} echo={coinEvents[coin]!.echo!} />
+        ))}
+      </div>
+    </div>
+  );
+});
+
+const EchoStatusRow = React.memo(function EchoStatusRow({
+  coin, echo,
+}: { coin: CoinSymbol; echo: NonNullable<CoinEventsEntry['echo']> }) {
+  // Live tick — drives countdowns down to the second.
+  const [nowMs, setNowMs] = useState(Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  const armed = echo.armed && echo.armEndAt != null && echo.armEndAt > nowMs;
+  const armMinLeft = armed && echo.armEndAt
+    ? Math.max(0, Math.round((echo.armEndAt - nowMs) / 60000))
+    : 0;
+  const defActivatesIn = echo.defensiveActivatesAt != null
+    ? Math.round((echo.defensiveActivatesAt - nowMs) / 60000)
+    : null;
+  const defActive = echo.defensiveEnabled
+    && (echo.defensiveActivatesAt == null || nowMs > echo.defensiveActivatesAt);
+  const lastExtremeAgo = echo.lastExtremeStreakAt != null
+    ? Math.round((nowMs - echo.lastExtremeStreakAt) / 60000)
+    : null;
+
+  // Color: armed = green, idle = grey, defensive active = red, defensive
+  // imminent (≤60m) = orange.
+  const stateColor = armed   ? '#3fb950'
+                   : defActive ? '#f85149'
+                   : '#8b949e';
+  const stateLabel = armed ? `ARMED · ${armMinLeft}m left`
+                   : defActive ? 'DEFENSIVE'
+                   : 'IDLE';
+  const fmtMin = (m: number) => m < 60 ? `${m}m`
+                              : m < 1440 ? `${Math.floor(m/60)}h ${m%60}m`
+                              : `${Math.floor(m/1440)}d ${Math.floor((m%1440)/60)}h`;
+  const fmtMs  = (ms: number) => fmtMin(Math.round(ms / 60000));
+  const gaps   = echo.defensiveGapStats;
+
+  return (
+    <div style={ES.row}>
+      <span style={ES.coin}>{coin}</span>
+      <span style={{ ...ES.state, color: stateColor }}>{stateLabel}</span>
+      <span style={ES.threshold}>
+        threshold ≥ <b>{echo.threshold}</b>
+        <span style={ES.hint}> (idle ≥{echo.baselineThreshold} · armed ≥{echo.armedThreshold} · trigger ≥{echo.triggerThreshold})</span>
+      </span>
+      {echo.defensiveEnabled ? (
+        <div style={ES.defensive}>
+          <div>
+            DEF{' '}
+            {defActive ? (
+              <span style={{ color: '#f85149', fontWeight: 600 }}>
+                ACTIVE → {echo.defensiveAction}
+              </span>
+            ) : defActivatesIn != null ? (
+              <span style={{ color: defActivatesIn <= 60 ? '#f0a500' : '#8b949e' }}>
+                activates in {fmtMin(defActivatesIn)}
+              </span>
+            ) : (
+              <span style={{ color: '#f85149' }}>no extreme observed → enforced</span>
+            )}
+            <span style={ES.hint}>
+              {' '}· trigger ≥{echo.defensiveStreakThreshold}
+              {' '}· overdue cfg {fmtMin(echo.defensiveOverdueMinutes)}
+            </span>
+          </div>
+          <div style={ES.subline}>
+            {lastExtremeAgo != null
+              ? <>last extreme <b>{fmtMin(lastExtremeAgo)}</b> ago</>
+              : <span style={{ color: '#f85149' }}>no extreme in 30d backfill</span>}
+            {gaps && (
+              <span style={ES.hint}>
+                {' '}· 30d gaps (n={gaps.count}):{' '}
+                p10 <b style={ES.statVal}>{fmtMs(gaps.p10Ms)}</b>{' · '}
+                p50 <b style={ES.statVal}>{fmtMs(gaps.p50Ms)}</b>{' · '}
+                p90 <b style={ES.statVal}>{fmtMs(gaps.p90Ms)}</b>{' · '}
+                max <b style={ES.statVal}>{fmtMs(gaps.maxMs)}</b>
+              </span>
+            )}
+          </div>
+        </div>
+      ) : (
+        <span style={{ ...ES.defensive, color: '#6e7681' }}>DEF off</span>
+      )}
+    </div>
+  );
+});
+
 // CoinSignalsStrip — per-coin worker events (T+4 / T-3s / T-0)
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -1740,11 +1928,112 @@ const CoinCard = React.memo(function CoinCard({
   const t4     = entry?.t4;
   const t3    = entry?.t3;
   const t0     = entry?.t0;
+  const echo   = entry?.echo;
   const hasAny = !!(t0plus || t4 || t3 || t0);
+
+  // Echo countdown — re-tick every second so the "5m left" / defensive
+  // "DEF in 12m" labels shrink live. Active whenever this coin runs the
+  // echo strategy at all (cheap: 1 setState/sec/card).
+  const [nowMs, setNowMs] = useState(Date.now());
+  useEffect(() => {
+    if (!echo) return;
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [echo]);
+
+  // Render echo state badge if this coin runs the echo strategy. `echo` is
+  // populated by the SSE coin_echo event; absence = strategy is 'streak'.
+  let echoBadge: React.ReactNode = null;
+  let defensiveBadge: React.ReactNode = null;
+  if (echo) {
+    const armed   = echo.armed && echo.armEndAt != null && echo.armEndAt > nowMs;
+    const minLeft = armed && echo.armEndAt
+      ? Math.max(0, Math.round((echo.armEndAt - nowMs) / 60000))
+      : 0;
+    // Defensive countdown — compute live so it ticks every second.
+    const defActivatesIn = echo.defensiveActivatesAt != null
+      ? Math.round((echo.defensiveActivatesAt - nowMs) / 60000)
+      : null;
+    const defActive = echo.defensiveEnabled
+      && (echo.defensiveActivatesAt == null || nowMs > echo.defensiveActivatesAt);
+    const lastExtremeAgo = echo.lastExtremeStreakAt != null
+      ? Math.round((nowMs - echo.lastExtremeStreakAt) / 60000)
+      : null;
+    // Tooltip: full param dump so user can see all thresholds + defensive state.
+    const tooltipLines = [
+      armed ? `ECHO ARMED · ${minLeft}m left` : 'ECHO idle',
+      `current threshold: ≥${echo.threshold}`,
+      `baseline (idle):   ≥${echo.baselineThreshold}`,
+      `armed:             ≥${echo.armedThreshold}`,
+      `trigger:           ≥${echo.triggerThreshold}`,
+    ];
+    if (echo.defensiveEnabled) {
+      tooltipLines.push('');
+      tooltipLines.push(`DEFENSIVE (extreme ≥${echo.defensiveStreakThreshold}):`);
+      if (lastExtremeAgo != null) tooltipLines.push(`  last extreme: ${lastExtremeAgo}m ago`);
+      else                        tooltipLines.push(`  last extreme: never observed`);
+      if (defActive) tooltipLines.push(`  STATE: ACTIVE → action ${echo.defensiveAction}`);
+      else if (defActivatesIn != null) tooltipLines.push(`  STATE: monitoring · activates in ${defActivatesIn}m`);
+    } else {
+      tooltipLines.push('');
+      tooltipLines.push('DEFENSIVE: disabled');
+    }
+    const tooltip = tooltipLines.join('\n');
+
+    const label = armed
+      ? `ECHO ${minLeft}m · ≥${echo.threshold}`
+      : `ECHO idle · ≥${echo.threshold}`;
+    echoBadge = (
+      <span title={tooltip}
+        style={{
+          marginLeft: 'auto',
+          padding: '2px 6px',
+          borderRadius: 3,
+          fontSize: 9,
+          fontWeight: 700,
+          letterSpacing: 0.4,
+          background: armed ? '#0e3a1c' : '#21262d',
+          color:      armed ? '#3fb950' : '#8b949e',
+          border: armed ? '1px solid #3fb950' : '1px solid #30363d',
+        }}>
+        {label}
+      </span>
+    );
+    // Defensive chip beside the echo badge.
+    if (echo.defensiveEnabled) {
+      const defLabel = defActive
+        ? `DEF ${echo.defensiveAction === 'skip_all' ? 'SKIP' : 'IDLE'}`
+        : defActivatesIn != null && defActivatesIn <= 60
+          ? `DEF ${defActivatesIn}m`
+          : null;
+      if (defLabel) {
+        defensiveBadge = (
+          <span title={tooltip}
+            style={{
+              marginLeft: 4,
+              padding: '2px 6px',
+              borderRadius: 3,
+              fontSize: 9,
+              fontWeight: 700,
+              letterSpacing: 0.4,
+              background: defActive ? '#3a1a1a' : '#3a2d0a',
+              color:      defActive ? '#f85149' : '#f0a500',
+              border: defActive ? '1px solid #f85149' : '1px solid #f0a500',
+            }}>
+            {defLabel}
+          </span>
+        );
+      }
+    }
+  }
 
   return (
     <div style={{ ...CS.card, opacity: hasAny ? 1 : 0.55 }}>
-      <div style={CS.coinName}>{coin}</div>
+      <div style={{ ...CS.coinName, display: 'flex', alignItems: 'center' }}>
+        <span>{coin}</span>
+        {echoBadge}
+        {defensiveBadge}
+      </div>
 
       {t0plus && (
         <div style={CS.section}>
@@ -1885,6 +2174,25 @@ function VolumeRow({ buckets }: { buckets: VolumeBucket[] | undefined }) {
   );
 }
 
+const ES: Record<string, React.CSSProperties> = {
+  panel:     { background: '#161b22', border: '1px solid #30363d', borderRadius: 6,
+               padding: '10px 14px', marginBottom: 12 },
+  title:     { fontSize: 11, fontWeight: 600, color: '#79c0ff',
+               letterSpacing: 0.5, marginBottom: 8, textTransform: 'uppercase' as const },
+  rows:      { display: 'flex', flexDirection: 'column', gap: 6 },
+  row:       { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
+               fontSize: 12, color: '#c9d1d9' },
+  coin:      { fontSize: 13, fontWeight: 700, color: '#c9d1d9', minWidth: 50 },
+  state:     { fontWeight: 700, fontSize: 11, padding: '2px 8px', borderRadius: 3,
+               background: '#0d1117', border: '1px solid currentColor', minWidth: 130, textAlign: 'center' as const },
+  threshold: { color: '#c9d1d9' },
+  defensive: { color: '#c9d1d9', marginLeft: 'auto', display: 'flex',
+               flexDirection: 'column' as const, alignItems: 'flex-end', gap: 2 },
+  subline:   { fontSize: 11, color: '#c9d1d9' },
+  statVal:   { color: '#79c0ff' },
+  hint:      { color: '#6e7681', fontSize: 11 },
+};
+
 const CS: Record<string, React.CSSProperties> = {
   strip:        { marginBottom: 12 },
   stripTitle:   { fontSize: 12, fontWeight: 600, color: '#8b949e', marginBottom: 6, textTransform: 'uppercase' as const, letterSpacing: 0.5 },
@@ -1916,6 +2224,22 @@ function midPrice(bid: number | null | undefined, ask: number | null | undefined
   if (bid == null) return ask ?? null;
   if (ask == null) return bid;
   return (bid + ask) / 2;
+}
+
+/**
+ * Maximum age of a share tick before we treat it as untrustworthy. Beyond
+ * this, the displayed price is more confusing than useful — the user has
+ * complained about seeing "stale 51-50" prices that don't reflect reality
+ * (Polymarket WS zombied → engine.shares froze at last value). Hide the
+ * number entirely; the "—" makes it obvious there's no live data.
+ */
+const STALE_TICK_MS = 60_000;
+
+/** Returns null if the tick is missing or older than STALE_TICK_MS. */
+function freshTick(tick: LiveShare | undefined, nowMs: number): LiveShare | null {
+  if (!tick) return null;
+  if (nowMs - tick.ts > STALE_TICK_MS) return null;
+  return tick;
 }
 
 function fmtTime(ms: number): string {
@@ -2047,13 +2371,21 @@ const S: Record<string, React.CSSProperties> = {
                    gridTemplateColumns: '90px 50px 55px 55px 70px 80px 90px 110px',
                    minWidth: 590,
                    fontSize: 13, color: '#c9d1d9', padding: '6px 0', alignItems: 'center' },
+  // Poly view: 7 cols (no Loại / Status), narrower because it's strictly raw on-chain trades.
+  polyTradesHeader: { display: 'grid',
+                      gridTemplateColumns: '90px 50px 70px 60px 70px 80px 100px',
+                      minWidth: 520,
+                      fontSize: 11, color: '#8b949e', padding: '4px 0', borderBottom: '1px solid #21262d' },
+  polyTradesRow:    { display: 'grid',
+                      gridTemplateColumns: '90px 50px 70px 60px 70px 80px 100px',
+                      minWidth: 520,
+                      fontSize: 13, color: '#c9d1d9', padding: '6px 0', alignItems: 'center' },
 
   windowGroup:       { border: '1px solid #21262d', borderRadius: 6, marginBottom: 12,
                        background: '#0d1117', padding: '0 12px 8px' },
   windowGroupHeader: { display: 'flex', alignItems: 'center', gap: 10,
                        padding: '10px 0 6px', borderBottom: '1px solid #21262d',
                        fontSize: 13, color: '#c9d1d9' },
-  kindBadge:     { padding: '2px 6px', borderRadius: 3, fontSize: 10, fontWeight: 700, letterSpacing: 0.4 },
   sourceMini:    { padding: '1px 5px', borderRadius: 3, fontSize: 9,
                    background: '#21262d', color: '#8b949e', textTransform: 'uppercase' },
 

@@ -157,6 +157,40 @@ export interface CoinT3Event {
   emittedAt:   number;
 }
 
+/** Inter-event gap stats (durations in ms) — see SignalBus.DefensiveGapStats. */
+export interface DefensiveGapStats {
+  count:  number;
+  p10Ms:  number;
+  p50Ms:  number;
+  p90Ms:  number;
+  maxMs:  number;
+  meanMs: number;
+}
+
+/** Echo Hunt arm-window state (only emitted for coins with strategy=echo). */
+export interface CoinEchoEvent {
+  type:              'echo_state';
+  coin:              CoinSymbol;
+  armed:             boolean;
+  lastTriggerAt:     number | null;
+  armEndAt:          number | null;
+  /** Current effective placement threshold (armedThreshold or baselineThreshold). */
+  threshold:         number;
+  baselineThreshold: number;
+  armedThreshold:    number;
+  triggerThreshold:  number;
+  // Defensive layer
+  defensiveEnabled:  boolean;
+  defensiveActive:   boolean;
+  defensiveAction:   'disable_armed' | 'skip_all';
+  lastExtremeStreakAt:      number | null;
+  defensiveActivatesAt:     number | null;
+  defensiveStreakThreshold: number;
+  defensiveOverdueMinutes:  number;
+  defensiveGapStats:        DefensiveGapStats | null;
+  emittedAt:         number;
+}
+
 export interface CoinT0Event {
   type:         'T-0';
   coin:         CoinSymbol;
@@ -178,6 +212,8 @@ export interface CoinEventsEntry {
   t4?:     CoinT4Event;
   t3?:     CoinT3Event;
   t0?:     CoinT0Event;
+  /** Latest echo-state event (only set for coins on echo strategy). */
+  echo?:   CoinEchoEvent;
 }
 
 const SIGNAL_HISTORY_MAX = 20;
@@ -345,6 +381,10 @@ export function useLiveStream(url = '/api/poly/stream'): LiveStreamState {
             signals: lastSignal && stateRef.current.signals.length === 0
               ? [lastSignal]
               : stateRef.current.signals,
+            // Hydrate per-coin echo state from snapshot — without this the
+            // FE would render no echo/defensive panel until the next state
+            // transition (could be many minutes).
+            coinEvents: hydrateEchoStates(stateRef.current.coinEvents, snap.echoStates),
           };
           scheduleFlush();
         } catch (err) { console.warn('snapshot parse', err); }
@@ -496,6 +536,19 @@ export function useLiveStream(url = '/api/poly/stream'): LiveStreamState {
         } catch { /* ignore */ }
       });
 
+      es.addEventListener('coin_echo', (ev) => {
+        try {
+          const e = JSON.parse((ev as MessageEvent).data) as CoinEchoEvent;
+          const prev = stateRef.current.coinEvents[e.coin] ?? {};
+          stateRef.current = {
+            ...stateRef.current,
+            coinEvents: { ...stateRef.current.coinEvents, [e.coin]: { ...prev, echo: e } },
+          };
+          tickStat();
+          scheduleFlush();
+        } catch { /* ignore */ }
+      });
+
       // 'ping' — keep-alive heartbeat from backend (every 15s). No UI use,
       // but we need to register the listener so EventSource fires it; this
       // updates lastEventAt and prevents the watchdog from false-triggering
@@ -563,4 +616,20 @@ function normalizeScan(t: any): LiveScan {
     obImbalance:   Number(t.obImbalance ?? t.ob_imbalance ?? 0),
     volSpikeZ:     Number(t.volSpikeZ ?? t.vol_spike_z ?? 0),
   };
+}
+
+/** Merge `snap.echoStates` (Record<coin, CoinEchoEvent>) into existing
+ *  coinEvents map. Snapshot wins for coins it covers, others kept. */
+function hydrateEchoStates(
+  current: Partial<Record<CoinSymbol, CoinEventsEntry>>,
+  snap: Partial<Record<string, CoinEchoEvent>> | undefined,
+): Partial<Record<CoinSymbol, CoinEventsEntry>> {
+  if (!snap || typeof snap !== 'object') return current;
+  const next = { ...current };
+  for (const [coinKey, echo] of Object.entries(snap)) {
+    if (!echo) continue;
+    const coin = coinKey as CoinSymbol;
+    next[coin] = { ...(next[coin] ?? {}), echo };
+  }
+  return next;
 }

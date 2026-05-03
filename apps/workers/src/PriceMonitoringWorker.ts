@@ -20,12 +20,13 @@
 import { log } from '@trading-bot/core/logger';
 import type {
   SignalBus, SignalT0PlusEvent, SignalT4Event, SignalTMinus3Event,
-  SignalT0Event, VolumeBucket, OrderRef,
+  SignalT0Event, SignalEchoStateEvent, VolumeBucket, OrderRef,
+  DefensiveGapStats,
 } from '@trading-bot/core/SignalBus';
 import { PolymarketService, type PolyClobMarket, type ShareTick } from '@trading-bot/core/PolymarketService';
 import {
   getEnabledCoins, getCoinConfig,
-  type CoinSymbol, type CoinConfig,
+  type CoinSymbol, type CoinConfig, type EchoEdgeCase,
 } from '@trading-bot/core/CoinConfig';
 import { recordOrder, hasAutoOrderFor } from '@trading-bot/core/orderPlacement';
 import { getClobExecutor } from '@trading-bot/core/PolymarketClobExecutor';
@@ -113,6 +114,27 @@ interface CoinState {
   lastCycleOrderSize: number | null;
   dcaFiredCount:      number;
   /**
+   * Echo: which mode the cycle's boundary order was placed in. Determines
+   * which DCA scale (`echo_dca_scale` for armed, `echo_dca_scale_idle` for
+   * idle) applies for the cycle's continuation orders. Reset to null on
+   * cycle close. Unused for streak strategy.
+   */
+  cycleMode:          'idle' | 'armed' | null;
+  /**
+   * Echo defensive layer: ms timestamp of the most recent extreme streak
+   * event (run end with |streak| ≥ `echo_defensive_streak_threshold`). When
+   * the gap to now exceeds `echo_defensive_overdue_minutes`, bot enters
+   * defensive mode. null = no extreme observed yet (treated as overdue).
+   */
+  lastExtremeStreakAt: number | null;
+  /**
+   * Inter-event gap stats from the 30-day backfill at startup. Stable for the
+   * worker lifetime — used by the echo_state publish to give the FE p10/p50/p90
+   * context so the user can calibrate `echo_defensive_overdue_minutes` against
+   * actual historical gap distribution. null when backfill saw < 2 events.
+   */
+  defensiveGapStats: DefensiveGapStats | null;
+  /**
    * Recent |streak| values from emitted T+4 signals (last up to 5 entries).
    * Feeds the small-adjust inside a schedule window: if the last 2 entries
    * both equal the schedule's base threshold, bump the effective threshold
@@ -125,6 +147,27 @@ interface CoinState {
    * T+4 emission (only the latest cached signal fires).
    */
   pendingPlacementTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * Echo strategy: ms timestamp of the most recent run end where |streak| ≥
+   * `cfg.echo_trigger_streak`. Drives the arm window — bot only signals/places
+   * orders while `now − lastEchoTriggerAt ≤ echo_window_minutes × 60_000`.
+   * In-memory; bot won't trade for up to ~30min after a restart until a fresh
+   * trigger arms (acceptable — restart-paused windows happen rarely).
+   * Unused when `cfg.strategy === 'streak'`.
+   */
+  lastEchoTriggerAt: number | null;
+  /**
+   * Last published echo arm state (for transition-only emission). When the
+   * computed state matches this, we don't republish — keeps the bus quiet.
+   * `armEndAt` distinguishes "armed at T1" vs "armed at T2 (refresh)" so
+   * arm-refresh events still emit.
+   */
+  lastEchoStatePublished: {
+    armed: boolean;
+    armEndAt: number | null;
+    defensiveActive: boolean;
+    lastExtremeStreakAt: number | null;
+  } | null;
 }
 
 export class PriceMonitoringWorker {
@@ -230,14 +273,29 @@ export class PriceMonitoringWorker {
       }
     });
     await poly.start();
-    this.coins.set(symbol, {
+    const state: CoinState = {
       symbol, poly, emitted: new Set(),
       cycleActive:        false,
       lastCycleOrderSize: null,
       dcaFiredCount:      0,
+      cycleMode:          null,
+      lastExtremeStreakAt: null,
+      defensiveGapStats:  null,
       recentStreakAbs: [],
-    });
+      lastEchoTriggerAt: null,
+      lastEchoStatePublished: null,
+    };
+    this.coins.set(symbol, state);
     log('info', `PriceMonitoringWorker: tracking ${symbol}`);
+
+    // Backfill defensive tracker from historical bars so the bot has an
+    // accurate `lastExtremeStreakAt` from minute one (otherwise it would
+    // always start in defensive mode after a restart). Fire-and-forget — if
+    // this fails the live tracker still updates as soon as a fresh extreme
+    // streak is observed.
+    void backfillLastExtremeStreakAt(state).catch(err => {
+      log('warn', 'defensive backfill failed', { symbol, error: String(err) });
+    });
   }
 
   private async tick(): Promise<void> {
@@ -292,10 +350,55 @@ export class PriceMonitoringWorker {
   private async evaluateT4Gates(
     state: CoinState, cfg: CoinConfig, windowStart: number, windowEnd: number,
   ): Promise<{ event?: SignalT4Event; reason?: string; persistentSkip: boolean }> {
-    const { streak, volumeBuckets } = await fetchStreakWithVolume(state.symbol, windowStart);
-    if (Math.abs(streak) < cfg.streak_min) {
-      return { reason: `streak ${streak} < min ${cfg.streak_min}`, persistentSkip: true };
+    const { streak, volumeBuckets, bodyHasHigh, bodyHasTiny, meanBodyRatio, bodyHasVeryExtreme } =
+      await fetchStreakWithVolume(state.symbol, windowStart);
+    const absStreak    = Math.abs(streak);
+    const expectedIcon = streak > 0 ? '🟢' : '🔴';
+    // Fetch the in-progress candle direction up-front so the echo gate can
+    // count it as +1 to the closed streak when it aligns. Streak strategy
+    // also uses it (later gate) — single fetch keeps the round-trip cost
+    // unchanged.
+    const currentIcon = await fetchInProgressIcon(state.symbol, windowStart);
+
+    // ── Echo arm bookkeeping ──────────────────────────────────────────────
+    // Echo Hunt is a HYBRID: bot always trades using the streak baseline
+    // (`auto_order_min_streak`); when a streak ≥ `echo_trigger_streak` ends,
+    // the placement threshold drops to `echo_signal_min_streak` for the next
+    // `echo_window_minutes`. After arm expires it reverts to the baseline.
+    // This block only updates the arm timestamp + publishes state — the
+    // actual threshold switch happens in `effectiveAutoMinStreak`.
+    if (cfg.strategy === 'echo') {
+      if (absStreak >= cfg.echo_trigger_streak) {
+        state.lastEchoTriggerAt = Date.now();
+      }
+      // Defensive tracker — record extreme streak observations so the
+      // overdue-gap check in tryPlaceBoundary has data.
+      if (absStreak >= cfg.echo_defensive_streak_threshold) {
+        state.lastExtremeStreakAt = Date.now();
+      }
+      void this.maybePublishEchoState(state, cfg);
     }
+
+    // Streak gate (notification threshold). For echo we count the in-progress
+    // candle when it aligns — matches the +1 used by the placement gate at
+    // T-3s, so the displayed signal aligns with what the bot will actually
+    // place against. Streak strategy keeps closed-only semantics (legacy).
+    const currentAligns = currentIcon === expectedIcon;
+    const effectiveStreak = cfg.strategy === 'echo' && currentAligns
+      ? absStreak + 1
+      : absStreak;
+    if (effectiveStreak < cfg.streak_min) {
+      return {
+        reason: cfg.strategy === 'echo'
+          ? `echo: effective ${effectiveStreak} (closed ${absStreak}+${currentAligns ? 1 : 0} current) < streak_min ${cfg.streak_min}`
+          : `streak ${streak} < min ${cfg.streak_min}`,
+        persistentSkip: cfg.strategy !== 'echo',  // echo: re-eval next tick
+      };
+    }
+
+    // V9 body filter does NOT block T+4 emit — it only adjusts the placement
+    // threshold at T-3s (for idle mode). T+4 still emits notification when
+    // streak_min is met regardless of body composition. See tryPlaceBoundary.
 
     const market = await state.poly.findMarketAt(Math.floor(windowStart / 1000));
     if (!market) {
@@ -304,17 +407,16 @@ export class PriceMonitoringWorker {
 
     const direction: 'up' | 'down' = streak > 0 ? 'down' : 'up';   // contrarian
     const tokenId = direction === 'up' ? market.tokenUp : market.tokenDown;
-    const [book, currentIcon] = await Promise.all([
-      state.poly.getOrderBook(tokenId),
-      fetchInProgressIcon(state.symbol, windowStart),
-    ]);
+    const book = await state.poly.getOrderBook(tokenId);
     const price = bestAskFromBook(book);
 
-    const expectedIcon = streak > 0 ? '🟢' : '🔴';
+    // Universal alignment gate — current candle must continue the streak
+    // direction, otherwise the contrarian premise is breaking and our bet
+    // is on the wrong side.
     if (currentIcon !== expectedIcon) {
       return {
         reason: `current ${currentIcon} ≠ expected ${expectedIcon}`,
-        persistentSkip: false,   // candle may flip back — retry on next tick
+        persistentSkip: false,
       };
     }
 
@@ -329,11 +431,87 @@ export class PriceMonitoringWorker {
         pastStreakIcons: iconsFromStreak(streak),
         currentIcon,
         streakVolumeBuckets: volumeBuckets,
+        bodyHasHigh,
+        bodyHasTiny,
+        meanBodyRatio,
+        bodyHasVeryExtreme,
         limitCents:    cfg.limit_price_cents,
         emittedAt:     Date.now(),
       },
       persistentSkip: false,
     };
+  }
+
+  /**
+   * Echo arm-state publisher. Computes current armed/armEndAt from state +
+   * cfg and publishes ONLY when something changed since last publish. This
+   * keeps the bus quiet (~1-2 events per arm cycle, vs hundreds of T+4s).
+   *
+   * Transitions emitted:
+   *   - First-ever evaluation for this coin → baseline state.
+   *   - Trigger fires (lastEchoTriggerAt updated) → "armed (refreshed)".
+   *   - Arm window expires between ticks → "not armed".
+   */
+  private async maybePublishEchoState(state: CoinState, cfg: CoinConfig): Promise<void> {
+    if (cfg.strategy !== 'echo') return;
+    const now = Date.now();
+    const armEndAt = state.lastEchoTriggerAt
+      ? state.lastEchoTriggerAt + cfg.echo_window_minutes * 60_000
+      : null;
+    const armed = armEndAt !== null && now <= armEndAt;
+
+    // Defensive layer state.
+    const defensiveActivatesAt = state.lastExtremeStreakAt != null
+      ? state.lastExtremeStreakAt + cfg.echo_defensive_overdue_minutes * 60_000
+      : null;
+    const defensiveActive = cfg.echo_defensive_enabled
+      && (defensiveActivatesAt == null || now > defensiveActivatesAt);
+
+    // Re-publish on any state transition: armed, armEndAt, defensive active,
+    // or extreme observation timestamp. The latter matters even when
+    // defensive flag doesn't flip — FE needs the fresh timestamp to compute
+    // the live countdown to next defensive activation.
+    const last = state.lastEchoStatePublished;
+    const same = last
+      && last.armed === armed
+      && last.armEndAt === armEndAt
+      && last.defensiveActive === defensiveActive
+      && last.lastExtremeStreakAt === state.lastExtremeStreakAt;
+    if (same) return;
+    state.lastEchoStatePublished = {
+      armed, armEndAt, defensiveActive,
+      lastExtremeStreakAt: state.lastExtremeStreakAt,
+    };
+    // Effective threshold reflects defensive override.
+    let threshold = armed ? cfg.echo_signal_min_streak : cfg.echo_baseline_streak;
+    if (defensiveActive && cfg.echo_defensive_action === 'disable_armed' && armed) {
+      threshold = cfg.echo_baseline_streak;
+    }
+    await this.bus.publish<SignalEchoStateEvent>({
+      type:                  'echo_state',
+      coin:                  state.symbol,
+      armed,
+      lastTriggerAt:         state.lastEchoTriggerAt,
+      armEndAt,
+      threshold,
+      baselineThreshold:     cfg.echo_baseline_streak,
+      armedThreshold:        cfg.echo_signal_min_streak,
+      triggerThreshold:      cfg.echo_trigger_streak,
+      defensiveEnabled:      cfg.echo_defensive_enabled,
+      defensiveActive,
+      defensiveAction:       cfg.echo_defensive_action,
+      lastExtremeStreakAt:   state.lastExtremeStreakAt,
+      defensiveActivatesAt,
+      defensiveStreakThreshold: cfg.echo_defensive_streak_threshold,
+      defensiveOverdueMinutes:  cfg.echo_defensive_overdue_minutes,
+      defensiveGapStats:        state.defensiveGapStats,
+      emittedAt:             now,
+    });
+    log('info', `echo state ${state.symbol}`, {
+      armed, threshold, defensiveActive,
+      lastTriggerAt: state.lastEchoTriggerAt,
+      armEndAt, defensiveActivatesAt,
+    });
   }
 
   /** Max size of the streak-history buffer. 2 is the minimum required by the
@@ -376,6 +554,33 @@ export class PriceMonitoringWorker {
     mode: 'aggressive' | 'conservative' | 'default';
     reason: string;
   } {
+    // Echo Hunt — hybrid threshold:
+    //   armed (within echo_window_minutes of the last trigger ≥ echo_trigger_streak)
+    //     → echo_signal_min_streak (lowered, more aggressive)
+    //   idle (no recent trigger or arm expired)
+    //     → echo_baseline_streak (echo's own baseline — independent from streak
+    //       strategy's auto_order_min_streak so the two strategies don't interfere)
+    // No hour-of-day schedule or small-adjust on echo — the arm window IS
+    // the adaptive layer here.
+    if (cfg.strategy === 'echo') {
+      const armed = state.lastEchoTriggerAt != null
+        && (Date.now() - state.lastEchoTriggerAt) <= cfg.echo_window_minutes * 60_000;
+      if (armed) {
+        const minLeft = Math.max(0, Math.round(
+          (state.lastEchoTriggerAt! + cfg.echo_window_minutes * 60_000 - Date.now()) / 60_000,
+        ));
+        return {
+          threshold: cfg.echo_signal_min_streak,
+          mode: 'aggressive',
+          reason: `echo armed — ${minLeft}m left in arm window (signal_min=${cfg.echo_signal_min_streak})`,
+        };
+      }
+      return {
+        threshold: cfg.echo_baseline_streak,
+        mode: 'default',
+        reason: `echo idle — using baseline echo_baseline_streak=${cfg.echo_baseline_streak}`,
+      };
+    }
     const base = cfg.auto_order_min_streak;
     const hour = new Date().getUTCHours();
 
@@ -602,12 +807,59 @@ export class PriceMonitoringWorker {
   }> {
     // Compute adaptive threshold up-front so callers always get context —
     // even when a non-threshold gate fails (ask too high, market missing etc).
-    const base = cfg.auto_order_min_streak;
-    const adapt = this.effectiveAutoMinStreak(state, cfg);
-    const adaptive = { base, ...adapt };
-    if (adapt.mode !== 'default') {
+    // `base` = the unadjusted baseline threshold:
+    //   streak: auto_order_min_streak (schedule + small-adjust may bump up).
+    //   echo:   echo_baseline_streak  (arm window may DROP to echo_signal_min_streak).
+    const base = cfg.strategy === 'echo' ? cfg.echo_baseline_streak : cfg.auto_order_min_streak;
+    let adapt = this.effectiveAutoMinStreak(state, cfg);
+
+    // ── Defensive regime check (echo only) ─────────────────────────────────
+    // If too long has passed since the last extreme streak, bot is in a
+    // quiet regime — empirically followed by outsized moves. Either suspend
+    // placement entirely or force idle threshold (don't drop to armed).
+    if (cfg.strategy === 'echo' && cfg.echo_defensive_enabled) {
+      const overdueMs = cfg.echo_defensive_overdue_minutes * 60_000;
+      const gap = state.lastExtremeStreakAt != null
+        ? Date.now() - state.lastExtremeStreakAt
+        : Infinity;   // never observed → treat as overdue (safe default)
+      const isOverdue = gap > overdueMs;
+      if (isOverdue) {
+        const gapLabel = gap === Infinity ? 'never observed'
+          : `${Math.round(gap / 60_000)}m ago, threshold ${cfg.echo_defensive_overdue_minutes}m`;
+        if (cfg.echo_defensive_action === 'skip_all') {
+          return {
+            placed: false,
+            reason: `defensive: extreme streak ${gapLabel} — skip_all action`,
+            adaptive: { base, ...adapt },
+          };
+        }
+        // 'disable_armed' — keep armed mode from lowering threshold below baseline.
+        if (adapt.mode === 'aggressive') {
+          adapt = {
+            threshold: cfg.echo_baseline_streak,
+            mode: 'default',
+            reason: `defensive: extreme ${gapLabel} → armed disabled, using baseline ${cfg.echo_baseline_streak}`,
+          };
+        }
+      }
+    }
+    // V9 body filter — IDLE mode only. When the streak has no high-body bar
+    // (>1.5× avg), the run is "grinding" without an impulse leg → contrarian
+    // bets there bleed at idle baseline. Bump threshold +2 so the bot waits
+    // for a longer streak. Armed mode bypasses — its natural edge is strong.
+    const idleNoHighBody = cfg.strategy === 'echo'
+      && cfg.echo_require_high_body
+      && adapt.mode === 'default'
+      && t4.bodyHasHigh === false;
+    const threshold = idleNoHighBody ? adapt.threshold + 2 : adapt.threshold;
+    const reason    = idleNoHighBody
+      ? `echo idle + no high-body bar → bumped threshold to ${threshold} (= ${adapt.threshold}+2)`
+      : adapt.reason;
+    const adaptive = { base, threshold, mode: adapt.mode, reason };
+    if (adapt.mode !== 'default' || idleNoHighBody) {
       log('info', `adaptive threshold ${state.symbol}`, {
-        base, threshold: adapt.threshold, mode: adapt.mode, reason: adapt.reason,
+        base, threshold, mode: adapt.mode, reason,
+        bodyHasHigh: t4.bodyHasHigh,
         hourUtc: new Date().getUTCHours(),
       });
     }
@@ -635,14 +887,31 @@ export class PriceMonitoringWorker {
 
     const absStreak = Math.abs(t4.streak);
 
-    // Gate 2: effective streak (closed + current candle counted) ≥ threshold
+    // Gate 2: effective streak ≥ threshold, with optional edge-case overrides.
+    // When the normal gate fails AND the streak's body composition matches
+    // an enabled edge case (idle echo only), fire anyway. See `EchoEdgeCase`
+    // for the available patterns and statistical rationale.
     const effectiveStreak = absStreak + 1;
-    if (effectiveStreak < adapt.threshold) {
-      return {
-        placed: false,
-        reason: `effective streak ${effectiveStreak} (closed ${absStreak}+1 current) < auto_min ${adapt.threshold} [${adapt.reason}]`,
-        adaptive,
-      };
+    if (effectiveStreak < threshold) {
+      const overrideName = adapt.mode === 'default' && cfg.strategy === 'echo'
+        ? matchEchoEdgeCase(cfg.echo_edge_cases ?? [], absStreak, t4)
+        : null;
+      if (overrideName) {
+        log('info', `echo edge-case override fires ${state.symbol}`, {
+          edgeCase: overrideName,
+          streak: t4.streak, effectiveStreak, threshold,
+          meanBodyRatio: t4.meanBodyRatio,
+          bodyHasVeryExtreme: t4.bodyHasVeryExtreme,
+        });
+        // Annotate adaptive so downstream events show why we fired.
+        adaptive.reason = `${reason} → override [${overrideName}]`;
+      } else {
+        return {
+          placed: false,
+          reason: `effective streak ${effectiveStreak} (closed ${absStreak}+1 current) < auto_min ${threshold} [${reason}]`,
+          adaptive,
+        };
+      }
     }
 
     // Gate 3: N+1 market exists
@@ -684,13 +953,17 @@ export class PriceMonitoringWorker {
         streakAtSignal: absStreak,
       });
 
-      // Cycle starts.
+      // Cycle starts. Tag the cycle's mode so DCA continuation picks the
+      // right scale (idle vs armed) — echo only.
       state.cycleActive        = true;
       state.cycleDirection     = direction;
       state.lastCycleOrderSize = null;
       state.dcaFiredCount      = 0;
+      state.cycleMode          = cfg.strategy === 'echo'
+        ? (adapt.mode === 'aggressive' ? 'armed' : 'idle')
+        : null;
       log('info', `Boundary placed (cycle start) ${state.symbol}`, {
-        streakAbs: absStreak, direction, size: orderSize,
+        streakAbs: absStreak, direction, size: orderSize, cycleMode: state.cycleMode,
       });
 
       return {
@@ -737,13 +1010,47 @@ export class PriceMonitoringWorker {
     const absStreak = Math.abs(streak);
     const direction = state.cycleDirection;
 
-    // Whitelist gate. Empty whitelist = always fire on loss (legacy default).
-    const whitelist = cfg.dca_streak_whitelist ?? [];
-    if (whitelist.length > 0 && !whitelist.includes(absStreak)) {
-      log('info', `DCA skip ${state.symbol}: streak ${absStreak} ∉ whitelist [${whitelist.join(',')}]`, {
-        nextWindowStart, direction,
-      });
-      return;
+    if (cfg.strategy === 'echo') {
+      // Defensive: if regime is overdue (long quiet stretch precedes outsized
+      // moves), don't double-down on a losing cycle — let the loss cap at the
+      // boundary entry size and wait for things to clear. Applies regardless
+      // of the configured action ('disable_armed' vs 'skip_all').
+      if (cfg.echo_defensive_enabled) {
+        const overdueMs = cfg.echo_defensive_overdue_minutes * 60_000;
+        const gap = state.lastExtremeStreakAt != null
+          ? Date.now() - state.lastExtremeStreakAt
+          : Infinity;
+        if (gap > overdueMs) {
+          const gapLabel = gap === Infinity ? 'never observed'
+            : `${Math.round(gap / 60_000)}m ago, threshold ${cfg.echo_defensive_overdue_minutes}m`;
+          log('info', `DCA skip ${state.symbol}: defensive (extreme ${gapLabel})`);
+          return;
+        }
+      }
+      // Pick scale by cycle's mode at open time:
+      //   armed cycle → echo_dca_scale (always).
+      //   idle cycle  → echo_dca_scale_idle if non-empty, else fall back.
+      // Bounded by array length (no infinite compounding).
+      const scale = (state.cycleMode === 'idle' && (cfg.echo_dca_scale_idle ?? []).length > 0)
+        ? cfg.echo_dca_scale_idle
+        : cfg.echo_dca_scale;
+      if ((scale ?? []).length === 0) {
+        log('info', `DCA skip ${state.symbol}: echo scale empty (DCA disabled for ${state.cycleMode})`);
+        return;
+      }
+      if (state.dcaFiredCount >= scale.length) {
+        log('info', `DCA skip ${state.symbol}: echo ${state.cycleMode} dcaFiredCount ${state.dcaFiredCount} ≥ scale length ${scale.length}`);
+        return;
+      }
+    } else {
+      // Streak strategy — whitelist gate (legacy). Empty = always fire on loss.
+      const whitelist = cfg.dca_streak_whitelist ?? [];
+      if (whitelist.length > 0 && !whitelist.includes(absStreak)) {
+        log('info', `DCA skip ${state.symbol}: streak ${absStreak} ∉ whitelist [${whitelist.join(',')}]`, {
+          nextWindowStart, direction,
+        });
+        return;
+      }
     }
 
     // Sanity: streak direction must still oppose our (contrarian) bet.
@@ -776,8 +1083,21 @@ export class PriceMonitoringWorker {
       return;
     }
 
-    const baseSize  = state.lastCycleOrderSize ?? cfg.size_usdc;
-    const orderSize = baseSize * cfg.dca_multiplier;
+    // DCA size:
+    //   echo: flat scale → cfg.size_usdc × scale[dcaFiredCount]  (no compounding)
+    //   streak: legacy compound → lastSize × dca_multiplier
+    let orderSize: number;
+    if (cfg.strategy === 'echo') {
+      const scale = (state.cycleMode === 'idle' && (cfg.echo_dca_scale_idle ?? []).length > 0)
+        ? cfg.echo_dca_scale_idle
+        : cfg.echo_dca_scale;
+      const scaleIdx = state.dcaFiredCount;   // 0-based, validated above
+      const mult     = scale[scaleIdx]!;
+      orderSize      = cfg.size_usdc * mult;
+    } else {
+      const baseSize = state.lastCycleOrderSize ?? cfg.size_usdc;
+      orderSize      = baseSize * cfg.dca_multiplier;
+    }
 
     try {
       const r = await recordOrder({
@@ -900,6 +1220,7 @@ export class PriceMonitoringWorker {
         delete state.cycleDirection;
         state.lastCycleOrderSize = null;
         state.dcaFiredCount      = 0;
+        state.cycleMode          = null;
       } else {
         // Loss → cycle continues. Fire DCA for the next window NOW that we
         // know the loss is real and the streak length includes it. Whitelist
@@ -1146,6 +1467,8 @@ export class PriceMonitoringWorker {
 
     const sharesOwned = Number(o.size_usdc) / Number(o.share_price);
 
+    let exitPrice    = bid;          // simulate-mode fallback
+    let actualShares = sharesOwned;
     if (o.mode === 'live') {
       const ex = getClobExecutor();
       if (!ex) {
@@ -1153,7 +1476,15 @@ export class PriceMonitoringWorker {
         return null;
       }
       try {
-        await ex.placeMarketSell(tokenId, sharesOwned);
+        const fill = await ex.placeMarketSell(tokenId, sharesOwned);
+        if (fill.filledShares <= 0 || !Number.isFinite(fill.avgFillPrice)) {
+          log('warn', 'cancel CLOB sell: 0 shares filled, leaving pending', {
+            orderId: o.id, requested: sharesOwned, fill,
+          });
+          return null;
+        }
+        exitPrice    = fill.avgFillPrice;
+        actualShares = fill.filledShares;
       } catch (err) {
         log('warn', 'cancel CLOB sell failed, leaving pending', {
           orderId: o.id, error: err instanceof Error ? err.message : String(err),
@@ -1162,7 +1493,7 @@ export class PriceMonitoringWorker {
       }
     }
 
-    const pnl = (bid - Number(o.share_price)) * sharesOwned;
+    const pnl = (exitPrice - Number(o.share_price)) * actualShares;
     const now = Date.now();
 
     await pool.query(
@@ -1170,7 +1501,7 @@ export class PriceMonitoringWorker {
           SET status='closed', pnl_usdc=$1, exit_price=$2,
               close_reason=$3, resolved_at=$4
         WHERE id=$5 AND status='pending' AND side='buy'`,
-      [pnl, bid, closeReason, now, o.id],
+      [pnl, exitPrice, closeReason, now, o.id],
     );
     await pool.query(
       `UPDATE poly_orders
@@ -1184,7 +1515,8 @@ export class PriceMonitoringWorker {
     // event already carries the cancel info — see SignalT0Event.cancelled.)
     log('info', `cancel order ${state.symbol}`, {
       orderId: o.id, reason: closeReason,
-      entry: o.share_price, bid, pnl: pnl.toFixed(2),
+      entry: o.share_price, bid_at_trigger: bid,
+      actual_exit: exitPrice, pnl: pnl.toFixed(2),
     });
     return {
       orderId:    o.id,
@@ -1193,7 +1525,7 @@ export class PriceMonitoringWorker {
       sizeUsdc:   Number(o.size_usdc),
       signalPath: (o.signal_path === 'dca' ? 'dca' : 'boundary'),
       pnlUsdc:    pnl,
-      exitPrice:  bid,
+      exitPrice:  exitPrice,
     };
   }
 }
@@ -1281,6 +1613,22 @@ interface StreakResult {
   streak: number;
   /** Volume buckets for each streak candle, oldest → newest, length = |streak|. */
   volumeBuckets: VolumeBucket[];
+  /**
+   * True if at least one streak bar has body (|close-open|) > 1.5× the avg
+   * body of the 48-bar baseline. A "high body" bar inside the streak is the
+   * primary signal that momentum is impulsive (vs grinding) — empirically
+   * +2.2% reversal-rate edge on BTC 180d. Used by echo strategy's optional
+   * `echo_require_high_body` gate.
+   */
+  bodyHasHigh: boolean;
+  /** True if at least one bar has body < 0.5× avg (informational). */
+  bodyHasTiny: boolean;
+  /** Mean body ratio across streak bars (= avg(streak body) / avg(48-bar body)).
+   *  Drives edge case A1 (strong-mean override). */
+  meanBodyRatio: number;
+  /** True if any streak bar has body > 4× avg (extreme climax candle).
+   *  Drives edge case A3 (mid-streak very-extreme override). */
+  bodyHasVeryExtreme: boolean;
 }
 
 /**
@@ -1307,7 +1655,7 @@ async function fetchStreakWithVolume(
       symbol, windowStart,
       source: PYTH_SYMBOL[symbol] ? 'pyth' : 'binance',
     });
-    return { streak: 0, volumeBuckets: [] };
+    return { streak: 0, volumeBuckets: [], bodyHasHigh: false, bodyHasTiny: false, meanBodyRatio: 0, bodyHasVeryExtreme: false };
   }
 
   // Stale data check: most recent bar's open should be ~5min before windowStart.
@@ -1326,7 +1674,7 @@ async function fetchStreakWithVolume(
   );
   const newest = outcomes[outcomes.length - 1];
   if (!newest || newest === 'doji') {
-    return { streak: 0, volumeBuckets: [] };
+    return { streak: 0, volumeBuckets: [], bodyHasHigh: false, bodyHasTiny: false, meanBodyRatio: 0, bodyHasVeryExtreme: false };
   }
 
   let n = 0;
@@ -1380,7 +1728,7 @@ async function fetchStreakWithVolume(
         symbol, windowStart, mismatchAt: wStart,
         binance: newest, poly: polyOutcome,
       });
-      return { streak: 0, volumeBuckets: [] };
+      return { streak: 0, volumeBuckets: [], bodyHasHigh: false, bodyHasTiny: false, meanBodyRatio: 0, bodyHasVeryExtreme: false };
     }
   }
 
@@ -1388,7 +1736,125 @@ async function fetchStreakWithVolume(
   const streakBars = bars.slice(-n);
   const volumeBuckets = streakBars.map(b => bucketize(b.volume, avgVol));
 
-  return { streak, volumeBuckets };
+  // Body composition — body is |close − open|. Compute several metrics over
+  // the streak's bars (each compared to the 48-bar avg body), feeding both
+  // the V9 high-body gate AND the optional edge-case overrides A1 / A3.
+  const avgBody = bars.reduce((a, b) => a + Math.abs(b.close - b.open), 0) / bars.length;
+  let bodyHasHigh        = false;
+  let bodyHasTiny        = false;
+  let bodyHasVeryExtreme = false;
+  let sumRatios          = 0;
+  if (avgBody > 0) {
+    for (const b of streakBars) {
+      const ratio = Math.abs(b.close - b.open) / avgBody;
+      sumRatios += ratio;
+      if (ratio > 1.5) bodyHasHigh = true;
+      if (ratio < 0.5) bodyHasTiny = true;
+      if (ratio > 4.0) bodyHasVeryExtreme = true;
+    }
+  }
+  const meanBodyRatio = streakBars.length > 0 ? sumRatios / streakBars.length : 0;
+
+  return { streak, volumeBuckets, bodyHasHigh, bodyHasTiny, meanBodyRatio, bodyHasVeryExtreme };
+}
+
+/**
+ * Backfill `state.lastExtremeStreakAt` from historical bars so the defensive
+ * layer has accurate gap info on bot startup. Without this, every restart
+ * would put the bot into immediate defensive mode (because null gap = treated
+ * as overdue), suspending trades for hours until a fresh extreme.
+ *
+ * Scans the last 30 days (8640 bars, ~9 Binance API calls — completes in a
+ * few seconds). On any active coin an extreme ≥ N=7 occurs roughly every
+ * 12-16h, so 30d gives a deep safety margin. If you need longer, bump
+ * `BACKFILL_DAYS` (no config field — it's a one-shot startup cost, not worth
+ * a per-coin knob).
+ *
+ * Threshold is read from the current cfg at backfill time. Live tracker
+ * picks up any threshold change naturally on the next observed extreme.
+ */
+const BACKFILL_DAYS = 30;
+async function backfillLastExtremeStreakAt(state: CoinState): Promise<void> {
+  const cfg = await getCoinConfig(state.symbol);
+  if (cfg.strategy !== 'echo' || !cfg.echo_defensive_enabled) return;
+  const threshold = cfg.echo_defensive_streak_threshold;
+  const now      = Date.now();
+  const lookback = BACKFILL_DAYS * 24 * 60 * 60 * 1000;
+  // Binance/Pyth fetch caps at ~1000 bars/call. Paginate forward in 1000-bar
+  // chunks (~3.5 days each) until we cover the full backfill horizon.
+  const CHUNK_BARS = 1000;
+  const CHUNK_MS   = CHUNK_BARS * 5 * 60 * 1000;
+  const bars: Bar[] = [];
+  for (let cursor = now - lookback; cursor < now; cursor += CHUNK_MS) {
+    const chunkEnd = Math.min(cursor + CHUNK_MS, now);
+    const chunk = await fetchBars(state.symbol, cursor, chunkEnd, CHUNK_BARS);
+    bars.push(...chunk);
+    if (chunk.length < 10) break;   // dead-end (no data) — stop early
+  }
+  if (bars.length < threshold) return;
+
+  // Walk bars: track every TIME a run first reaches the threshold (= one
+  // extreme event). lastAt = closeTime of the most recent bar still in an
+  // extreme run (used for the live overdue countdown).
+  const eventStartTimes: number[] = [];
+  let runDir = 0, runLen = 0;
+  let lastAt: number | null = null;
+  let i = 0;
+  for (const b of bars) {
+    const dir = b.close > b.open ? 1 : b.close < b.open ? -1 : 0;
+    const closeTime = now - lookback + (i + 1) * (5 * 60 * 1000);
+    if (dir === 0) { runDir = 0; runLen = 0; i++; continue; }
+    const wasBelow = runLen < threshold;
+    if (dir === runDir) runLen++;
+    else                { runDir = dir; runLen = 1; }
+    if (runLen >= threshold) {
+      lastAt = closeTime;
+      if (wasBelow) eventStartTimes.push(closeTime);   // new extreme event
+    }
+    i++;
+  }
+
+  // Compute inter-event gap stats — drives FE display + helps user calibrate
+  // the configured `echo_defensive_overdue_minutes`.
+  const gaps: number[] = [];
+  for (let j = 1; j < eventStartTimes.length; j++) {
+    gaps.push(eventStartTimes[j]! - eventStartTimes[j - 1]!);
+  }
+  const gapStats = gaps.length > 0 ? computeGapStats(gaps) : null;
+
+  state.defensiveGapStats = gapStats;
+
+  if (lastAt != null) {
+    state.lastExtremeStreakAt = lastAt;
+    const ago = Math.round((now - lastAt) / 60_000);
+    log('info', `defensive backfill ${state.symbol}: last extreme streak ${ago}m ago`, {
+      threshold, lastExtremeStreakAt: lastAt, scannedDays: BACKFILL_DAYS,
+      scannedBars: bars.length, events: eventStartTimes.length,
+      gapStats,
+    });
+  } else {
+    log('info', `defensive backfill ${state.symbol}: no extreme ≥ ${threshold} in last ${BACKFILL_DAYS}d`, {
+      scannedBars: bars.length,
+    });
+    // Leave null → treated as overdue → defensive enforced. Quiet 30d is
+    // genuinely rare on liquid coins; safe default.
+  }
+}
+
+/** Percentile + summary stats over inter-event gaps (ms). Returned as ms so
+ *  the FE picks its own display unit. */
+function computeGapStats(gapsMs: number[]): DefensiveGapStats {
+  const sorted = [...gapsMs].sort((a, b) => a - b);
+  const at = (q: number) => sorted[Math.max(0, Math.min(sorted.length - 1, Math.floor(q * sorted.length)))]!;
+  const sum = sorted.reduce((a, b) => a + b, 0);
+  return {
+    count: sorted.length,
+    p10Ms: at(0.10),
+    p50Ms: at(0.50),
+    p90Ms: at(0.90),
+    maxMs: sorted[sorted.length - 1]!,
+    meanMs: Math.round(sum / sorted.length),
+  };
 }
 
 function bucketize(vol: number, avgVol: number): VolumeBucket {
@@ -1398,6 +1864,31 @@ function bucketize(vol: number, avgVol: number): VolumeBucket {
   if (ratio < 1.5) return 'mid';
   if (ratio < 3.0) return 'high';
   return 'extreme';
+}
+
+/**
+ * Echo idle-mode override matcher. Returns the name of the first matching
+ * edge case (so caller can log which one fired) or null if none match.
+ * Patterns + samples + WR are documented on `EchoEdgeCase` in CoinConfig.ts.
+ */
+function matchEchoEdgeCase(
+  enabled: readonly EchoEdgeCase[],
+  absStreak: number,
+  ctx: { meanBodyRatio?: number; bodyHasVeryExtreme?: boolean },
+): EchoEdgeCase | null {
+  // A1: streak 3-4 + mean body > 1.5× avg.
+  if (enabled.includes('short_streak_strong_mean')
+      && absStreak >= 3 && absStreak <= 4
+      && (ctx.meanBodyRatio ?? 0) > 1.5) {
+    return 'short_streak_strong_mean';
+  }
+  // A3: streak 5-7 + ≥1 very-extreme body bar (>4× avg).
+  if (enabled.includes('mid_streak_very_extreme')
+      && absStreak >= 5 && absStreak <= 7
+      && ctx.bodyHasVeryExtreme === true) {
+    return 'mid_streak_very_extreme';
+  }
+  return null;
 }
 
 interface Bar { open: number; close: number; volume: number }

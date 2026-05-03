@@ -61,6 +61,7 @@ export function polyStreamHandler(engine: LiveTradingEngine) {
     const onCoinT4     = (e: unknown): void => send('coin_t4',     e);
     const onCoinT3    = (e: unknown): void => send('coin_t3',    e);
     const onCoinT0     = (e: unknown): void => send('coin_t0',     e);
+    const onCoinEcho   = (e: unknown): void => send('coin_echo',   e);
 
     engine.on('btc',     onBtc);
     engine.on('share',   onShare);
@@ -74,6 +75,7 @@ export function polyStreamHandler(engine: LiveTradingEngine) {
     engine.on('coin_t4',     onCoinT4);
     engine.on('coin_t3',    onCoinT3);
     engine.on('coin_t0',     onCoinT0);
+    engine.on('coin_echo',   onCoinEcho);
 
     // 3. Heartbeat
     const ping = setInterval(() => send('ping', { ts: Date.now() }), HEARTBEAT_MS);
@@ -93,6 +95,7 @@ export function polyStreamHandler(engine: LiveTradingEngine) {
       engine.off('coin_t4',     onCoinT4);
       engine.off('coin_t3',    onCoinT3);
       engine.off('coin_t0',     onCoinT0);
+      engine.off('coin_echo',   onCoinEcho);
     };
     req.on('close', cleanup);
     req.on('error', cleanup);

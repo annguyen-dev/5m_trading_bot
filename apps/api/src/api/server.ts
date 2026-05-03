@@ -35,6 +35,7 @@ import { getPolyStatus, getUpcomingMarkets, getCurrentMarket,
          resetTestData, getPortfolio,
          getPolyPositions, sellPosition, getBalance } from './poly-status.js';
 import { verifyCoinSlugs } from './poly-verify.js';
+import { getPolyTrades } from './poly-trades.js';
 import { listCoinConfigs, updateCoinConfigHandler } from './coin-configs.js';
 import { listTelegramChannels, replaceTelegramChannels } from './telegram-channels.js';
 import { getStreakStats } from './analyze-streaks.js';
@@ -142,6 +143,7 @@ app.get('/api/poly/orders',            listOrders);
 app.get('/api/poly/portfolio',         getPortfolio);
 app.delete('/api/poly/admin/reset-test-data', resetTestData);
 app.get('/api/poly/verify-slugs',      verifyCoinSlugs);
+app.get('/api/poly/trades',            getPolyTrades);
 
 // ── Per-coin strategy config ───────────────────────────────────────────────
 app.get('/api/coin-configs',           listCoinConfigs);
@@ -210,10 +212,15 @@ async function bootstrap(): Promise<void> {
     console.error('[api] SignalBus start failed:', err);
   }
   bus.onSignal((ev: SignalBusEvent) => {
-    if (ev.type === 'T+0')   engine.emit('coin_t0plus', ev);
-    if (ev.type === 'T+4')   engine.emit('coin_t4',     ev);
-    if (ev.type === 'T-3s')  engine.emit('coin_t3',     ev);
-    if (ev.type === 'T-0')   engine.emit('coin_t0',     ev);
+    if (ev.type === 'T+0')        engine.emit('coin_t0plus',  ev);
+    if (ev.type === 'T+4')        engine.emit('coin_t4',      ev);
+    if (ev.type === 'T-3s')       engine.emit('coin_t3',      ev);
+    if (ev.type === 'T-0')        engine.emit('coin_t0',      ev);
+    if (ev.type === 'echo_state') {
+      // Persist for snapshot hydration AND fan out to live SSE clients.
+      engine.recordEchoState(ev);
+      engine.emit('coin_echo', ev);
+    }
   });
 
   const server = app.listen(PORT, () => {

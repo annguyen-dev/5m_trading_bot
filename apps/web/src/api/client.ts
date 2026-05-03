@@ -381,6 +381,13 @@ export const api = {
       body:    JSON.stringify(body),
     }),
 
+  /** Pull on-chain trades for a market straight from Polymarket data-api.
+   *  Useful for cross-checking the bot's local order ledger against reality. */
+  getPolyTrades: (conditionId: string) =>
+    request<{ trades: PolyTradeRow[]; fromCache: boolean }>(
+      `/api/poly/trades?conditionId=${encodeURIComponent(conditionId)}`,
+    ),
+
   getPolyOrders: (status?: 'pending' | 'closed', limit = 100) => {
     const q = new URLSearchParams();
     if (status) q.set('status', status);
@@ -428,7 +435,11 @@ export const api = {
 
 export type CoinSymbol  = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE' | 'HYPE' | 'BNB';
 export type CoinMode    = 'signal_only' | 'signal_and_order';
-export type CoinStrategy = 'streak';
+/** Strategy choice — 'streak' = baseline simple, 'echo' = Echo Hunt (arm-window). */
+export type CoinStrategy = 'streak' | 'echo';
+
+/** Echo idle-mode override edge cases (see backend EchoEdgeCase). */
+export type EchoEdgeCase = 'short_streak_strong_mean' | 'mid_streak_very_extreme';
 
 export interface AutoScheduleEntry {
   start_hour:     number;   // 0-23 UTC
@@ -452,6 +463,23 @@ export interface PostExtremeBucket {
   avgMinsToSideways:  number;
   avgMaxStreakNext60: number;
   sidewaysFraction:   number;
+}
+
+export interface StreakGapBucket {
+  thresholdLength: number;
+  occurrences:     number;
+  meanGapMin:      number;
+  medianGapMin:    number;
+  p10GapMin:       number;
+  p90GapMin:       number;
+  maxGapMin:       number;
+}
+
+export interface StreakGapEvent {
+  endedAt:      number;
+  signed:       number;          // signed length: + UP, − DOWN
+  length:       number;          // abs
+  gapBeforeMin: number | null;
 }
 
 export interface StreakStatsResponse {
@@ -478,6 +506,10 @@ export interface StreakStatsResponse {
     bigCount:  number;
     totalBars: number;
   }>;
+  streakGaps: {
+    byThreshold:  StreakGapBucket[];
+    recentEvents: StreakGapEvent[];
+  };
   suggested: {
     auto_order_min_streak: number;
     dca_streak_whitelist:  number[];
@@ -506,6 +538,30 @@ export interface CoinConfigPatch {
    * Empty = always allowed (default). Non-empty = strict whitelist.
    */
   dca_streak_whitelist:  number[];
+
+  // ── Echo Hunt strategy params (only used when strategy === 'echo') ─────────
+  /** Streak length that, when it ENDS, opens the arm window. */
+  echo_trigger_streak:       number;
+  /** How long the arm window stays open after a trigger. */
+  echo_window_minutes:       number;
+  /** Inside the arm window, fire signal/order when |streak| ≥ this. */
+  echo_signal_min_streak:    number;
+  /** Idle baseline threshold for echo (when not armed). Independent from
+   *  auto_order_min_streak so the two strategies don't interfere. */
+  echo_baseline_streak:      number;
+  /** V9 body filter: require ≥1 high-body bar (>1.5× avg) in the streak. */
+  echo_require_high_body:    boolean;
+  /** Idle-mode override edge cases (each lets the bot fire at lower streak when matched). */
+  echo_edge_cases:           EchoEdgeCase[];
+  /** ARMED-mode DCA size multipliers (e.g. [3,4] = base×3 after L1, base×4 after L2). */
+  echo_dca_scale: number[];
+  /** IDLE-mode DCA scale (empty = fall back to echo_dca_scale). */
+  echo_dca_scale_idle: number[];
+  // Defensive regime detection
+  echo_defensive_enabled:          boolean;
+  echo_defensive_streak_threshold: number;
+  echo_defensive_overdue_minutes:  number;
+  echo_defensive_action:           'disable_armed' | 'skip_all';
 }
 
 export interface CoinConfigRow extends CoinConfigPatch {
@@ -608,6 +664,19 @@ export type PolySignalPath  = 'boundary' | 'dca' | 'panic';
 export type PolyCloseReason = 'resolution' | 'tp' | 'sl' | 'manual' | 'cancelled';
 export type PolyOrderSide   = 'buy' | 'sell';
 
+/** On-chain trade pulled from Polymarket data-api (NOT our DB). */
+export interface PolyTradeRow {
+  transactionHash: string;
+  /** Unix SECONDS (not ms) — Polymarket returns seconds. */
+  timestamp:       number;
+  side:            'BUY' | 'SELL';
+  price:           number;     // 0..1 — per-share dollar price
+  size:            number;     // shares
+  asset:           string;     // ERC-1155 token id
+  outcome:         string;     // "Up" / "Down" / coin label
+  proxyWallet:     string | null;
+}
+
 export interface PolyOrderRow {
   id:               string;
   market_id:        string;
@@ -659,6 +728,8 @@ export interface PolyBacktestAutoScheduleEntry {
 
 export interface PolyBacktestCoinConfig {
   symbol:                'BTC';
+  /** 'streak' = legacy baseline; 'echo' = arm-window strategy. */
+  strategy:              CoinStrategy;
   size_usdc:             number;
   streak_min:            number;
   auto_order_min_streak: number;
@@ -668,6 +739,18 @@ export interface PolyBacktestCoinConfig {
   dca_multiplier:        number;
   dca_streak_whitelist:  number[];
   auto_schedule:         PolyBacktestAutoScheduleEntry[];
+  echo_trigger_streak:    number;
+  echo_window_minutes:    number;
+  echo_signal_min_streak: number;
+  echo_baseline_streak:   number;
+  echo_require_high_body: boolean;
+  echo_edge_cases:        EchoEdgeCase[];
+  echo_dca_scale:         number[];
+  echo_dca_scale_idle:    number[];
+  echo_defensive_enabled:          boolean;
+  echo_defensive_streak_threshold: number;
+  echo_defensive_overdue_minutes:  number;
+  echo_defensive_action:           'disable_armed' | 'skip_all';
 }
 
 export interface PolyBacktestRequestBody {

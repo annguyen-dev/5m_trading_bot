@@ -78,6 +78,14 @@ const DISCOVERY_POLL_MS = 60_000;   // re-scan upcoming markets every 60s
 const FLUSH_INTERVAL_MS = 1000;     // batch DB writes at most every 1s
 const FLUSH_BATCH_MAX   = 200;      // or when buffer hits this size
 const UPCOMING_TRACK    = 3;        // track current + next 2 windows
+// Staleness watchdog — outbound WS to Polymarket can silently zombie behind
+// NAT / cloud network filters: TCP stays open, no `close` fires, but no data
+// flows. engine.shares freezes at last value, SSE keeps pushing stale snapshot,
+// UI shows wrong "live" prices until process restart. Detect by tracking time
+// since last message and force-reconnect when idle.
+const WS_PING_INTERVAL_MS  = 25_000;   // outbound ping → keeps NAT/proxy from idle-killing
+const WS_STALE_MS          = 60_000;   // no DATA message ≥ this → assume zombie, reconnect
+const WS_WATCHDOG_TICK_MS  = 15_000;
 
 // ── Service ────────────────────────────────────────────────────────────────
 
@@ -101,6 +109,10 @@ export class PolymarketService extends EventEmitter {
 
   // Dedup cache for top-of-book: tokenId → last {bid, ask}
   private lastTopOfBook = new Map<string, { bid: number | null; ask: number | null }>();
+
+  // Last time the WS produced a message (any type). Used by the staleness
+  // watchdog to detect silent zombie connections.
+  private lastWsEventAt = 0;
 
   // Write buffer
   private buf: ShareTick[] = [];
@@ -276,6 +288,62 @@ export class PolymarketService extends EventEmitter {
       // CLOB accepts incremental subscribes on the same connection.
       this.ws.send(JSON.stringify({ type: 'market', assets_ids: [token] }));
     }
+    // CLOB's WS subscribe doesn't always trigger a `book` event back —
+    // especially on freshly-opened or low-liquidity markets. Without an
+    // initial book the engine's shares Map stays empty for this token until
+    // the first price_change (could be many minutes), so the UI shows blank
+    // and a page refresh doesn't fix it (server state is also empty).
+    // REST-seed proactively to guarantee shares have data within ~200ms.
+    void this.seedInitialBook(token);
+  }
+
+  /**
+   * REST-fetch a token's order book and emit it as a synthetic `book` tick.
+   *
+   * Two modes:
+   * - `force=false` (default): one-shot lazy seed. No-op if the token already
+   *   has cached top-of-book — used when adding a new token subscription.
+   * - `force=true`: always overwrite, regardless of cached state. Used on WS
+   *   reconnect to refresh tokens whose data has gone stale.
+   *
+   * Why force=true is needed on reconnect: empirically (verified via DB query
+   * on prod), Polymarket's WS subscribe DOES NOT replay `book` events for
+   * inactive tokens — only for ones with current activity. So tokens that
+   * were seeded once with placeholder 49/50, 50/51 and never received a
+   * price_change keep their stale value forever despite repeated reconnects.
+   * Forcing a REST refresh on every WS open closes that gap.
+   *
+   * Does NOT write to poly_share_ticks (that table is for real ticks; REST
+   * snapshots would falsely look like exchange-driven events).
+   */
+  private async seedInitialBook(token: string, force = false): Promise<void> {
+    if (!force && this.lastTopOfBook.has(token)) return;
+    const book = await this.getOrderBook(token);
+    if (!book) return;
+    // Lazy path: re-check after the awaited REST in case WS raced ahead. On
+    // the force path the goal IS to overwrite, so we skip this re-check.
+    if (!force && this.lastTopOfBook.has(token)) return;
+    const bestBid = book.bids.length ? Math.max(...book.bids.map(b => b.price)) : null;
+    const bestAsk = book.asks.length ? Math.min(...book.asks.map(a => a.price)) : null;
+    if (bestBid == null && bestAsk == null) return;
+    this.lastTopOfBook.set(token, { bid: bestBid, ask: bestAsk });
+    const cond = Array.from(this.activeMarkets.values())
+      .find(m => m.tokenUp === token || m.tokenDown === token);
+    const tick: ShareTick = {
+      conditionId: cond?.conditionId ?? '',
+      tokenId:     token,
+      ts:          Date.now(),
+      bestBid,
+      bestAsk,
+      lastPrice:   null,
+      event:       'book',
+    };
+    this.emit('share_tick', tick);
+    // Demote re-seed log to debug — fires for every token on every reconnect
+    // (~30 tokens × every 15 min ≈ 120/h per service). Keep info for the
+    // first-time path so initial population is still visible.
+    log(force ? 'debug' : 'info', 'Polymarket REST-seeded initial book',
+        { token: token.slice(0, 8), bestBid, bestAsk, force });
   }
 
   // ── WebSocket loop ───────────────────────────────────────────────────────
@@ -295,32 +363,84 @@ export class PolymarketService extends EventEmitter {
     return new Promise((resolve) => {
       const ws = new WebSocket(WS_URL);
       this.ws = ws;
+      // Start the staleness clock fresh; if the open handshake itself stalls,
+      // the watchdog will close us out within WS_STALE_MS.
+      this.lastWsEventAt = Date.now();
+
+      // Outbound ping keeps NAT/proxy/Polymarket from idle-killing the socket
+      // during quiet periods (no book updates). Pong is auto-handled by `ws`.
+      const pingTimer = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          try { ws.ping(); } catch { /* ignore — close handler runs cleanup */ }
+        }
+      }, WS_PING_INTERVAL_MS);
+
+      // Watchdog: detect zombie connections (TCP open, no data flowing).
+      // Polymarket WS normally produces ≥1 message every few seconds across
+      // all subscribed tokens; WS_STALE_MS of total silence almost always
+      // means the connection is dead. Force-close to break out of the
+      // resolve-on-close pattern so wsLoop reconnects.
+      const watchdog = setInterval(() => {
+        if (this.ws !== ws) return;             // we've been superseded
+        const idle = Date.now() - this.lastWsEventAt;
+        if (idle > WS_STALE_MS) {
+          log('warn', 'Polymarket WS stale — forcing reconnect', {
+            idleMs: idle, tokens: this.subscribedTokens.size,
+          });
+          try { ws.terminate(); } catch { /* ignore */ }
+        }
+      }, WS_WATCHDOG_TICK_MS);
 
       ws.on('open', () => {
         log('info', 'Polymarket WS open', { tokens: this.subscribedTokens.size });
+        this.lastWsEventAt = Date.now();
         const assets = Array.from(this.subscribedTokens);
         if (assets.length > 0) {
           ws.send(JSON.stringify({ type: 'market', assets_ids: assets }));
         }
+        // Force-refresh ALL token books via REST on every WS open. Polymarket
+        // WS subscribe does not replay book events for inactive tokens (verified
+        // against prod DB), so without this, tokens seeded once at market open
+        // with placeholder 49/50, 50/51 stay stale across every 15-min
+        // reconnect. The force=true overwrites cached state.
+        for (const t of this.subscribedTokens) {
+          void this.seedInitialBook(t, true);
+        }
       });
+
+      // Intentionally NOT updating lastWsEventAt on pong. Polymarket's WS
+      // sometimes goes silent on real DATA (book/price_change) for minutes
+      // before closing, while still auto-responding to our pings — pong-as-
+      // alive made the watchdog blind to those silent stretches. Verified
+      // 209s + 175s data gaps in prod despite no watchdog firings. Now only
+      // real exchange messages reset the staleness clock; if Polymarket stops
+      // sending data for WS_STALE_MS, we terminate and reconnect to recover
+      // the FE display.
+      // ws.on('pong', () => { /* noop — see above */ });
 
       ws.on('message', (data) => this.handleWsMessage(data.toString()));
 
       ws.on('close', () => {
         log('warn', 'Polymarket WS closed');
-        this.ws = null;
+        clearInterval(pingTimer);
+        clearInterval(watchdog);
+        if (this.ws === ws) this.ws = null;
         this.emit('disconnect');
         resolve();
       });
 
       ws.on('error', (err: Error) => {
         log('warn', 'Polymarket WS error', { error: err.message });
-        // close fires after error; resolve there
+        // close fires after error; cleanup happens there
       });
     });
   }
 
   private handleWsMessage(raw: string): void {
+    // Any incoming message — even if it's an unknown type — counts as proof
+    // the connection is alive. Update before parsing so the watchdog can't
+    // trigger on a parse-error edge case.
+    this.lastWsEventAt = Date.now();
     let msgs: unknown;
     try { msgs = JSON.parse(raw); } catch { return; }
     const arr = Array.isArray(msgs) ? msgs : [msgs];

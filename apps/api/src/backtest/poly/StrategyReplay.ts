@@ -39,6 +39,9 @@ export interface ReplayWindow {
    *  when this window IS the target N+1 of a placement decision). */
   tokenUp:        string;
   tokenDown:      string;
+  /** Bar body = |close − open|. Used by echo's V9 high-body filter.
+   *  May be undefined when source data is missing — filter is skipped then. */
+  body?:          number;
 }
 
 /** Mutable cycle state — same shape as PMW's CoinState (cycle slice). */
@@ -47,6 +50,13 @@ interface Cycle {
   direction?:    'up' | 'down';
   lastSize:      number | null;
   dcaCount:      number;
+  /** Echo strategy: ms timestamp when arm window was last refreshed. null
+   *  outside echo strategy or before the first trigger. */
+  lastEchoTriggerAt: number | null;
+  /** Echo strategy: cycle-open mode → drives DCA scale selection. */
+  cycleMode:     'idle' | 'armed' | null;
+  /** Defensive layer: ms timestamp of last extreme streak observation. */
+  lastExtremeStreakAt: number | null;
 }
 
 interface PendingOrder {
@@ -84,7 +94,7 @@ export function replayStrategy(
 ): ReplayResult {
   const trades:    PolyBacktestTrade[]    = [];
   const decisions: PolyBacktestDecision[] = [];
-  const cycle: Cycle = { active: false, lastSize: null, dcaCount: 0 };
+  const cycle: Cycle = { active: false, lastSize: null, dcaCount: 0, lastEchoTriggerAt: null, cycleMode: null, lastExtremeStreakAt: null };
 
   /** Map of windowStart → pending order(s) targeting that window.
    *  In practice at most one per window because of the dedup gate, but use
@@ -112,6 +122,7 @@ export function replayStrategy(
           delete cycle.direction;
           cycle.lastSize = null;
           cycle.dcaCount = 0;
+          cycle.cycleMode = null;
         }
         // loss → cycle continues; DCA decision below uses underlying outcome
       }
@@ -127,6 +138,7 @@ export function replayStrategy(
         delete cycle.direction;
         cycle.lastSize = null;
         cycle.dcaCount = 0;
+        cycle.cycleMode = null;
       }
       // loss → continues
     }
@@ -145,8 +157,17 @@ export function replayStrategy(
         const book    = bookFor(tokenId);
         const ask     = book ? book.bestAskAt(nextW.windowStart) : null;
         if (ask != null && ask * 100 <= cfg.limit_price_cents) {
-          const baseSize = cycle.lastSize ?? cfg.size_usdc;
-          const size     = baseSize * cfg.dca_multiplier;
+          // DCA size: echo picks scale by cycle mode (idle vs armed).
+          let size: number;
+          if (cfg.strategy === 'echo') {
+            const scale = (cycle.cycleMode === 'idle' && (cfg.echo_dca_scale_idle ?? []).length > 0)
+              ? cfg.echo_dca_scale_idle
+              : cfg.echo_dca_scale;
+            size = cfg.size_usdc * scale[cycle.dcaCount]!;
+          } else {
+            const baseSize = cycle.lastSize ?? cfg.size_usdc;
+            size = baseSize * cfg.dca_multiplier;
+          }
           const order: PendingOrder = {
             windowStart:   nextW.windowStart,
             windowEnd:     nextW.windowEnd,
@@ -197,7 +218,7 @@ export function replayStrategy(
 
     // ── 3. Boundary placement for N+1 (T-3s of N timing) ──────────────────
     if (placedThisIteration == null && !cycle.active && nextW != null) {
-      const decision = tryBoundary(windows, i, cfg);
+      const decision = tryBoundary(windows, i, cfg, cycle);
       if (decision.place && decision.direction) {
         const tokenId = decision.direction === 'up' ? nextW.tokenUp : nextW.tokenDown;
         const book    = bookFor(tokenId);
@@ -219,6 +240,12 @@ export function replayStrategy(
           cycle.direction = decision.direction;
           cycle.lastSize = null;
           cycle.dcaCount = 0;
+          // Tag cycle's mode for echo so DCA picks the right scale.
+          if (cfg.strategy === 'echo') {
+            const armEndAtT3 = (cycle.lastEchoTriggerAt ?? 0) + cfg.echo_window_minutes * 60_000;
+            const w = windows[i]!;
+            cycle.cycleMode = w.windowEnd <= armEndAtT3 ? 'armed' : 'idle';
+          }
           decisions.push({
             windowStart:         nextW.windowStart,
             windowEnd:           nextW.windowEnd,
@@ -279,21 +306,110 @@ function tryBoundary(
   windows: ReplayWindow[],
   i:       number,                             // index of current window N
   cfg:     PolyBacktestCoinConfig,
+  cycle:   Cycle,
 ): BoundaryDecision {
-  // streak as of N's start (= excludes N's outcome) — we need lookback
-  // through prior 48 closed windows.
   const streak = computeStreak(windows, i);
   const absStreak = Math.abs(streak);
+  const w = windows[i]!;
+
+  // Echo Hunt: HYBRID — bot always trades using `auto_order_min_streak` as
+  // the baseline; when a streak ≥ trigger ends, the placement threshold drops
+  // to `echo_signal_min_streak` for the next `echo_window_minutes`. Outside
+  // that arm window, threshold reverts to baseline.
+  if (cfg.strategy === 'echo') {
+    if (absStreak >= cfg.echo_trigger_streak) {
+      cycle.lastEchoTriggerAt = w.windowStart;
+    }
+    // Defensive tracker — record extreme streak observations.
+    if (absStreak >= cfg.echo_defensive_streak_threshold) {
+      cycle.lastExtremeStreakAt = w.windowStart;
+    }
+    if (absStreak < cfg.streak_min) {
+      return { place: false, streak, skipReason: `streak<${cfg.streak_min}` };
+    }
+    const direction: 'up' | 'down' = streak > 0 ? 'down' : 'up';
+    if (w.outcome !== 'unknown') {
+      const expectedOutcome: 'up' | 'down' = streak > 0 ? 'up' : 'down';
+      if (w.outcome !== expectedOutcome) {
+        return { place: false, direction, streak, skipReason: 'in_progress_flipped' };
+      }
+    }
+    // Armed-aware threshold: use windowEnd as "now" — placement is at T-3s of N.
+    const armEndAt = (cycle.lastEchoTriggerAt ?? 0) + cfg.echo_window_minutes * 60_000;
+    let armed = w.windowEnd <= armEndAt;
+
+    // Defensive regime: if too long since last extreme, suspend or downgrade.
+    if (cfg.echo_defensive_enabled) {
+      const overdueMs = cfg.echo_defensive_overdue_minutes * 60_000;
+      const gap = cycle.lastExtremeStreakAt != null
+        ? w.windowEnd - cycle.lastExtremeStreakAt
+        : Infinity;
+      if (gap > overdueMs) {
+        if (cfg.echo_defensive_action === 'skip_all') {
+          return { place: false, streak, skipReason: 'defensive_skip_all' };
+        }
+        // disable_armed → force baseline
+        armed = false;
+      }
+    }
+
+    let threshold = armed ? cfg.echo_signal_min_streak : cfg.echo_baseline_streak;
+
+    // Body composition (used by V9 filter + edge-case overrides). Only valid
+    // when `body` is populated (BTC backtest). Null bodies → metrics undefined.
+    const streakBarsBT = windows.slice(i - absStreak + 1, i + 1);
+    const baselineLo   = Math.max(0, i - 48 + 1);
+    const baselineBT   = windows.slice(baselineLo, i + 1);
+    const bodiesBT     = baselineBT.map(w => w.body).filter((b): b is number => b != null);
+    const avgBodyBT    = bodiesBT.length ? bodiesBT.reduce((a,b) => a + b, 0) / bodiesBT.length : 0;
+    const streakBodyRatios: number[] = avgBodyBT > 0
+      ? streakBarsBT.map(w => w.body != null ? w.body / avgBodyBT : NaN).filter(r => !Number.isNaN(r))
+      : [];
+    const hasHigh         = streakBodyRatios.some(r => r > 1.5);
+    const hasVeryExtreme  = streakBodyRatios.some(r => r > 4.0);
+    const meanBodyRatio   = streakBodyRatios.length
+      ? streakBodyRatios.reduce((a, b) => a + b, 0) / streakBodyRatios.length
+      : 0;
+
+    // V9 body filter — IDLE mode only. Bump threshold +2 when no high-body bar.
+    if (!armed && cfg.echo_require_high_body && streakBodyRatios.length > 0 && !hasHigh) {
+      threshold += 2;
+    }
+
+    const effectiveStreak = absStreak + 1;
+    if (effectiveStreak < threshold) {
+      // Edge-case overrides (idle echo only). Match against same patterns as PMW.
+      let overrideName: string | null = null;
+      if (!armed && (cfg.echo_edge_cases ?? []).length > 0 && streakBodyRatios.length > 0) {
+        const enabled = cfg.echo_edge_cases;
+        if (enabled.includes('short_streak_strong_mean')
+            && absStreak >= 3 && absStreak <= 4
+            && meanBodyRatio > 1.5) {
+          overrideName = 'short_streak_strong_mean';
+        } else if (enabled.includes('mid_streak_very_extreme')
+            && absStreak >= 5 && absStreak <= 7
+            && hasVeryExtreme) {
+          overrideName = 'mid_streak_very_extreme';
+        }
+      }
+      if (!overrideName) {
+        return { place: false, direction, streak,
+                 skipReason: armed
+                   ? `echo_armed_eff<${threshold}`
+                   : `echo_idle_eff<${threshold}` };
+      }
+      // override fires — fall through to place
+    }
+    return { place: true, direction, streak };
+  }
+
+  // Streak (legacy) strategy below.
   if (absStreak < cfg.streak_min) {
     return { place: false, streak, skipReason: `streak<${cfg.streak_min}` };
   }
 
   const direction: 'up' | 'down' = streak > 0 ? 'down' : 'up';   // contrarian
 
-  // In-progress candle gate (PMW's "current flipped" check). Approximate
-  // by the just-closed window's outcome — by T-3s of N, ~99% of N's bar
-  // is formed.
-  const w = windows[i]!;
   if (w.outcome !== 'unknown') {
     const expectedOutcome: 'up' | 'down' = streak > 0 ? 'up' : 'down';
     if (w.outcome !== expectedOutcome) {
@@ -301,7 +417,6 @@ function tryBoundary(
     }
   }
 
-  // Adaptive threshold — schedule overrides applied to N's hour at T-3s.
   const threshold = effectiveThreshold(cfg, w.windowEnd);
   const effectiveStreak = absStreak + 1;
   if (effectiveStreak < threshold) {
@@ -330,10 +445,33 @@ function tryDca(
   const streak = computeStreak(windows, iNext);
   const absStreak = Math.abs(streak);
 
-  // Whitelist gate (empty = fire on every loss)
-  if (cfg.dca_streak_whitelist.length > 0 && !cfg.dca_streak_whitelist.includes(absStreak)) {
-    return { place: false, streak,
-             skipReason: `whitelist[${cfg.dca_streak_whitelist.join(',')}]` };
+  if (cfg.strategy === 'echo') {
+    // Defensive: skip DCA when in overdue regime (mirrors PMW). Use the
+    // target window's start as the "now" reference.
+    if (cfg.echo_defensive_enabled) {
+      const overdueMs = cfg.echo_defensive_overdue_minutes * 60_000;
+      const nowRef    = windows[iNext]?.windowStart ?? 0;
+      const gap = cycle.lastExtremeStreakAt != null
+        ? nowRef - cycle.lastExtremeStreakAt
+        : Infinity;
+      if (gap > overdueMs) {
+        return { place: false, streak, skipReason: 'defensive_overdue_no_dca' };
+      }
+    }
+    // Echo: bounded scale array — stop when we've exhausted the entries.
+    if (cfg.echo_dca_scale.length === 0) {
+      return { place: false, streak, skipReason: 'echo_dca_disabled' };
+    }
+    if (cycle.dcaCount >= cfg.echo_dca_scale.length) {
+      return { place: false, streak,
+               skipReason: `echo_dca_exhausted(${cfg.echo_dca_scale.length})` };
+    }
+  } else {
+    // Streak: per-streak whitelist (empty = always).
+    if (cfg.dca_streak_whitelist.length > 0 && !cfg.dca_streak_whitelist.includes(absStreak)) {
+      return { place: false, streak,
+               skipReason: `whitelist[${cfg.dca_streak_whitelist.join(',')}]` };
+    }
   }
 
   // Defensive: streak direction must still oppose our bet.

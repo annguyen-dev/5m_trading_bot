@@ -660,7 +660,7 @@ export async function sellPosition(req: Request, res: Response): Promise<void> {
       res.status(400).json({ error: 'conditionId + direction (up|down) required' });
       return;
     }
-    const exit = Number(exitPrice);
+    let exit = Number(exitPrice);
     if (!(exit > 0 && exit < 1)) {
       res.status(400).json({ error: 'exitPrice must be in (0, 1) — pass current bid' });
       return;
@@ -747,8 +747,13 @@ export async function sellPosition(req: Request, res: Response): Promise<void> {
       const totalShares  = Math.floor(requestedRaw * 100) / 100;
 
       try {
-        await ex.placeMarketSell(tokenId, totalShares);
-        liveSoldShares = totalShares;
+        const fill = await ex.placeMarketSell(tokenId, totalShares);
+        liveSoldShares = fill.filledShares;
+        // Use actual VWAP fill (not the user-provided `exit` placeholder)
+        // so DB reflects real wallet outcome.
+        if (fill.filledShares > 0 && Number.isFinite(fill.avgFillPrice)) {
+          exit = fill.avgFillPrice;
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         res.status(400).json({ error: `CLOB market SELL rejected: ${msg}` });

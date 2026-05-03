@@ -15,6 +15,8 @@
  *  skip/filter layer. */
 export interface PolyBacktestCoinConfig {
   symbol:                 'BTC';        // v1: BTC only
+  /** 'streak' = legacy baseline; 'echo' = arm-window strategy. */
+  strategy:               'streak' | 'echo';
   size_usdc:              number;
   streak_min:             number;
   auto_order_min_streak:  number;
@@ -24,6 +26,21 @@ export interface PolyBacktestCoinConfig {
   dca_multiplier:         number;
   dca_streak_whitelist:   number[];     // empty = fire DCA on every loss
   auto_schedule:          PolyAutoScheduleEntry[];
+  // ── Echo Hunt params (used only when strategy === 'echo') ────────────────
+  echo_trigger_streak:    number;
+  echo_window_minutes:    number;
+  echo_signal_min_streak: number;
+  echo_baseline_streak:   number;
+  echo_require_high_body: boolean;
+  /** Idle-mode override edge cases (see EchoEdgeCase). */
+  echo_edge_cases:        Array<'short_streak_strong_mean' | 'mid_streak_very_extreme'>;
+  echo_dca_scale:         number[];
+  /** Idle-mode DCA scale (empty → fallback to echo_dca_scale). */
+  echo_dca_scale_idle:    number[];
+  echo_defensive_enabled:          boolean;
+  echo_defensive_streak_threshold: number;
+  echo_defensive_overdue_minutes:  number;
+  echo_defensive_action:           'disable_armed' | 'skip_all';
 }
 
 export interface PolyAutoScheduleEntry {

@@ -10,7 +10,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   api,
-  type CoinConfigRow, type CoinMode, type AutoScheduleEntry,
+  type CoinConfigRow, type CoinMode, type CoinStrategy, type EchoEdgeCase, type AutoScheduleEntry,
   type TelegramChannel, type TelegramInfoType, type CoinSymbol,
 } from '../api/client.js';
 
@@ -43,6 +43,7 @@ export default function SettingsPage() {
                 <tr>
                   <th style={S.th}>Coin</th>
                   <th style={S.th}>Enabled</th>
+                  <th style={S.th} title="streak = simple baseline; echo = trade only in arm-window after a high-streak event">Strategy</th>
                   <th style={S.th}>Mode</th>
                   <th style={{ ...S.th, textAlign: 'right' }} title="Emit T+4 signal when |streak| ≥ this">Signal ≥</th>
                   <th style={{ ...S.th, textAlign: 'right' }} title="Place order at T-3s when |streak| ≥ this">Auto ≥</th>
@@ -91,9 +92,47 @@ function CoinRow({
   const [err,             setErr]             = useState<string | null>(null);
   const [flash,           setFlash]           = useState(false);
   const [scheduleOpen,    setScheduleOpen]    = useState(false);
+  // Local raw-text state for the DCA scale input. We can't bind directly to
+  // `draft.echo_dca_scale.join(',')` because typing a comma triggers
+  // parse-then-stringify which strips the trailing "," before the user can
+  // type the next digit. Keep the literal string here; sync to draft array on
+  // each keystroke (for dirty/valid/save), and re-sync FROM initial when the
+  // parent reloads the row (e.g. after a successful save).
+  const [scaleStr, setScaleStr] = useState<string>(
+    () => (initial.echo_dca_scale ?? []).join(','),
+  );
+  // Same shadow-string pattern for the IDLE-mode DCA scale input.
+  const [scaleStrIdle, setScaleStrIdle] = useState<string>(
+    () => (initial.echo_dca_scale_idle ?? []).join(','),
+  );
   const [dcaOpen,         setDcaOpen]         = useState(false);
 
   useEffect(() => { setDraft(initial); }, [initial]);
+  // Re-sync the input string ONLY when the upstream array would parse to
+  // something different from what the current string already does. This
+  // catches external reloads (after save / initial fetch) without clobbering
+  // mid-typed strings like "3," whose parsed equivalent equals the upstream.
+  useEffect(() => {
+    const parsed = scaleStr
+      .split(',')
+      .map(s => Number(s.trim()))
+      .filter(n => Number.isFinite(n) && n > 0);
+    const upstream = initial.echo_dca_scale ?? [];
+    const same = parsed.length === upstream.length
+      && parsed.every((v, i) => v === upstream[i]);
+    if (!same) setScaleStr(upstream.join(','));
+    // Intentionally exclude scaleStr from deps — only re-run when initial changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initial.echo_dca_scale]);
+  // Same pattern for idle scale.
+  useEffect(() => {
+    const parsed = scaleStrIdle.split(',').map(s => Number(s.trim()))
+      .filter(n => Number.isFinite(n) && n > 0);
+    const upstream = initial.echo_dca_scale_idle ?? [];
+    const same = parsed.length === upstream.length && parsed.every((v, i) => v === upstream[i]);
+    if (!same) setScaleStrIdle(upstream.join(','));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initial.echo_dca_scale_idle]);
 
   // Array equality via JSON stringify is sufficient for the schedule shape
   // (small, flat). Falls back to string compare, O(n) per row.
@@ -104,15 +143,29 @@ function CoinRow({
       !== JSON.stringify([...(initial.dca_streak_whitelist ?? [])].sort());
 
   const dirty =
-       draft.enabled               !== initial.enabled
-    || draft.mode                  !== initial.mode
-    || draft.streak_min            !== initial.streak_min
-    || draft.auto_order_min_streak !== initial.auto_order_min_streak
-    || draft.size_usdc             !== initial.size_usdc
-    || draft.limit_price_cents     !== initial.limit_price_cents
-    || draft.tp_cents              !== initial.tp_cents
-    || draft.sl_cents              !== initial.sl_cents
-    || draft.dca_multiplier        !== initial.dca_multiplier
+       draft.enabled                   !== initial.enabled
+    || draft.strategy                  !== initial.strategy
+    || draft.mode                      !== initial.mode
+    || draft.streak_min                !== initial.streak_min
+    || draft.auto_order_min_streak     !== initial.auto_order_min_streak
+    || draft.size_usdc                 !== initial.size_usdc
+    || draft.limit_price_cents         !== initial.limit_price_cents
+    || draft.tp_cents                  !== initial.tp_cents
+    || draft.sl_cents                  !== initial.sl_cents
+    || draft.dca_multiplier            !== initial.dca_multiplier
+    || draft.echo_trigger_streak    !== initial.echo_trigger_streak
+    || draft.echo_window_minutes    !== initial.echo_window_minutes
+    || draft.echo_signal_min_streak !== initial.echo_signal_min_streak
+    || draft.echo_baseline_streak   !== initial.echo_baseline_streak
+    || draft.echo_require_high_body !== initial.echo_require_high_body
+    || JSON.stringify([...(draft.echo_edge_cases ?? [])].sort())
+       !== JSON.stringify([...(initial.echo_edge_cases ?? [])].sort())
+    || JSON.stringify(draft.echo_dca_scale ?? []) !== JSON.stringify(initial.echo_dca_scale ?? [])
+    || JSON.stringify(draft.echo_dca_scale_idle ?? []) !== JSON.stringify(initial.echo_dca_scale_idle ?? [])
+    || draft.echo_defensive_enabled          !== initial.echo_defensive_enabled
+    || draft.echo_defensive_streak_threshold !== initial.echo_defensive_streak_threshold
+    || draft.echo_defensive_overdue_minutes  !== initial.echo_defensive_overdue_minutes
+    || draft.echo_defensive_action           !== initial.echo_defensive_action
     || scheduleDirty
     || dcaWhitelistDirty;
 
@@ -121,6 +174,16 @@ function CoinRow({
     && Number.isInteger(e.duration_hours) && e.duration_hours >= 1 && e.duration_hours <= 24
     && Number.isInteger(e.threshold)      && e.threshold      >= 1 && e.threshold      <= 20,
   );
+
+  // Echo params validate independently — even when strategy=streak we keep them
+  // in valid range so toggling to echo doesn't suddenly require fixing values.
+  const echoValid =
+       draft.echo_trigger_streak    >= 1 && draft.echo_trigger_streak    <= 20
+    && draft.echo_window_minutes    >= 1 && draft.echo_window_minutes    <= 240
+    && draft.echo_signal_min_streak >= 1 && draft.echo_signal_min_streak <= 20
+    && draft.echo_baseline_streak   >= 1 && draft.echo_baseline_streak   <= 20
+    && draft.echo_signal_min_streak <= draft.echo_baseline_streak
+    && (draft.echo_dca_scale ?? []).every(s => Number.isFinite(s) && s >= 1 && s <= 20);
 
   const valid =
        draft.streak_min            >= 1 && draft.streak_min            <= 20
@@ -132,24 +195,38 @@ function CoinRow({
     && draft.dca_multiplier        >= 1.0 && draft.dca_multiplier      <= 10.0
     && draft.tp_cents > draft.sl_cents
     && draft.auto_order_min_streak >= draft.streak_min
-    && scheduleValid;
+    && scheduleValid
+    && echoValid;
 
   async function save() {
     if (!dirty || !valid) return;
     setSaving(true); setErr(null);
     try {
       await api.updateCoinConfig(draft.symbol, {
-        enabled:               draft.enabled,
-        mode:                  draft.mode,
-        streak_min:            draft.streak_min,
-        auto_order_min_streak: draft.auto_order_min_streak,
-        auto_schedule:         draft.auto_schedule ?? [],
-        size_usdc:             draft.size_usdc,
-        limit_price_cents:     draft.limit_price_cents,
-        tp_cents:              draft.tp_cents,
-        sl_cents:              draft.sl_cents,
-        dca_multiplier:        draft.dca_multiplier,
-        dca_streak_whitelist:  [...(draft.dca_streak_whitelist ?? [])].sort((a, b) => a - b),
+        enabled:                   draft.enabled,
+        strategy:                  draft.strategy,
+        mode:                      draft.mode,
+        streak_min:                draft.streak_min,
+        auto_order_min_streak:     draft.auto_order_min_streak,
+        auto_schedule:             draft.auto_schedule ?? [],
+        size_usdc:                 draft.size_usdc,
+        limit_price_cents:         draft.limit_price_cents,
+        tp_cents:                  draft.tp_cents,
+        sl_cents:                  draft.sl_cents,
+        dca_multiplier:            draft.dca_multiplier,
+        dca_streak_whitelist:      [...(draft.dca_streak_whitelist ?? [])].sort((a, b) => a - b),
+        echo_trigger_streak:    draft.echo_trigger_streak,
+        echo_window_minutes:    draft.echo_window_minutes,
+        echo_signal_min_streak: draft.echo_signal_min_streak,
+        echo_baseline_streak:   draft.echo_baseline_streak,
+        echo_require_high_body: draft.echo_require_high_body,
+        echo_edge_cases:        draft.echo_edge_cases ?? [],
+        echo_dca_scale:         draft.echo_dca_scale ?? [],
+        echo_dca_scale_idle:    draft.echo_dca_scale_idle ?? [],
+        echo_defensive_enabled:          draft.echo_defensive_enabled,
+        echo_defensive_streak_threshold: draft.echo_defensive_streak_threshold,
+        echo_defensive_overdue_minutes:  draft.echo_defensive_overdue_minutes,
+        echo_defensive_action:           draft.echo_defensive_action,
       });
       setFlash(true);
       setTimeout(() => setFlash(false), 1500);
@@ -173,6 +250,20 @@ function CoinRow({
             onChange={v => setDraft({ ...draft, enabled: v })}
             disabled={saving}
           />
+        </td>
+        <td style={S.td}>
+          <select
+            value={draft.strategy}
+            onChange={e => setDraft({ ...draft, strategy: e.target.value as CoinStrategy })}
+            disabled={saving || !draft.enabled}
+            style={S.select}
+            title={draft.strategy === 'echo'
+              ? 'Echo Hunt: only signals in 30min arm window after a high-streak event ends. ~78–96% WR on BTC.'
+              : 'Simple baseline: contrarian whenever |streak| ≥ Auto. ~52% WR.'}
+          >
+            <option value="streak">streak</option>
+            <option value="echo">echo</option>
+          </select>
         </td>
         <td style={S.td}>
           <select
@@ -292,9 +383,177 @@ function CoinRow({
           </button>
         </td>
       </tr>
+      {/* Echo Hunt params — inline second row when strategy=echo. Keeps the
+          main row narrow while making all 4 echo params visible at a glance. */}
+      {draft.strategy === 'echo' && (
+        <tr style={{ background: '#0a0d12' }}>
+          <td colSpan={14} style={{ padding: '8px 24px', borderBottom: '1px solid #21262d' }}>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'center', fontSize: 12 }}>
+              <span style={{ color: '#79c0ff', fontWeight: 600 }}>Echo Hunt:</span>
+              <label style={{ color: '#8b949e' }}
+                     title="Idle baseline threshold — bot uses this when NOT armed (between trigger events).">
+                Baseline streak ≥{' '}
+                <NumInput value={draft.echo_baseline_streak}
+                          min={draft.echo_signal_min_streak} max={20}
+                          disabled={saving || !draft.enabled}
+                          onChange={v => setDraft({ ...draft, echo_baseline_streak: v })} />
+              </label>
+              <label style={{ color: '#8b949e' }}>
+                Trigger streak ≥{' '}
+                <NumInput value={draft.echo_trigger_streak}
+                          min={3} max={20}
+                          disabled={saving || !draft.enabled}
+                          onChange={v => setDraft({ ...draft, echo_trigger_streak: v })} />
+              </label>
+              <label style={{ color: '#8b949e' }}>
+                Arm window (min){' '}
+                <NumInput value={draft.echo_window_minutes}
+                          min={5} max={240}
+                          disabled={saving || !draft.enabled}
+                          onChange={v => setDraft({ ...draft, echo_window_minutes: v })} />
+              </label>
+              <label style={{ color: '#8b949e' }}>
+                Signal streak ≥{' '}
+                <NumInput value={draft.echo_signal_min_streak}
+                          min={1} max={draft.echo_trigger_streak}
+                          disabled={saving || !draft.enabled}
+                          onChange={v => setDraft({ ...draft, echo_signal_min_streak: v })} />
+              </label>
+              <label style={{ color: '#8b949e', display: 'flex', alignItems: 'center', gap: 4 }}
+                     title="V9 filter (IDLE mode only): when streak has no high-body bar (>1.5× avg), bump baseline threshold +2 (e.g. 6→8) to wait for a stronger streak. Armed mode unaffected.">
+                <input type="checkbox"
+                       checked={draft.echo_require_high_body}
+                       disabled={saving || !draft.enabled}
+                       onChange={e => setDraft({ ...draft, echo_require_high_body: e.target.checked })}
+                       style={{ margin: 0 }} />
+                Body filter (idle: bump +2 if no high-body)
+              </label>
+              <label style={{ color: '#8b949e' }}
+                     title="ARMED-mode DCA — comma-separated multipliers indexed by loss-count. e.g. '3,4' = base×3 after L1, base×4 after L2, then stop.">
+                DCA armed{' '}
+                <input
+                  type="text"
+                  value={scaleStr}
+                  disabled={saving || !draft.enabled}
+                  onChange={e => {
+                    const text = e.target.value;
+                    setScaleStr(text);
+                    const parsed = text
+                      .split(',')
+                      .map(s => Number(s.trim()))
+                      .filter(n => Number.isFinite(n) && n > 0);
+                    setDraft({ ...draft, echo_dca_scale: parsed });
+                  }}
+                  placeholder="3,4"
+                  style={{ width: 80, padding: '4px 6px', borderRadius: 4,
+                           border: '1px solid #30363d', background: '#0d1117',
+                           color: '#c9d1d9', fontSize: 12, fontFamily: 'monospace' }}
+                />
+              </label>
+              <label style={{ color: '#8b949e' }}
+                     title="IDLE-mode DCA — separate scale for cycles opened at baseline threshold. Empty = use armed scale (above) for both modes.">
+                DCA idle{' '}
+                <input
+                  type="text"
+                  value={scaleStrIdle}
+                  disabled={saving || !draft.enabled}
+                  onChange={e => {
+                    const text = e.target.value;
+                    setScaleStrIdle(text);
+                    const parsed = text
+                      .split(',')
+                      .map(s => Number(s.trim()))
+                      .filter(n => Number.isFinite(n) && n > 0);
+                    setDraft({ ...draft, echo_dca_scale_idle: parsed });
+                  }}
+                  placeholder="(use armed)"
+                  style={{ width: 90, padding: '4px 6px', borderRadius: 4,
+                           border: '1px solid #30363d', background: '#0d1117',
+                           color: '#c9d1d9', fontSize: 12, fontFamily: 'monospace' }}
+                />
+              </label>
+              <span style={{ color: '#6e7681', fontSize: 11, fontStyle: 'italic' }}>
+                Echo idle → threshold = <b>Baseline streak ≥</b>. Echo armed → threshold = <b>Signal streak ≥</b>.
+                Auto ≥ / Schedule / DCA streaks / DCA mult không áp dụng cho echo.
+              </span>
+              <div style={{ width: '100%', display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginTop: 4, paddingTop: 4, borderTop: '1px solid #21262d' }}>
+                <span style={{ color: '#f0a500', fontWeight: 600, fontSize: 11 }}>Defensive regime:</span>
+                <label style={{ color: '#8b949e', display: 'flex', alignItems: 'center', gap: 4 }}
+                       title="When enabled, bot tracks time since last extreme streak. If gap exceeds the overdue threshold, applies the defensive action.">
+                  <input type="checkbox"
+                         checked={draft.echo_defensive_enabled}
+                         disabled={saving || !draft.enabled}
+                         onChange={e => setDraft({ ...draft, echo_defensive_enabled: e.target.checked })}
+                         style={{ margin: 0 }} />
+                  Enabled
+                </label>
+                <label style={{ color: '#8b949e' }}
+                       title="Streak length that resets the 'last extreme' timer. Default 7.">
+                  Extreme streak ≥{' '}
+                  <NumInput value={draft.echo_defensive_streak_threshold}
+                            min={3} max={20}
+                            disabled={saving || !draft.enabled || !draft.echo_defensive_enabled}
+                            onChange={v => setDraft({ ...draft, echo_defensive_streak_threshold: v })} />
+                </label>
+                <label style={{ color: '#8b949e' }}
+                       title="Minutes since last extreme before bot enters defensive mode. Default 1440 (24h).">
+                  Overdue (min){' '}
+                  <NumInput value={draft.echo_defensive_overdue_minutes}
+                            min={10} max={43200}
+                            disabled={saving || !draft.enabled || !draft.echo_defensive_enabled}
+                            onChange={v => setDraft({ ...draft, echo_defensive_overdue_minutes: v })} />
+                </label>
+                <label style={{ color: '#8b949e' }}
+                       title="disable_armed: bot still trades baseline but never lowers to armed threshold. skip_all: suspend placement entirely.">
+                  Action{' '}
+                  <select value={draft.echo_defensive_action}
+                          disabled={saving || !draft.enabled || !draft.echo_defensive_enabled}
+                          onChange={e => setDraft({ ...draft, echo_defensive_action: e.target.value as 'disable_armed' | 'skip_all' })}
+                          style={{ padding: '2px 6px', borderRadius: 4, border: '1px solid #30363d',
+                                   background: '#0d1117', color: '#c9d1d9', fontSize: 12 }}>
+                    <option value="disable_armed">disable_armed</option>
+                    <option value="skip_all">skip_all</option>
+                  </select>
+                </label>
+              </div>
+              <div style={{ width: '100%', display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginTop: 4, paddingTop: 4, borderTop: '1px solid #21262d' }}>
+                <span style={{ color: '#79c0ff', fontWeight: 600, fontSize: 11 }}>Idle edge-case overrides:</span>
+                <label style={{ color: '#8b949e', display: 'flex', alignItems: 'center', gap: 4 }}
+                       title="A1: streak 3-4 + mean body > 1.5× avg → fire even when threshold not met. WR 58.1% (n=1384) on BTC 180d, +4.5% over baseline.">
+                  <input type="checkbox"
+                         checked={(draft.echo_edge_cases ?? []).includes('short_streak_strong_mean')}
+                         disabled={saving || !draft.enabled}
+                         onChange={e => {
+                           const cur = new Set(draft.echo_edge_cases ?? []);
+                           if (e.target.checked) cur.add('short_streak_strong_mean');
+                           else                  cur.delete('short_streak_strong_mean');
+                           setDraft({ ...draft, echo_edge_cases: Array.from(cur) as EchoEdgeCase[] });
+                         }}
+                         style={{ margin: 0 }} />
+                  A1: streak 3-4 + strong mean body
+                </label>
+                <label style={{ color: '#8b949e', display: 'flex', alignItems: 'center', gap: 4 }}
+                       title="A3: streak 5-7 + ≥1 very-extreme body bar (>4× avg) → fire. WR 58.5% (n=217) on BTC 180d, +6.2% over baseline.">
+                  <input type="checkbox"
+                         checked={(draft.echo_edge_cases ?? []).includes('mid_streak_very_extreme')}
+                         disabled={saving || !draft.enabled}
+                         onChange={e => {
+                           const cur = new Set(draft.echo_edge_cases ?? []);
+                           if (e.target.checked) cur.add('mid_streak_very_extreme');
+                           else                  cur.delete('mid_streak_very_extreme');
+                           setDraft({ ...draft, echo_edge_cases: Array.from(cur) as EchoEdgeCase[] });
+                         }}
+                         style={{ margin: 0 }} />
+                  A3: streak 5-7 + very-extreme bar
+                </label>
+              </div>
+            </div>
+          </td>
+        </tr>
+      )}
       {scheduleOpen && (
         <tr style={{ background: '#0a0d12' }}>
-          <td colSpan={13} style={{ padding: '12px 24px', borderBottom: '1px solid #21262d' }}>
+          <td colSpan={14} style={{ padding: '12px 24px', borderBottom: '1px solid #21262d' }}>
             <ScheduleEditor
               value={draft.auto_schedule ?? []}
               baseThreshold={draft.auto_order_min_streak}
@@ -306,7 +565,7 @@ function CoinRow({
       )}
       {dcaOpen && (
         <tr style={{ background: '#0a0d12' }}>
-          <td colSpan={13} style={{ padding: '12px 24px', borderBottom: '1px solid #21262d' }}>
+          <td colSpan={14} style={{ padding: '12px 24px', borderBottom: '1px solid #21262d' }}>
             <DcaWhitelistEditor
               value={draft.dca_streak_whitelist ?? []}
               disabled={saving || !draft.enabled}
@@ -317,7 +576,7 @@ function CoinRow({
       )}
       {err && (
         <tr>
-          <td colSpan={13} style={{ ...S.td, color: '#f85149', fontSize: 11 }}>
+          <td colSpan={14} style={{ ...S.td, color: '#f85149', fontSize: 11 }}>
             {err}
           </td>
         </tr>

@@ -64,6 +64,16 @@ export interface SignalT4Event {
   currentIcon:   string;
   /** Volume bucket per streak candle, oldest → newest, length = |streak|. */
   streakVolumeBuckets: VolumeBucket[];
+  /** True if at least 1 streak bar's body > 1.5× the 48-bar avg body.
+   *  Used by echo's optional require-high-body gate (V9 from analysis). */
+  bodyHasHigh?:  boolean;
+  /** True if at least 1 streak bar's body < 0.5× avg (informational). */
+  bodyHasTiny?:  boolean;
+  /** Mean body ratio across streak bars. Drives edge case A1 (idle override). */
+  meanBodyRatio?: number;
+  /** True if any streak bar's body > 4× avg (extreme climax candle).
+   *  Drives edge case A3 (idle override). */
+  bodyHasVeryExtreme?: boolean;
   limitCents:    number;
   emittedAt:     number;
 }
@@ -120,23 +130,92 @@ export interface SignalT0Event {
   emittedAt:     number;
 }
 
+/**
+ * Stats over inter-event gaps between consecutive extreme streaks observed in
+ * the backfill window. Used by the FE to calibrate `echo_defensive_overdue_minutes`
+ * (e.g. setting overdue ≈ p90 means defensive only fires when the gap is in the
+ * worst 10% of historical gaps). All durations in ms; FE picks display unit.
+ */
+export interface DefensiveGapStats {
+  /** Number of inter-event gaps measured (= events - 1). */
+  count:  number;
+  p10Ms:  number;
+  p50Ms:  number;
+  p90Ms:  number;
+  maxMs:  number;
+  meanMs: number;
+}
+
+/**
+ * Echo Hunt arm-window state. Published by PMW whenever the state transitions
+ * (idle → armed, armed → expired, or arm refreshed by a fresh trigger). NOT
+ * emitted on every tick — only on changes — so the channel stays quiet
+ * (~1-2 events per coin per arm cycle, vs hundreds of T+4/T-3s).
+ */
+export interface SignalEchoStateEvent {
+  type:           'echo_state';
+  coin:           CoinSymbol;
+  /** true when now ≤ armEndAt (in arm window). */
+  armed:          boolean;
+  /** ms timestamp of the most recent trigger (run end ≥ echo_trigger_streak). */
+  lastTriggerAt:  number | null;
+  /** ms timestamp when arm window expires (= lastTriggerAt + window_minutes×60s). */
+  armEndAt:       number | null;
+  // Threshold context — included so the FE can show the live state without
+  // re-fetching coin_configs. All three are streak length values.
+  /** Current effective placement threshold (= armedThreshold if armed, else baselineThreshold). */
+  threshold:        number;
+  /** echo_baseline_streak (idle threshold). */
+  baselineThreshold: number;
+  /** echo_signal_min_streak (armed threshold). */
+  armedThreshold:   number;
+  /** echo_trigger_streak. */
+  triggerThreshold: number;
+  // ── Defensive layer state ──────────────────────────────────────────────
+  /** Whether the defensive layer is enabled in cfg. */
+  defensiveEnabled: boolean;
+  /** Whether bot is CURRENTLY in defensive mode. */
+  defensiveActive:  boolean;
+  /** Action taken when defensive: 'disable_armed' or 'skip_all'. */
+  defensiveAction:  'disable_armed' | 'skip_all';
+  /** ms timestamp of last extreme streak observed (≥ defensive threshold).
+   *  null = never observed (treated as overdue). */
+  lastExtremeStreakAt: number | null;
+  /** ms timestamp when defensive will activate (= lastExtremeStreakAt +
+   *  overdue_minutes × 60_000). null when lastExtremeStreakAt is null. */
+  defensiveActivatesAt: number | null;
+  /** Streak threshold that resets the defensive timer. */
+  defensiveStreakThreshold: number;
+  /** Configured overdue duration (minutes) for defensive activation. Mirrors
+   *  `cfg.echo_defensive_overdue_minutes` so FE doesn't have to fetch the
+   *  config separately. */
+  defensiveOverdueMinutes: number;
+  /** Inter-event gap percentiles from the 30-day backfill at startup. null
+   *  when the backfill saw fewer than 2 extreme events (no gaps to measure). */
+  defensiveGapStats: DefensiveGapStats | null;
+  emittedAt:      number;
+}
+
 export type SignalBusEvent =
-  | SignalT0PlusEvent | SignalT4Event | SignalTMinus3Event | SignalT0Event;
+  | SignalT0PlusEvent | SignalT4Event | SignalTMinus3Event | SignalT0Event
+  | SignalEchoStateEvent;
 
 // ── Channel names ──────────────────────────────────────────────────────────
 
-const CHANNEL_T0PLUS = 'signal:T+0';
-const CHANNEL_T4     = 'signal:T+4';
-const CHANNEL_T3    = 'signal:T-3s';
-const CHANNEL_T0     = 'signal:T-0';
-const ALL_CHANNELS   = [CHANNEL_T0PLUS, CHANNEL_T4, CHANNEL_T3, CHANNEL_T0] as const;
+const CHANNEL_T0PLUS    = 'signal:T+0';
+const CHANNEL_T4        = 'signal:T+4';
+const CHANNEL_T3        = 'signal:T-3s';
+const CHANNEL_T0        = 'signal:T-0';
+const CHANNEL_ECHO      = 'signal:echo_state';
+const ALL_CHANNELS      = [CHANNEL_T0PLUS, CHANNEL_T4, CHANNEL_T3, CHANNEL_T0, CHANNEL_ECHO] as const;
 
 function channelFor(ev: SignalBusEvent): string {
   switch (ev.type) {
-    case 'T+0':   return CHANNEL_T0PLUS;
-    case 'T+4':   return CHANNEL_T4;
-    case 'T-3s': return CHANNEL_T3;
-    case 'T-0':   return CHANNEL_T0;
+    case 'T+0':        return CHANNEL_T0PLUS;
+    case 'T+4':        return CHANNEL_T4;
+    case 'T-3s':       return CHANNEL_T3;
+    case 'T-0':        return CHANNEL_T0;
+    case 'echo_state': return CHANNEL_ECHO;
   }
 }
 

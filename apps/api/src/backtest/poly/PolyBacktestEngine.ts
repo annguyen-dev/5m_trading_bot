@@ -75,12 +75,17 @@ export async function runPolyBacktest(
     } else {
       stillUnknown++;
     }
+    // Body for V9 high-body filter — abs(close - open) when both prices known.
+    const o = r.open_price != null ? Number(r.open_price)  : null;
+    const c = r.close_price != null ? Number(r.close_price) : null;
+    const body = (o != null && c != null) ? Math.abs(c - o) : undefined;
     return {
       windowStart: Number(r.window_start),
       windowEnd:   Number(r.window_end),
       tokenUp:     r.token_up,
       tokenDown:   r.token_down,
       outcome,
+      ...(body !== undefined ? { body } : {}),
     };
   });
 

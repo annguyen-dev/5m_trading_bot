@@ -151,6 +151,33 @@ interface SuggestedConfig {
   reasoning:             string;
 }
 
+/**
+ * "Gap analysis": how often does a high-streak event recur?
+ * Used by the new strategy that arms a trading window for ~30min–2h30 after
+ * any streak ≥ N occurrence (the assumption being mean-reversion / volatility
+ * clustering after extremes).
+ */
+interface StreakGapBucket {
+  thresholdLength: number;     // N
+  occurrences:     number;
+  /** Gaps in minutes between consecutive run-ends where |length| ≥ N.
+   *  All zero if occurrences < 2 (nothing to measure). */
+  meanGapMin:      number;
+  medianGapMin:    number;
+  p10GapMin:       number;     // shortest typical gap (recurrence floor)
+  p90GapMin:       number;     // longest typical gap
+  maxGapMin:       number;
+}
+
+interface StreakGapEvent {
+  endedAt:      number;          // unix ms — run ended (= "đảo chiều")
+  signed:       number;          // signed length (+UP, -DOWN)
+  length:       number;          // abs
+  /** Minutes since the prior run with |length| ≥ 5 (lowest threshold).
+   *  null for the first such event in the analysis range. */
+  gapBeforeMin: number | null;
+}
+
 interface StreakStatsResponse {
   coin:           string;
   rangeStartMs:   number;
@@ -175,6 +202,12 @@ interface StreakStatsResponse {
     bigCount:  number;
     totalBars: number;
   }>;
+  streakGaps: {
+    /** One row per threshold N (5, 6, 7, 8). */
+    byThreshold:  StreakGapBucket[];
+    /** Most recent ≤ 20 events with |length| ≥ 5 (lowest threshold), newest first. */
+    recentEvents: StreakGapEvent[];
+  };
   suggested:        SuggestedConfig;
 }
 
@@ -361,6 +394,54 @@ export async function getStreakStats(req: Request, res: Response): Promise<void>
       totalBars: dowCounts[d]!.total,
     }));
 
+    // Streak gap analysis: for each threshold N in [5,6,7,8], measure time
+    // between consecutive run-ends where |length| ≥ N. Drives the new
+    // "trade-after-extreme" strategy — knowing avg recurrence interval lets
+    // the user pick a sensible armed window (e.g. T+30m → T+median gap).
+    const GAP_THRESHOLDS = [5, 6, 7, 8] as const;
+    const RECENT_EVENT_MIN = 5;       // lowest threshold for the recent list
+    const RECENT_EVENT_LIMIT = 20;
+    const sortedRuns = [...runs].sort((a, b) => a.endedAt - b.endedAt);
+    const byThreshold: StreakGapBucket[] = GAP_THRESHOLDS.map(N => {
+      const events = sortedRuns.filter(r => Math.abs(r.signed) >= N);
+      if (events.length < 2) {
+        return {
+          thresholdLength: N, occurrences: events.length,
+          meanGapMin: 0, medianGapMin: 0, p10GapMin: 0, p90GapMin: 0, maxGapMin: 0,
+        };
+      }
+      const gaps: number[] = [];
+      for (let i = 1; i < events.length; i++) {
+        gaps.push((events[i]!.endedAt - events[i - 1]!.endedAt) / 60_000);
+      }
+      return {
+        thresholdLength: N,
+        occurrences:     events.length,
+        meanGapMin:      gaps.reduce((a, b) => a + b, 0) / gaps.length,
+        medianGapMin:    pctl(gaps, 0.50),
+        p10GapMin:       pctl(gaps, 0.10),
+        p90GapMin:       pctl(gaps, 0.90),
+        maxGapMin:       Math.max(...gaps),
+      };
+    });
+    // Recent events: last N events with |length| >= RECENT_EVENT_MIN, with
+    // gap-from-prior-event computed against the FULL filtered list (so the
+    // "first row in the slice" still has a meaningful gap if a prior event
+    // exists outside the displayed window).
+    const recentAll = sortedRuns.filter(r => Math.abs(r.signed) >= RECENT_EVENT_MIN);
+    const sliceStart = Math.max(0, recentAll.length - RECENT_EVENT_LIMIT);
+    const recentSlice = recentAll.slice(sliceStart);
+    const recentEvents: StreakGapEvent[] = recentSlice.map((r, i) => {
+      const fullIdx = sliceStart + i;
+      const prev = fullIdx > 0 ? recentAll[fullIdx - 1]! : null;
+      return {
+        endedAt:      r.endedAt,
+        signed:       r.signed,
+        length:       Math.abs(r.signed),
+        gapBeforeMin: prev ? (r.endedAt - prev.endedAt) / 60_000 : null,
+      };
+    }).reverse();   // newest first for UI
+
     const suggested = suggestConfig(streakLengths, bars.length);
 
     const body: StreakStatsResponse = {
@@ -374,6 +455,7 @@ export async function getStreakStats(req: Request, res: Response): Promise<void>
       postExtreme,
       hourlyHotness,
       dayOfWeekHotness,
+      streakGaps:       { byThreshold, recentEvents },
       suggested,
     };
     res.json(body);

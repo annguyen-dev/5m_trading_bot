@@ -197,12 +197,19 @@ export class PolymarketClobExecutor {
    * With FAK we take whatever's available, log the actual filled amount,
    * and the caller can re-attempt for residual shares if any remain.
    *
-   * Returns the CLOB orderID. Caller should inspect resp.makingAmount to
-   * compare requested vs actually-sold shares (logged at info level here).
+   * Returns:
+   *   orderID       — CLOB order id (always present on success)
+   *   filledShares  — `resp.makingAmount` parsed (shares actually sold; 0 = full kill)
+   *   filledUsdc    — `resp.takingAmount` parsed (USDC actually received)
+   *   avgFillPrice  — filledUsdc / filledShares (NaN when filledShares=0)
+   *
+   * Caller MUST use `avgFillPrice` (not the bid at trigger) when recording
+   * exit_price + computing PnL — FAK can fill across multiple price levels,
+   * and the WS bid stream is sometimes stale during chaotic moves.
    */
   async placeMarketSell(
     tokenID: string, shares: number,
-  ): Promise<string> {
+  ): Promise<{ orderID: string; filledShares: number; filledUsdc: number; avgFillPrice: number }> {
     const client = this.mustClient();
     log('info', 'CLOB market SELL attempt', {
       tokenID, shares,
@@ -212,8 +219,14 @@ export class PolymarketClobExecutor {
     // Throw on resp.success=false INSIDE retry callback (same reasoning as
     // placeMarketBuy) so withRetry can classify + retry transient failures.
     const resp: OrderResponse = await withRetry('CLOB market SELL', async () => {
+      // `price: 0.01` is the FLOOR (SELL semantics: accept any bid ≥ this).
+      // Without it, the SDK defaults price to 1.0 (see clob-client-v2
+      // buildMarketOrderCreationArgs: `userMarketOrder.price || 1`), which
+      // some Polymarket markets reject with "invalid price (0.999), max: 0.99".
+      // 0.01 means "I'll accept any reasonable bid"; CLOB matches against
+      // the highest bids first, so we still get best execution.
       const r: OrderResponse = await client.createAndPostMarketOrder(
-        { tokenID, amount: shares, side: Side.SELL, orderType: OrderType.FAK },
+        { tokenID, amount: shares, price: 0.01, side: Side.SELL, orderType: OrderType.FAK },
         undefined,
         OrderType.FAK,
       );
@@ -222,14 +235,18 @@ export class PolymarketClobExecutor {
       }
       return r;
     }, { maxAttempts: 5, baseDelayMs: 300 });
+    const filledShares = Number(resp.makingAmount ?? 0);
+    const filledUsdc   = Number(resp.takingAmount ?? 0);
+    const avgFillPrice = filledShares > 0 ? filledUsdc / filledShares : NaN;
     log('info', 'CLOB market SELL response (FAK)', {
       tokenID, requested_shares: shares,
       makingAmount: resp.makingAmount,    // shares actually sold
       takingAmount: resp.takingAmount,    // USDC actually received
+      avgFillPrice,
       status: resp.status,
       success: resp.success,
     });
-    return resp.orderID!;
+    return { orderID: resp.orderID!, filledShares, filledUsdc, avgFillPrice };
   }
 
   /**

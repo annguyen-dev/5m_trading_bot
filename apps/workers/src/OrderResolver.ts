@@ -145,6 +145,12 @@ export class OrderResolver {
     const ids = this.ordersByToken.get(tick.tokenId);
     if (!ids || ids.size === 0) return;
     const bidCents = tick.bestBid * 100;
+    // Guard: WS occasionally publishes bid=0 during transient outages /
+    // book-empty moments. Observed prod cases where cached bid=0 fired SL but
+    // the actual FAK fill came at 0.50-0.99 — i.e. the WS was stale, not the
+    // book. Skip; if bid is genuinely 0 the next tick will repeat and
+    // resolveAtClose will handle it via binary settlement.
+    if (tick.bestBid === 0) return;
     const now = Date.now();
     const slGlobal = await getAutoOrderSlCents();   // cached per-tick (cheap; Postgres hit but rare)
 
@@ -201,11 +207,19 @@ export class OrderResolver {
     }
   }
 
-  /** Mid-window exit rule (tick-based). TP is normally a resting GTC limit
-   *  on CLOB (placed at BUY time) — fills passively, no polling needed.
-   *  This path runs for fallbacks (simulate mode, or live mode where
-   *  placeLimitSell failed). SL is also handled here as a 5s-polling
-   *  fallback; the primary SL path is event-driven in handleShareTick. */
+  /** Mid-window exit rule (tick-based).
+   *
+   *  TP — live mode: ONLY via the resting GTC limit placed at BUY time. No
+   *  market-sell fallback here, even if the limit failed to place: market
+   *  sell during last-second price flicker can fill BELOW tpCents, which
+   *  defeats the point of TP. If the resting limit didn't fill, let the
+   *  window settle naturally (binary outcome).
+   *
+   *  TP — simulate mode: market-sell triggers as before (for backtest
+   *  fidelity — models the case where the limit would have filled at bid).
+   *
+   *  SL — both modes: 5s-polling fallback to event-driven `handleShareTick`.
+   *  Always uses market sell (must exit at any price). */
   private async checkTpSl(
     o: PendingOrderRow, tpCents: number, slCents: number, slDisabled: boolean,
   ): Promise<void> {
@@ -241,10 +255,15 @@ export class OrderResolver {
       bid = brows[0]?.best_bid != null ? Number(brows[0].best_bid) : null;
     }
     if (bid == null) return;
+    // WS-stale guard (see handleShareTick comment): bid=0 is treated as
+    // "feed unreliable, hold position" — never a SL trigger.
+    if (bid === 0) return;
 
     const bidCents = bid * 100;
     let reason: 'tp' | 'sl' | null = null;
-    if (!tpRestingOnClob && bidCents >= tpCents) {
+    // TP market-sell trigger only in simulate mode; live relies solely on the
+    // resting CLOB limit (see function header).
+    if (o.mode !== 'live' && !tpRestingOnClob && bidCents >= tpCents) {
       reason = 'tp';
     } else if (!slDisabled && bidCents <= slCents) {
       reason = 'sl';
@@ -255,7 +274,14 @@ export class OrderResolver {
   }
 
   /** Shared close logic for TP/SL triggers. Handles CLOB market SELL
-   *  (live mode, cancelling any resting TP limit first) and DB updates. */
+   *  (live mode, cancelling any resting TP limit first) and DB updates.
+   *
+   *  exit_price recording: uses the ACTUAL FAK fill VWAP (`takingAmount /
+   *  makingAmount`) — NOT the bid at trigger time. The WS bid stream is
+   *  sometimes stale during chaotic moves (we've seen bid=0 cached while
+   *  real book had bids at 0.99), and FAK matches across multiple price
+   *  levels. Recording bid-at-trigger underreports real PnL by $5+ per
+   *  order in some cases. */
   private async closeOrderAt(
     o: PendingOrderRow, tokenId: string, bid: number,
     reason: 'tp' | 'sl',
@@ -263,7 +289,8 @@ export class OrderResolver {
   ): Promise<void> {
     const pool = getPool();
     const sharesOwned = o.size_usdc / o.share_price;
-    const exitPrice = bid;
+    let exitPrice = bid;          // simulate mode + initial fallback
+    let actualShares = sharesOwned;
 
     if (o.mode === 'live') {
       const ex = getClobExecutor();
@@ -279,9 +306,20 @@ export class OrderResolver {
         }
       }
       try {
-        await ex.placeMarketSell(tokenId, sharesOwned);
+        const fill = await ex.placeMarketSell(tokenId, sharesOwned);
+        if (fill.filledShares <= 0 || !Number.isFinite(fill.avgFillPrice)) {
+          // Full FAK kill — no fill at all. Don't close DB; next tick retries.
+          log('warn', 'OrderResolver market SELL: 0 shares filled, retrying', {
+            id: o.id, reason, requested: sharesOwned, fill,
+          });
+          return;
+        }
+        exitPrice    = fill.avgFillPrice;
+        actualShares = fill.filledShares;
         log('info', `OrderResolver ${reason.toUpperCase()} live-sold`, {
-          id: o.id, bid, shares: sharesOwned,
+          id: o.id, bid_at_trigger: bid, actual_fill_price: exitPrice,
+          actual_shares: actualShares, requested_shares: sharesOwned,
+          filled_usdc: fill.filledUsdc, orderID: fill.orderID,
         });
       } catch (err) {
         log('warn', 'OrderResolver market SELL failed, will retry next tick', {
@@ -291,7 +329,7 @@ export class OrderResolver {
       }
     }
 
-    const pnl = (exitPrice - o.share_price) * sharesOwned;
+    const pnl = (exitPrice - o.share_price) * actualShares;
     const now = Date.now();
     // 1. Close BUY with the realized pnl + exit price
     await pool.query(

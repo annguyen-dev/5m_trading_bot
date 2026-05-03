@@ -27,6 +27,8 @@
 
 import { EventEmitter } from 'events';
 import { PolymarketService, type PolyClobMarket, type ShareTick } from '@trading-bot/core/PolymarketService';
+import type { SignalEchoStateEvent } from '@trading-bot/core/SignalBus';
+import type { CoinSymbol } from '@trading-bot/core/CoinConfig';
 import { FutureTickScanner, type FutureTick } from './FutureTickScanner.js';
 import { BinanceFastTicker, type FastTick } from './BinanceFastTicker.js';
 import { log } from '../observability/logger.js';
@@ -46,6 +48,10 @@ export interface EngineSnapshot {
   scan:           FutureTick | null;
   /** Most recent streak-based signal (null if none emitted yet this window). */
   lastSignal:     unknown | null;
+  /** Latest echo_state per coin — populated whenever the bus emits an
+   *  echo_state event. Lets new SSE clients render the echo/defensive panel
+   *  immediately on page load instead of waiting for the next state change. */
+  echoStates:     Partial<Record<CoinSymbol, SignalEchoStateEvent>>;
   connected: {
     polymarket: boolean;
     binanceWs:  boolean;
@@ -63,6 +69,7 @@ export class LiveTradingEngine extends EventEmitter {
   private btc:  { price: number; ts: number } | null = null;
   private scan: FutureTick | null = null;
   private lastSignal: unknown | null = null;
+  private echoStates = new Map<CoinSymbol, SignalEchoStateEvent>();
   private refreshTimer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -99,11 +106,21 @@ export class LiveTradingEngine extends EventEmitter {
       btc:           this.btc,
       scan:          this.scan,
       lastSignal:    this.lastSignal,
+      echoStates:    Object.fromEntries(this.echoStates) as Partial<Record<CoinSymbol, SignalEchoStateEvent>>,
       connected: {
         polymarket: this.poly.isConnected(),
         binanceWs:  this.fast.isConnected(),
       },
     };
+  }
+
+  /**
+   * External hook for the bus → engine bridge to record latest echo state per
+   * coin. Stored so new SSE clients see current state on snapshot, not just
+   * on the next transition. Caller should also fan out via `engine.emit`.
+   */
+  recordEchoState(ev: SignalEchoStateEvent): void {
+    this.echoStates.set(ev.coin, ev);
   }
 
   private wire(): void {

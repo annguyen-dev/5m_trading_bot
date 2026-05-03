@@ -29,15 +29,31 @@ const DEFAULT_CONFIG: CoinConfig = {
   sl_cents:              25,
   dca_multiplier:        1.5,
   dca_streak_whitelist:  [],
+  echo_trigger_streak:    5,
+  echo_window_minutes:    30,
+  echo_signal_min_streak: 4,
+  echo_baseline_streak:   6,
+  echo_require_high_body: true,
+  echo_edge_cases:        [],
+  echo_dca_scale:         [3, 4],
+  echo_dca_scale_idle:    [],
+  echo_defensive_enabled:           false,
+  echo_defensive_streak_threshold:  7,
+  echo_defensive_overdue_minutes:   1440,
+  echo_defensive_action:            'disable_armed',
 };
 
 /** GET /api/coin-configs → array of { symbol, ...config } for all 7 coins. */
 export async function listCoinConfigs(_req: Request, res: Response): Promise<void> {
   try {
     const all = await getAllCoinConfigs();
+    // Merge over DEFAULT_CONFIG so configs saved BEFORE a field existed (e.g.
+    // pre-echo BTC config) still expose defaults for the newer fields. Without
+    // this, FE renders empty inputs and validation fails on otherwise-saved coins.
     const rows = ALL_COINS.map(sym => ({
       symbol: sym,
-      ...(all[sym] ?? DEFAULT_CONFIG),
+      ...DEFAULT_CONFIG,
+      ...(all[sym] ?? {}),
     }));
     res.json(rows);
   } catch (err) {
@@ -55,7 +71,7 @@ const autoScheduleEntrySchema = z.object({
 
 const patchSchema = z.object({
   enabled:               z.boolean().optional(),
-  strategy:              z.enum(['streak']).optional(),
+  strategy:              z.enum(['streak', 'echo']).optional(),
   mode:                  z.enum(['signal_only', 'signal_and_order']).optional(),
   streak_min:            z.number().int().min(1).max(20).optional(),
   auto_order_min_streak: z.number().int().min(1).max(20).optional(),
@@ -66,6 +82,20 @@ const patchSchema = z.object({
   sl_cents:              z.number().int().min(1).max(99).optional(),
   dca_multiplier:        z.number().min(1.0).max(10.0).optional(),
   dca_streak_whitelist:  z.array(z.number().int().min(2).max(20)).max(20).optional(),
+  // Echo Hunt params (only relevant when strategy='echo'). Loose ranges —
+  // the FE enforces logical relationships (signal ≤ trigger ≤ disable).
+  echo_trigger_streak:    z.number().int().min(1).max(20).optional(),
+  echo_window_minutes:    z.number().int().min(1).max(240).optional(),
+  echo_signal_min_streak: z.number().int().min(1).max(20).optional(),
+  echo_baseline_streak:   z.number().int().min(1).max(20).optional(),
+  echo_require_high_body: z.boolean().optional(),
+  echo_edge_cases:        z.array(z.enum(['short_streak_strong_mean', 'mid_streak_very_extreme'])).max(8).optional(),
+  echo_dca_scale:         z.array(z.number().min(1).max(20)).max(10).optional(),
+  echo_dca_scale_idle:    z.array(z.number().min(1).max(20)).max(10).optional(),
+  echo_defensive_enabled:          z.boolean().optional(),
+  echo_defensive_streak_threshold: z.number().int().min(3).max(20).optional(),
+  echo_defensive_overdue_minutes:  z.number().int().min(10).max(43200).optional(),  // 10min..30d
+  echo_defensive_action:           z.enum(['disable_armed', 'skip_all']).optional(),
 }).strict();
 
 export async function updateCoinConfigHandler(

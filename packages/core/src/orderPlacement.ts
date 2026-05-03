@@ -167,15 +167,56 @@ async function createExitOrders(
   const shares = Math.floor(sharesExact * 100) / 100;
   const tpPrice = tpCents / 100;
 
-  // TP is always DB-watched now. We used to try a resting GTC limit SELL on
-  // CLOB for passive fills, but Polymarket rejects limit orders for small
-  // share counts (and our typical bot orders are small). OrderResolver polls
-  // the bid each tick and fires a MARKET SELL when bid >= TP price — same
-  // mechanism that already handles SL.
+  // TP = resting GTC limit SELL on CLOB at tpPrice. Filed alongside the BUY
+  // so the exit price floor is enforced by CLOB matching engine — eliminates
+  // the "TP fired at bid but actually filled lower" bug from market-sell exits
+  // during last-second price flicker.
   //
-  // tpClobId stays null → in OrderResolver, `tpRestingOnClob` is false →
-  // bid-trigger path runs unconditionally for TP just like SL.
-  const tpClobId: string | null = null;
+  // SKIPPED for DCA orders: boundary BUY at T-3s of N already placed a TP
+  // limit that locks the YES token pool for that market+direction. DCA at
+  // T+0 of N adds shares to the SAME pool; placing a 2nd TP limit fails with
+  // "balance is not enough" because the boundary's TP has all shares locked.
+  // For DCA, OrderResolver's market-sell-on-trigger path handles exit (with
+  // the P0 accounting fix that captures actual FAK fill price).
+  //
+  // Failure modes (all fall back to tpClobId=null → OrderResolver's bid-trigger
+  // market-sell path runs as before):
+  //   - Polymarket rejects size (e.g. share count below tick floor)
+  //   - CTF balance hasn't settled in time (waitForTokenBalance timeout)
+  //   - Network / CLOB transient error
+  let tpClobId: string | null = null;
+  const isDca = p.signalPath === 'dca';
+  if (mode === 'live' && shares > 0 && tpCents > 0 && !isDca) {
+    const ex = getClobExecutor();
+    if (ex) {
+      try {
+        // Polymarket has 1-3s lag between BUY fill and CTF balance credit;
+        // limit SELL would otherwise reject with "not enough balance".
+        // Bumped from 8s → 15s after observing settled=0 cases on prod.
+        const settled = await ex.waitForTokenBalance(tokenID, shares * 0.99, 15000);
+        const sellSize = Math.floor(settled * 100) / 100;
+        if (sellSize > 0) {
+          tpClobId = await ex.placeLimitSell(tokenID, tpPrice, sellSize);
+          log('info', 'TP resting limit placed', {
+            buyId, tokenID, tpPrice, sellSize, clobOrderId: tpClobId,
+          });
+        } else {
+          log('warn', 'TP resting limit skipped: balance not settled', {
+            buyId, tokenID, expected: shares, settled,
+          });
+        }
+      } catch (err) {
+        log('warn', 'TP resting limit failed, will fall back to market-sell on trigger', {
+          buyId, tokenID, tpPrice, shares,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  } else if (mode === 'live' && isDca) {
+    log('info', 'TP resting limit skipped for DCA order (boundary holds the pool lock)', {
+      buyId, tokenID,
+    });
+  }
   const tpShares = shares;
   const tpSizeUsdc = shares * tpPrice;
 

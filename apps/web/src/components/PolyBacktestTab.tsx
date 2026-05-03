@@ -44,16 +44,29 @@ export default function PolyBacktestTab() {
         const btc = rows.find((r: CoinConfigRow) => r.symbol === 'BTC');
         if (!btc) { setConfigError('BTC not found in coin_configs'); return; }
         setConfig({
-          symbol:                'BTC',
-          size_usdc:             btc.size_usdc,
-          streak_min:            btc.streak_min,
-          auto_order_min_streak: btc.auto_order_min_streak,
-          limit_price_cents:     btc.limit_price_cents,
-          tp_cents:              btc.tp_cents,
-          sl_cents:              btc.sl_cents,
-          dca_multiplier:        btc.dca_multiplier,
-          dca_streak_whitelist:  btc.dca_streak_whitelist ?? [],
-          auto_schedule:         btc.auto_schedule ?? [],
+          symbol:                    'BTC',
+          strategy:                  btc.strategy ?? 'streak',
+          size_usdc:                 btc.size_usdc,
+          streak_min:                btc.streak_min,
+          auto_order_min_streak:     btc.auto_order_min_streak,
+          limit_price_cents:         btc.limit_price_cents,
+          tp_cents:                  btc.tp_cents,
+          sl_cents:                  btc.sl_cents,
+          dca_multiplier:            btc.dca_multiplier,
+          dca_streak_whitelist:      btc.dca_streak_whitelist ?? [],
+          auto_schedule:             btc.auto_schedule ?? [],
+          echo_trigger_streak:    btc.echo_trigger_streak    ?? 5,
+          echo_window_minutes:    btc.echo_window_minutes    ?? 30,
+          echo_signal_min_streak: btc.echo_signal_min_streak ?? 4,
+          echo_baseline_streak:   btc.echo_baseline_streak   ?? 6,
+          echo_require_high_body: btc.echo_require_high_body ?? true,
+          echo_edge_cases:        btc.echo_edge_cases        ?? [],
+          echo_dca_scale:         btc.echo_dca_scale         ?? [3, 4],
+          echo_dca_scale_idle:    btc.echo_dca_scale_idle    ?? [],
+          echo_defensive_enabled:          btc.echo_defensive_enabled          ?? false,
+          echo_defensive_streak_threshold: btc.echo_defensive_streak_threshold ?? 7,
+          echo_defensive_overdue_minutes:  btc.echo_defensive_overdue_minutes  ?? 1440,
+          echo_defensive_action:           btc.echo_defensive_action           ?? 'disable_armed',
         });
       })
       .catch(e => setConfigError(String(e)));
@@ -204,36 +217,186 @@ function ConfigGrid({
   const set = <K extends keyof PolyBacktestCoinConfig>(k: K, v: PolyBacktestCoinConfig[K]) =>
     onChange({ ...config, [k]: v });
 
+  const isEcho = config.strategy === 'echo';
+
+  // Raw text state for the DCA scale inputs (armed + idle).
+  const [scaleStr, setScaleStr] = useState<string>(
+    () => (config.echo_dca_scale ?? []).join(','),
+  );
+  const [scaleStrIdle, setScaleStrIdle] = useState<string>(
+    () => (config.echo_dca_scale_idle ?? []).join(','),
+  );
+  useEffect(() => {
+    const parsed = scaleStr.split(',').map(s => Number(s.trim()))
+      .filter(n => Number.isFinite(n) && n > 0);
+    const upstream = config.echo_dca_scale ?? [];
+    const same = parsed.length === upstream.length && parsed.every((v, i) => v === upstream[i]);
+    if (!same) setScaleStr(upstream.join(','));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config.echo_dca_scale]);
+  useEffect(() => {
+    const parsed = scaleStrIdle.split(',').map(s => Number(s.trim()))
+      .filter(n => Number.isFinite(n) && n > 0);
+    const upstream = config.echo_dca_scale_idle ?? [];
+    const same = parsed.length === upstream.length && parsed.every((v, i) => v === upstream[i]);
+    if (!same) setScaleStrIdle(upstream.join(','));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config.echo_dca_scale_idle]);
+
   return (
     <div style={S.configGrid}>
+      <div style={{ gridColumn: '1 / -1', display: 'flex', gap: 8, alignItems: 'center', marginBottom: 4 }}>
+        <span style={{ fontSize: 12, color: '#8b949e', minWidth: 90 }}>Strategy</span>
+        <select value={config.strategy}
+                onChange={e => set('strategy', e.target.value as 'streak' | 'echo')}
+                style={{ padding: '4px 8px', borderRadius: 4,
+                         border: '1px solid #30363d', background: '#0d1117',
+                         color: '#c9d1d9', fontSize: 12 }}>
+          <option value="streak">streak (baseline)</option>
+          <option value="echo">echo (arm-window)</option>
+        </select>
+      </div>
       <Field label="Size $"           value={config.size_usdc}             onChange={n => set('size_usdc', n)} />
-      <Field label="Streak min"       value={config.streak_min}            onChange={n => set('streak_min', n)} />
-      <Field label="Auto ≥"           value={config.auto_order_min_streak} onChange={n => set('auto_order_min_streak', n)} />
       <Field label="Limit ¢"          value={config.limit_price_cents}     onChange={n => set('limit_price_cents', n)} />
       <Field label="TP ¢"             value={config.tp_cents}              onChange={n => set('tp_cents', n)} />
       <Field label="SL ¢"             value={config.sl_cents}              onChange={n => set('sl_cents', n)} />
-      <Field label="DCA mult"         value={config.dca_multiplier}        step={0.1} onChange={n => set('dca_multiplier', n)} />
-      <div style={{ gridColumn: '1 / -1', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-        <span style={{ fontSize: 12, color: '#8b949e', minWidth: 90 }}>DCA whitelist</span>
-        {Array.from({ length: 14 }, (_, i) => i + 2).map(n => {
-          const on = config.dca_streak_whitelist.includes(n);
-          return (
-            <button key={n} style={{ ...S.chip,
-              background: on ? '#1a4731' : 'transparent',
-              color:      on ? '#3fb950' : '#8b949e',
-              borderColor: on ? '#3fb950' : '#30363d',
-              minWidth: 28 }}
-              onClick={() => set('dca_streak_whitelist',
-                on ? config.dca_streak_whitelist.filter(x => x !== n)
-                   : [...config.dca_streak_whitelist, n].sort((a, b) => a - b))}>
-              {n}
-            </button>
-          );
-        })}
-        <span style={{ fontSize: 11, color: '#6e7681', fontStyle: 'italic' }}>
-          {config.dca_streak_whitelist.length === 0 ? '(empty = DCA fires on every loss)' : ''}
-        </span>
-      </div>
+      {!isEcho && (
+        <>
+          <Field label="Streak min"       value={config.streak_min}            onChange={n => set('streak_min', n)} />
+          <Field label="Auto ≥"           value={config.auto_order_min_streak} onChange={n => set('auto_order_min_streak', n)} />
+          <Field label="DCA mult"         value={config.dca_multiplier}        step={0.1} onChange={n => set('dca_multiplier', n)} />
+          <div style={{ gridColumn: '1 / -1', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 12, color: '#8b949e', minWidth: 90 }}>DCA whitelist</span>
+            {Array.from({ length: 14 }, (_, i) => i + 2).map(n => {
+              const on = config.dca_streak_whitelist.includes(n);
+              return (
+                <button key={n} style={{ ...S.chip,
+                  background: on ? '#1a4731' : 'transparent',
+                  color:      on ? '#3fb950' : '#8b949e',
+                  borderColor: on ? '#3fb950' : '#30363d',
+                  minWidth: 28 }}
+                  onClick={() => set('dca_streak_whitelist',
+                    on ? config.dca_streak_whitelist.filter(x => x !== n)
+                       : [...config.dca_streak_whitelist, n].sort((a, b) => a - b))}>
+                  {n}
+                </button>
+              );
+            })}
+            <span style={{ fontSize: 11, color: '#6e7681', fontStyle: 'italic' }}>
+              {config.dca_streak_whitelist.length === 0 ? '(empty = DCA fires on every loss)' : ''}
+            </span>
+          </div>
+        </>
+      )}
+      {isEcho && (
+        <>
+          <Field label="Echo trigger ≥"   value={config.echo_trigger_streak}    onChange={n => set('echo_trigger_streak', n)} />
+          <Field label="Echo window (m)"  value={config.echo_window_minutes}    onChange={n => set('echo_window_minutes', n)} />
+          <Field label="Echo signal ≥"    value={config.echo_signal_min_streak} onChange={n => set('echo_signal_min_streak', n)} />
+          <Field label="Echo baseline ≥"  value={config.echo_baseline_streak}   onChange={n => set('echo_baseline_streak', n)} />
+          <div style={{ gridColumn: '1 / -1', display: 'flex', gap: 6, alignItems: 'center' }}>
+            <span style={{ fontSize: 12, color: '#8b949e', minWidth: 90 }}>High-body filter</span>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: '#c9d1d9' }}>
+              <input type="checkbox"
+                     checked={config.echo_require_high_body}
+                     onChange={e => set('echo_require_high_body', e.target.checked)}
+                     style={{ margin: 0 }} />
+              Body filter (idle: bump +2 if no high-body bar)
+            </label>
+          </div>
+          <div style={{ gridColumn: '1 / -1', display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 12, color: '#8b949e', minWidth: 90 }}>Idle overrides</span>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: '#c9d1d9' }}
+                   title="A1: streak 3-4 + mean body > 1.5× → fire (WR 58.1%, n=1384, Δ+4.5%)">
+              <input type="checkbox"
+                     checked={config.echo_edge_cases.includes('short_streak_strong_mean')}
+                     onChange={e => {
+                       const s = new Set(config.echo_edge_cases);
+                       if (e.target.checked) s.add('short_streak_strong_mean');
+                       else                  s.delete('short_streak_strong_mean');
+                       set('echo_edge_cases', Array.from(s) as ('short_streak_strong_mean'|'mid_streak_very_extreme')[]);
+                     }}
+                     style={{ margin: 0 }} />
+              A1
+            </label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: '#c9d1d9' }}
+                   title="A3: streak 5-7 + ≥1 very-extreme bar (>4×) → fire (WR 58.5%, n=217, Δ+6.2%)">
+              <input type="checkbox"
+                     checked={config.echo_edge_cases.includes('mid_streak_very_extreme')}
+                     onChange={e => {
+                       const s = new Set(config.echo_edge_cases);
+                       if (e.target.checked) s.add('mid_streak_very_extreme');
+                       else                  s.delete('mid_streak_very_extreme');
+                       set('echo_edge_cases', Array.from(s) as ('short_streak_strong_mean'|'mid_streak_very_extreme')[]);
+                     }}
+                     style={{ margin: 0 }} />
+              A3
+            </label>
+          </div>
+          <div style={{ gridColumn: '1 / -1', display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap',
+                        paddingTop: 6, borderTop: '1px solid #21262d' }}>
+            <span style={{ fontSize: 12, color: '#f0a500', fontWeight: 600, minWidth: 90 }}>Defensive</span>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: '#c9d1d9' }}>
+              <input type="checkbox"
+                     checked={config.echo_defensive_enabled}
+                     onChange={e => set('echo_defensive_enabled', e.target.checked)}
+                     style={{ margin: 0 }} />
+              Enabled
+            </label>
+            <Field label="Extreme ≥"     value={config.echo_defensive_streak_threshold} onChange={n => set('echo_defensive_streak_threshold', n)} />
+            <Field label="Overdue (min)" value={config.echo_defensive_overdue_minutes}  onChange={n => set('echo_defensive_overdue_minutes', n)} />
+            <label style={{ fontSize: 12, color: '#c9d1d9', display: 'flex', alignItems: 'center', gap: 4 }}>
+              Action
+              <select value={config.echo_defensive_action}
+                      onChange={e => set('echo_defensive_action', e.target.value as 'disable_armed' | 'skip_all')}
+                      style={{ padding: '2px 6px', borderRadius: 4, border: '1px solid #30363d',
+                               background: '#0d1117', color: '#c9d1d9', fontSize: 12 }}>
+                <option value="disable_armed">disable_armed</option>
+                <option value="skip_all">skip_all</option>
+              </select>
+            </label>
+          </div>
+          <div style={{ gridColumn: '1 / -1', display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+            <label style={{ fontSize: 12, color: '#c9d1d9', display: 'flex', alignItems: 'center', gap: 4 }}
+                   title="ARMED-mode DCA scale (cycle opened during arm window)">
+              DCA armed
+              <input type="text"
+                     value={scaleStr}
+                     onChange={e => {
+                       const text = e.target.value;
+                       setScaleStr(text);
+                       const parsed = text.split(',').map(s => Number(s.trim()))
+                         .filter(n => Number.isFinite(n) && n > 0);
+                       set('echo_dca_scale', parsed);
+                     }}
+                     placeholder="3,4"
+                     style={{ width: 90, padding: '4px 8px', borderRadius: 4,
+                              border: '1px solid #30363d', background: '#0d1117',
+                              color: '#c9d1d9', fontSize: 12, fontFamily: 'monospace' }} />
+            </label>
+            <label style={{ fontSize: 12, color: '#c9d1d9', display: 'flex', alignItems: 'center', gap: 4 }}
+                   title="IDLE-mode DCA scale (cycle opened at baseline). Empty = use armed scale.">
+              DCA idle
+              <input type="text"
+                     value={scaleStrIdle}
+                     onChange={e => {
+                       const text = e.target.value;
+                       setScaleStrIdle(text);
+                       const parsed = text.split(',').map(s => Number(s.trim()))
+                         .filter(n => Number.isFinite(n) && n > 0);
+                       set('echo_dca_scale_idle', parsed);
+                     }}
+                     placeholder="(use armed)"
+                     style={{ width: 100, padding: '4px 8px', borderRadius: 4,
+                              border: '1px solid #30363d', background: '#0d1117',
+                              color: '#c9d1d9', fontSize: 12, fontFamily: 'monospace' }} />
+            </label>
+            <span style={{ fontSize: 11, color: '#6e7681', fontStyle: 'italic' }}>
+              after L1 = base × scale[0], … exhaust → stop
+            </span>
+          </div>
+        </>
+      )}
     </div>
   );
 }
