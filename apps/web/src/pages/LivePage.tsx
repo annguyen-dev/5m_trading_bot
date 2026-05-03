@@ -1789,24 +1789,55 @@ const ModeBanner = React.memo(function ModeBanner({
 
 // ────────────────────────────────────────────────────────────────────────────
 // EchoStatusPanel — prominent strategy state display above the chart.
-// Shows ALL coins running echo strategy with full state (armed/idle, current
-// threshold, defensive countdown). Hydrated from the snapshot on connect so
-// it renders immediately, not after the next bus event.
+// ALWAYS rendered (even when no echo events have arrived yet) so the user
+// gets immediate visual confirmation the panel exists. Per-coin row shows
+// full state when its echo event is in coinEvents, otherwise a slim
+// "waiting for state…" placeholder.
+//
+// We list ALL_COINS unconditionally rather than filtering to "echo coins
+// only" because we have no way on the FE to know which coins are echo
+// vs streak strategy until the first event arrives. Coins permanently
+// running streak strategy will sit on the placeholder forever — acceptable
+// (a one-line note tells the user nothing's wrong).
 // ────────────────────────────────────────────────────────────────────────────
 
 const EchoStatusPanel = React.memo(function EchoStatusPanel({
   coinEvents,
 }: { coinEvents: LiveStreamState['coinEvents'] }) {
-  const echoCoins = ALL_COINS.filter(c => coinEvents[c]?.echo);
-  if (echoCoins.length === 0) return null;
+  const haveAny = ALL_COINS.some(c => coinEvents[c]?.echo);
   return (
     <div style={ES.panel}>
       <div style={ES.title}>Echo strategy state</div>
+      {!haveAny && (
+        <div style={ES.empty}>
+          No echo state received yet — coins running the streak strategy don't
+          publish echo events; this panel will populate as soon as any echo coin
+          publishes a state transition.
+        </div>
+      )}
       <div style={ES.rows}>
-        {echoCoins.map(coin => (
-          <EchoStatusRow key={coin} coin={coin} echo={coinEvents[coin]!.echo!} />
-        ))}
+        {ALL_COINS.map(coin => {
+          const echo = coinEvents[coin]?.echo;
+          if (echo) return <EchoStatusRow key={coin} coin={coin} echo={echo} />;
+          return <EchoStatusPlaceholder key={coin} coin={coin} />;
+        })}
       </div>
+    </div>
+  );
+});
+
+const EchoStatusPlaceholder = React.memo(function EchoStatusPlaceholder({
+  coin,
+}: { coin: CoinSymbol }) {
+  return (
+    <div style={ES.row}>
+      <span style={ES.coin}>{coin}</span>
+      <span style={{ ...ES.state, color: '#6e7681', borderStyle: 'dashed' }}>
+        — no state —
+      </span>
+      <span style={ES.hint}>
+        waiting for echo_state event (coin may not be running echo strategy)
+      </span>
     </div>
   );
 });
@@ -2180,6 +2211,7 @@ const ES: Record<string, React.CSSProperties> = {
   title:     { fontSize: 11, fontWeight: 600, color: '#79c0ff',
                letterSpacing: 0.5, marginBottom: 8, textTransform: 'uppercase' as const },
   rows:      { display: 'flex', flexDirection: 'column', gap: 6 },
+  empty:     { fontSize: 11, color: '#8b949e', marginBottom: 8, fontStyle: 'italic' as const },
   row:       { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
                fontSize: 12, color: '#c9d1d9' },
   coin:      { fontSize: 13, fontWeight: 700, color: '#c9d1d9', minWidth: 50 },
