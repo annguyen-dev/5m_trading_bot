@@ -135,6 +135,26 @@ interface CoinState {
    */
   defensiveGapStats: DefensiveGapStats | null;
   /**
+   * Threshold values used the LAST time backfill ran. When EITHER threshold
+   * changes (or defensive toggles off→on, or echo enabled at all), the tick
+   * loop's `ensureBackfillFresh` detects the mismatch and re-runs backfill
+   * so `lastExtremeStreakAt` + `defensiveGapStats` + `lastEchoTriggerAt`
+   * reflect the live config.
+   *
+   * Both null when:
+   *   - never backfilled (echo disabled at startup), OR
+   *   - defensive disabled (no defensive backfill done) — only `trigger` is set
+   *
+   * Why two: `lastEchoTriggerAt` depends on `echo_trigger_streak`, while
+   * `lastExtremeStreakAt` depends on `echo_defensive_streak_threshold`. A user
+   * can change either independently — both must trigger a fresh scan.
+   */
+  backfillTriggerThreshold:   number | null;
+  backfillDefensiveThreshold: number | null;
+  /** In-flight guard: prevents concurrent backfills if the user changes config
+   *  multiple times in quick succession. */
+  backfillInFlight: boolean;
+  /**
    * Recent |streak| values from emitted T+4 signals (last up to 5 entries).
    * Feeds the small-adjust inside a schedule window: if the last 2 entries
    * both equal the schedule's base threshold, bump the effective threshold
@@ -281,6 +301,9 @@ export class PriceMonitoringWorker {
       cycleMode:          null,
       lastExtremeStreakAt: null,
       defensiveGapStats:  null,
+      backfillTriggerThreshold:   null,
+      backfillDefensiveThreshold: null,
+      backfillInFlight:   false,
       recentStreakAbs: [],
       lastEchoTriggerAt: null,
       lastEchoStatePublished: null,
@@ -288,13 +311,13 @@ export class PriceMonitoringWorker {
     this.coins.set(symbol, state);
     log('info', `PriceMonitoringWorker: tracking ${symbol}`);
 
-    // Backfill defensive tracker from historical bars so the bot has an
-    // accurate `lastExtremeStreakAt` from minute one (otherwise it would
-    // always start in defensive mode after a restart). Fire-and-forget — if
-    // this fails the live tracker still updates as soon as a fresh extreme
-    // streak is observed.
-    void backfillLastExtremeStreakAt(state).catch(err => {
-      log('warn', 'defensive backfill failed', { symbol, error: String(err) });
+    // Backfill echo state from historical bars: lastEchoTriggerAt (so arm
+    // window is correct on first tick after restart), lastExtremeStreakAt +
+    // gap stats (so defensive layer doesn't enter immediate-defensive mode
+    // on every restart). Fire-and-forget — if this fails, the live tracker
+    // catches up on the next observed trigger streak.
+    void backfillEchoState(state).catch(err => {
+      log('warn', 'echo backfill failed', { symbol, error: String(err) });
     });
   }
 
@@ -310,6 +333,11 @@ export class PriceMonitoringWorker {
       try {
         const cfg = await getCoinConfig(state.symbol);
         if (!cfg.enabled) continue;
+
+        // Re-backfill `lastExtremeStreakAt` + `defensiveGapStats` if user
+        // changed `echo_defensive_streak_threshold` or toggled defensive on
+        // since the last backfill. No-op when config matches.
+        ensureBackfillFresh(state, cfg);
 
         // Clean old dedup keys (window bucket changed)
         this.pruneEmitted(state, windowStart);
@@ -1759,29 +1787,48 @@ async function fetchStreakWithVolume(
 }
 
 /**
- * Backfill `state.lastExtremeStreakAt` from historical bars so the defensive
- * layer has accurate gap info on bot startup. Without this, every restart
- * would put the bot into immediate defensive mode (because null gap = treated
- * as overdue), suspending trades for hours until a fresh extreme.
+ * Backfill in-memory echo state (`lastEchoTriggerAt` AND `lastExtremeStreakAt`)
+ * from historical bars so the bot has correct values on startup AND after
+ * config changes. Without this, lastEchoTriggerAt stays null until a fresh
+ * trigger streak hits — meaning a worker that just restarted (or a user that
+ * just lowered echo_trigger_streak) shows armed=false even though a recent
+ * past streak would have armed it under the current threshold.
  *
  * Scans the last 30 days (8640 bars, ~9 Binance API calls — completes in a
- * few seconds). On any active coin an extreme ≥ N=7 occurs roughly every
- * 12-16h, so 30d gives a deep safety margin. If you need longer, bump
- * `BACKFILL_DAYS` (no config field — it's a one-shot startup cost, not worth
- * a per-coin knob).
+ * few seconds). On any active coin an extreme ≥ 7 occurs roughly every
+ * 12-16h, so 30d gives a deep safety margin.
  *
- * Threshold is read from the current cfg at backfill time. Live tracker
- * picks up any threshold change naturally on the next observed extreme.
+ * SINGLE pass computes both:
+ *   - lastEchoTriggerAt    using cfg.echo_trigger_streak             (always for echo)
+ *   - lastExtremeStreakAt  using cfg.echo_defensive_streak_threshold (only when defensive enabled)
+ *   - defensiveGapStats    inter-event gaps for defensive            (only when defensive enabled)
+ *
+ * Tracks both thresholds in `state.backfill{Trigger,Defensive}Threshold` so
+ * `ensureBackfillFresh` knows when to re-run (= EITHER threshold changed, OR
+ * defensive just got toggled on/off, OR first time after worker start).
+ *
+ * Sets `state.backfillInFlight` for the duration to prevent concurrent
+ * re-entries on rapid config edits (in-flight check in caller too).
  */
 const BACKFILL_DAYS = 30;
-async function backfillLastExtremeStreakAt(state: CoinState): Promise<void> {
+async function backfillEchoState(state: CoinState): Promise<void> {
+  if (state.backfillInFlight) return;
+  state.backfillInFlight = true;
+  try {
   const cfg = await getCoinConfig(state.symbol);
-  if (cfg.strategy !== 'echo' || !cfg.echo_defensive_enabled) return;
-  const threshold = cfg.echo_defensive_streak_threshold;
+  if (cfg.strategy !== 'echo') {
+    // Strategy switched to streak — clear all echo state.
+    state.lastExtremeStreakAt          = null;
+    state.lastEchoTriggerAt            = null;
+    state.defensiveGapStats            = null;
+    state.backfillTriggerThreshold     = null;
+    state.backfillDefensiveThreshold   = null;
+    return;
+  }
+  const triggerThreshold   = cfg.echo_trigger_streak;
+  const defensiveThreshold = cfg.echo_defensive_enabled ? cfg.echo_defensive_streak_threshold : null;
   const now      = Date.now();
   const lookback = BACKFILL_DAYS * 24 * 60 * 60 * 1000;
-  // Binance/Pyth fetch caps at ~1000 bars/call. Paginate forward in 1000-bar
-  // chunks (~3.5 days each) until we cover the full backfill horizon.
   const CHUNK_BARS = 1000;
   const CHUNK_MS   = CHUNK_BARS * 5 * 60 * 1000;
   const bars: Bar[] = [];
@@ -1789,56 +1836,117 @@ async function backfillLastExtremeStreakAt(state: CoinState): Promise<void> {
     const chunkEnd = Math.min(cursor + CHUNK_MS, now);
     const chunk = await fetchBars(state.symbol, cursor, chunkEnd, CHUNK_BARS);
     bars.push(...chunk);
-    if (chunk.length < 10) break;   // dead-end (no data) — stop early
+    if (chunk.length < 10) break;
   }
-  if (bars.length < threshold) return;
+  if (bars.length < triggerThreshold) return;
 
-  // Walk bars: track every TIME a run first reaches the threshold (= one
-  // extreme event). lastAt = closeTime of the most recent bar still in an
-  // extreme run (used for the live overdue countdown).
-  const eventStartTimes: number[] = [];
+  // Single walk computes lastTriggerAt + lastExtremeAt + defensive gap events.
+  const extremeEventStarts: number[] = [];
   let runDir = 0, runLen = 0;
-  let lastAt: number | null = null;
+  let lastTriggerAt: number | null = null;
+  let lastExtremeAt: number | null = null;
   let i = 0;
   for (const b of bars) {
     const dir = b.close > b.open ? 1 : b.close < b.open ? -1 : 0;
     const closeTime = now - lookback + (i + 1) * (5 * 60 * 1000);
     if (dir === 0) { runDir = 0; runLen = 0; i++; continue; }
-    const wasBelow = runLen < threshold;
+    const wasBelowExtreme = defensiveThreshold !== null && runLen < defensiveThreshold;
     if (dir === runDir) runLen++;
     else                { runDir = dir; runLen = 1; }
-    if (runLen >= threshold) {
-      lastAt = closeTime;
-      if (wasBelow) eventStartTimes.push(closeTime);   // new extreme event
+    if (runLen >= triggerThreshold) {
+      lastTriggerAt = closeTime;
+    }
+    if (defensiveThreshold !== null && runLen >= defensiveThreshold) {
+      lastExtremeAt = closeTime;
+      if (wasBelowExtreme) extremeEventStarts.push(closeTime);
     }
     i++;
   }
 
-  // Compute inter-event gap stats — drives FE display + helps user calibrate
-  // the configured `echo_defensive_overdue_minutes`.
-  const gaps: number[] = [];
-  for (let j = 1; j < eventStartTimes.length; j++) {
-    gaps.push(eventStartTimes[j]! - eventStartTimes[j - 1]!);
-  }
-  const gapStats = gaps.length > 0 ? computeGapStats(gaps) : null;
+  // Trigger-side state (always set for echo).
+  state.lastEchoTriggerAt        = lastTriggerAt;
+  state.backfillTriggerThreshold = triggerThreshold;
 
-  state.defensiveGapStats = gapStats;
-
-  if (lastAt != null) {
-    state.lastExtremeStreakAt = lastAt;
-    const ago = Math.round((now - lastAt) / 60_000);
-    log('info', `defensive backfill ${state.symbol}: last extreme streak ${ago}m ago`, {
-      threshold, lastExtremeStreakAt: lastAt, scannedDays: BACKFILL_DAYS,
-      scannedBars: bars.length, events: eventStartTimes.length,
-      gapStats,
-    });
+  // Defensive-side state (only when enabled).
+  if (defensiveThreshold !== null) {
+    const gaps: number[] = [];
+    for (let j = 1; j < extremeEventStarts.length; j++) {
+      gaps.push(extremeEventStarts[j]! - extremeEventStarts[j - 1]!);
+    }
+    state.defensiveGapStats            = gaps.length > 0 ? computeGapStats(gaps) : null;
+    state.lastExtremeStreakAt          = lastExtremeAt;
+    state.backfillDefensiveThreshold   = defensiveThreshold;
   } else {
-    log('info', `defensive backfill ${state.symbol}: no extreme ≥ ${threshold} in last ${BACKFILL_DAYS}d`, {
-      scannedBars: bars.length,
-    });
-    // Leave null → treated as overdue → defensive enforced. Quiet 30d is
-    // genuinely rare on liquid coins; safe default.
+    state.defensiveGapStats            = null;
+    state.lastExtremeStreakAt          = null;
+    state.backfillDefensiveThreshold   = null;
   }
+
+  log('info', `echo backfill ${state.symbol} done`, {
+    triggerThreshold,
+    defensiveThreshold,
+    lastEchoTriggerAt: lastTriggerAt,
+    lastExtremeStreakAt: lastExtremeAt,
+    triggerAgoMin: lastTriggerAt != null ? Math.round((now - lastTriggerAt) / 60_000) : null,
+    extremeAgoMin: lastExtremeAt != null ? Math.round((now - lastExtremeAt) / 60_000) : null,
+    extremeEvents: extremeEventStarts.length,
+    scannedBars: bars.length,
+  });
+  } finally {
+    state.backfillInFlight = false;
+  }
+}
+
+/**
+ * Detect threshold/strategy/defensive-enabled changes vs the values used in
+ * the most recent backfill — re-run backfill so derived state reflects live
+ * config. Called from the tick loop after `getCoinConfig`. Cheap on the
+ * common path (a couple of int compares).
+ *
+ * Re-backfill triggers when ANY of:
+ *   - Echo strategy enabled but never backfilled (first call after start /
+ *     after switching strategy to echo)
+ *   - `echo_trigger_streak` changed since last backfill (lastEchoTriggerAt
+ *     stale → arm state wrong on UI)
+ *   - `echo_defensive_enabled` flipped on (need defensive backfill now)
+ *   - `echo_defensive_streak_threshold` changed (lastExtremeStreakAt + gap
+ *     stats stale)
+ *   - `echo_defensive_enabled` flipped off (clear defensive state to avoid
+ *     stale data resurfacing on next enable)
+ */
+function ensureBackfillFresh(state: CoinState, cfg: CoinConfig): void {
+  if (state.backfillInFlight) return;
+  if (cfg.strategy !== 'echo') {
+    // Switched away from echo — clear so a later switch back triggers fresh backfill.
+    if (state.backfillTriggerThreshold !== null || state.backfillDefensiveThreshold !== null) {
+      state.lastExtremeStreakAt        = null;
+      state.lastEchoTriggerAt          = null;
+      state.defensiveGapStats          = null;
+      state.backfillTriggerThreshold   = null;
+      state.backfillDefensiveThreshold = null;
+      log('info', `echo state cleared ${state.symbol} — strategy is ${cfg.strategy}`);
+    }
+    return;
+  }
+
+  const wantTrigger   = cfg.echo_trigger_streak;
+  const wantDefensive = cfg.echo_defensive_enabled ? cfg.echo_defensive_streak_threshold : null;
+  const triggerStale   = state.backfillTriggerThreshold   !== wantTrigger;
+  const defensiveStale = state.backfillDefensiveThreshold !== wantDefensive;
+  if (!triggerStale && !defensiveStale) return;
+
+  log('info', `echo backfill ${state.symbol} triggered`, {
+    previousTrigger:   state.backfillTriggerThreshold,
+    newTrigger:        wantTrigger,
+    previousDefensive: state.backfillDefensiveThreshold,
+    newDefensive:      wantDefensive,
+    reason: state.backfillTriggerThreshold === null ? 'first-backfill'
+          : triggerStale && defensiveStale ? 'both-changed'
+          : triggerStale ? 'trigger-changed' : 'defensive-changed',
+  });
+  void backfillEchoState(state).catch(err => {
+    log('warn', 'echo backfill failed', { symbol: state.symbol, error: String(err) });
+  });
 }
 
 /** Percentile + summary stats over inter-event gaps (ms). Returned as ms so
