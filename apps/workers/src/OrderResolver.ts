@@ -31,6 +31,16 @@ import type { PriceMonitoringWorker } from './PriceMonitoringWorker.js';
 const TICK_MS         = 5_000;      // faster loop — TP/SL needs mid-window responsiveness
 const SETTLE_DELAY_MS = 30_000;     // wait this long after window_end before resolving
 
+// SL chop / sustained-dip filter (see shouldFireSl).
+//   SL_CONFIRM_MS:            bid must be ≤ slCents continuously for this long
+//   CHOP_WINDOW_MS:           sliding window for counting reversals
+//   CHOP_REVERSAL_THRESHOLD:  ≥ this many reversals in window → chop → skip SL
+//   BID_HISTORY_KEEP_MS:      retention for the per-token bid history ring buffer
+const SL_CONFIRM_MS           = 2_000;
+const CHOP_WINDOW_MS          = 1_000;
+const CHOP_REVERSAL_THRESHOLD = 2;
+const BID_HISTORY_KEEP_MS     = 2_000;
+
 interface PendingOrderRow {
   id:           string;
   market_id:    string;
@@ -63,6 +73,15 @@ export class OrderResolver {
   /** tokenId → set of orderIds holding that token (for O(1) WS tick lookup). */
   private ordersByToken = new Map<string, Set<string>>();
 
+  /** Per-token rolling bid history (last BID_HISTORY_KEEP_MS) for chop
+   *  detection. Pushed on every WS share_tick; entries auto-evicted by age
+   *  on each push. Cleaned up entirely when a token has no more orders. */
+  private bidHistory = new Map<string, Array<{ ts: number; bid: number }>>();
+  /** Per-order ms timestamp when bid FIRST went below slCents continuously.
+   *  Cleared whenever bid recovers above slCents OR the order is evicted.
+   *  SL fires only when (now - this) >= SL_CONFIRM_MS AND no chop detected. */
+  private slBelowSinceMs = new Map<string, number>();
+
   /**
    * Accepts an optional PriceMonitoringWorker reference. When provided:
    *   - Resolver reads bestBid from PMW's in-memory WS cache (no DB query).
@@ -93,12 +112,84 @@ export class OrderResolver {
     log('info', 'OrderResolver stopped');
   }
 
-  /** Remove an order from both caches after it closes. */
+  /** Remove an order from both caches after it closes. Also drops the
+   *  per-order SL timer state and, when this was the LAST order on the
+   *  token, the per-token bid history (prevents leak of stale ticks for
+   *  no-longer-watched tokens). */
   private evict(orderId: string): void {
     const o = this.activeOrders.get(orderId);
     if (!o) return;
     this.activeOrders.delete(orderId);
-    this.ordersByToken.get(o.tokenId)?.delete(orderId);
+    const set = this.ordersByToken.get(o.tokenId);
+    set?.delete(orderId);
+    this.slBelowSinceMs.delete(orderId);
+    if (set && set.size === 0) {
+      this.bidHistory.delete(o.tokenId);
+    }
+  }
+
+  /**
+   * Decide whether SL should fire for this order RIGHT NOW.
+   *
+   * Two filters — BOTH must pass before returning true:
+   *
+   *   1. Chop filter: count "reversals" (direction flips) in the per-token
+   *      bid history over the last CHOP_WINDOW_MS. ≥ CHOP_REVERSAL_THRESHOLD
+   *      reversals = price oscillating rapidly = chop → skip SL even when
+   *      bid is currently below threshold (likely WS flicker / MM withdraw,
+   *      not a real crash).
+   *
+   *   2. Sustained-dip filter: bid must have been ≤ slCents continuously for
+   *      ≥ SL_CONFIRM_MS. The first WS tick that crosses the threshold sets
+   *      `slBelowSinceMs[orderId] = now`; subsequent ticks check the elapsed
+   *      time. Bid recovering above threshold clears the timer.
+   *
+   * Combined effect: rejects single-tick flicker AND sustained oscillation.
+   * Real crashes (price drops and stays low) fire SL after a SL_CONFIRM_MS
+   * delay — minor cost (slip a few cents on the way down) traded for
+   * eliminating false-positive SL exits during volatile chops.
+   */
+  private shouldFireSl(
+    orderId: string, tokenId: string, bid: number, slCents: number, now: number,
+  ): boolean {
+    const bidCents = bid * 100;
+    if (bidCents > slCents) {
+      // Bid recovered above threshold → clear the timer; no SL.
+      this.slBelowSinceMs.delete(orderId);
+      return false;
+    }
+
+    // Chop filter — count reversals in last CHOP_WINDOW_MS.
+    const hist = this.bidHistory.get(tokenId);
+    if (hist && hist.length >= 3) {
+      const cutoff = now - CHOP_WINDOW_MS;
+      const recent = hist.filter(h => h.ts >= cutoff);
+      let reversals = 0;
+      for (let i = 1; i < recent.length - 1; i++) {
+        const prevDir = Math.sign(recent[i]!.bid     - recent[i - 1]!.bid);
+        const nextDir = Math.sign(recent[i + 1]!.bid - recent[i]!.bid);
+        if (prevDir !== 0 && nextDir !== 0 && prevDir !== nextDir) reversals++;
+      }
+      if (reversals >= CHOP_REVERSAL_THRESHOLD) {
+        // Don't clear timer — a brief recovery counts as "still chopping".
+        // Once chop subsides AND bid stays below threshold, the existing
+        // firstBelowAt timestamp lets us fire after SL_CONFIRM_MS without
+        // restarting the clock.
+        return false;
+      }
+    }
+
+    // Sustained-dip filter — require continuous below-threshold for SL_CONFIRM_MS.
+    const firstBelow = this.slBelowSinceMs.get(orderId);
+    if (firstBelow == null) {
+      this.slBelowSinceMs.set(orderId, now);
+      return false;
+    }
+    if (now - firstBelow < SL_CONFIRM_MS) return false;
+
+    // Both filters passed → genuine sustained dip → fire SL.
+    this.slBelowSinceMs.delete(orderId);
+    return true;
   }
 
   /** Rebuild in-memory cache from DB. Runs every tick (5s) — covers new
@@ -144,7 +235,6 @@ export class OrderResolver {
     if (!this.running || tick.bestBid == null) return;
     const ids = this.ordersByToken.get(tick.tokenId);
     if (!ids || ids.size === 0) return;
-    const bidCents = tick.bestBid * 100;
     // Guard: WS occasionally publishes bid=0 during transient outages /
     // book-empty moments. Observed prod cases where cached bid=0 fired SL but
     // the actual FAK fill came at 0.50-0.99 — i.e. the WS was stale, not the
@@ -152,16 +242,28 @@ export class OrderResolver {
     // resolveAtClose will handle it via binary settlement.
     if (tick.bestBid === 0) return;
     const now = Date.now();
+
+    // Update per-token bid history (for chop detection in shouldFireSl).
+    // Push current tick, then evict entries older than BID_HISTORY_KEEP_MS.
+    let hist = this.bidHistory.get(tick.tokenId);
+    if (!hist) { hist = []; this.bidHistory.set(tick.tokenId, hist); }
+    hist.push({ ts: now, bid: tick.bestBid });
+    const cutoff = now - BID_HISTORY_KEEP_MS;
+    while (hist.length > 0 && hist[0]!.ts < cutoff) hist.shift();
+
     const slGlobal = await getAutoOrderSlCents();   // cached per-tick (cheap; Postgres hit but rare)
 
     for (const id of Array.from(ids)) {
       const o = this.activeOrders.get(id);
       if (!o) continue;
-      // Only in last 30s of target window + SL enabled + bid ≤ threshold.
+      // Only in last 30s of target window + SL enabled.
       if (o.window_end <= now || o.window_end - 30_000 > now) continue;
       if (o.sl_cents === null) continue;              // SL explicitly disabled (Path B)
       const slCents = o.sl_cents ?? slGlobal;
-      if (bidCents > slCents) continue;
+
+      // Combined chop + sustained-dip filter (see shouldFireSl).
+      if (!this.shouldFireSl(id, tick.tokenId, tick.bestBid, slCents, now)) continue;
+
       // Evict BEFORE firing so concurrent handler re-entries don't double-fire.
       this.evict(id);
       await this.closeOrderAt(toRow(o), o.tokenId, tick.bestBid, 'sl', o.tpClobId != null, o.tpClobId);
@@ -261,11 +363,18 @@ export class OrderResolver {
 
     const bidCents = bid * 100;
     let reason: 'tp' | 'sl' | null = null;
+    const now = Date.now();
     // TP market-sell trigger only in simulate mode; live relies solely on the
     // resting CLOB limit (see function header).
     if (o.mode !== 'live' && !tpRestingOnClob && bidCents >= tpCents) {
       reason = 'tp';
     } else if (!slDisabled && bidCents <= slCents) {
+      // Apply the same chop + sustained-dip filter as the WS-driven path
+      // (handleShareTick) so the polling fallback can't sneak past the
+      // protection. Reads from the same per-token bidHistory populated by
+      // WS ticks; per-order timer is per-orderId so handleShareTick + this
+      // poll share state correctly.
+      if (!this.shouldFireSl(o.id, tokenId, bid, slCents, now)) return;
       reason = 'sl';
     }
     if (!reason) return;
