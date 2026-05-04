@@ -35,6 +35,11 @@ import { getPool } from '@trading-bot/db';
 
 const TICK_MS    = 5_000;
 const WINDOW_MS  = 300_000;
+/** Heartbeat for echo_state republish — bounds API-restart recovery latency.
+ *  When API restarts its in-memory engine.echoStates Map is empty; the next
+ *  echo_state event from worker will repopulate it. With transition-only
+ *  publishes that could take hours; a 60s heartbeat caps the gap. */
+const ECHO_REPUBLISH_INTERVAL_MS = 60_000;
 
 // Phase slots. Tick-driven phases must be ≥ TICK_MS wide. T-3s placement is
 // NOT tick-driven — it's scheduled precisely via setTimeout from phaseT4 so
@@ -114,6 +119,18 @@ interface CoinState {
   lastCycleOrderSize: number | null;
   dcaFiredCount:      number;
   /**
+   * In-flight guard for boundary placement. tryPlaceBoundary can be called
+   * concurrently from phaseTMinus3 (primary) AND phaseT0 Path E (retry) when
+   * the primary path is still inside `recordOrder` (which awaits CLOB calls
+   * and `waitForTokenBalance`, taking up to ~15s). Without this, both paths
+   * pass the cycleActive=false gate AND the DB hasAutoOrderFor check (no row
+   * inserted yet) → duplicate orders.
+   *
+   * Set synchronously at the entry of tryPlaceBoundary BEFORE any await so
+   * the check+set is atomic on the JS event loop. Cleared in finally.
+   */
+  boundaryPlacementInFlight: boolean;
+  /**
    * Echo: which mode the cycle's boundary order was placed in. Determines
    * which DCA scale (`echo_dca_scale` for armed, `echo_dca_scale_idle` for
    * idle) applies for the cycle's continuation orders. Reset to null on
@@ -178,7 +195,10 @@ interface CoinState {
   lastEchoTriggerAt: number | null;
   /**
    * Last published echo arm state (for transition-only emission). When the
-   * computed state matches this, we don't republish — keeps the bus quiet.
+   * computed state matches this AND `at` is recent (< ECHO_REPUBLISH_INTERVAL_MS),
+   * we skip republish — keeps the bus quiet on the common path while still
+   * providing a heartbeat so API restarts (which clear the in-memory snapshot
+   * cache) recover within at most `ECHO_REPUBLISH_INTERVAL_MS`.
    * `armEndAt` distinguishes "armed at T1" vs "armed at T2 (refresh)" so
    * arm-refresh events still emit.
    */
@@ -187,6 +207,7 @@ interface CoinState {
     armEndAt: number | null;
     defensiveActive: boolean;
     lastExtremeStreakAt: number | null;
+    at: number;
   } | null;
 }
 
@@ -299,6 +320,7 @@ export class PriceMonitoringWorker {
       lastCycleOrderSize: null,
       dcaFiredCount:      0,
       cycleMode:          null,
+      boundaryPlacementInFlight: false,
       lastExtremeStreakAt: null,
       defensiveGapStats:  null,
       backfillTriggerThreshold:   null,
@@ -351,6 +373,13 @@ export class PriceMonitoringWorker {
         } else if (msFromStart >= T_MINUS_0_MS) {
           await this.phaseT0(state, cfg, windowStart, windowEnd);
         }
+
+        // Heartbeat publish — every tick checks if echo_state needs to
+        // republish (transition or > ECHO_REPUBLISH_INTERVAL_MS since last).
+        // Cheap on the common path (just dedupe + clock check). Critical for
+        // API restart recovery: without this, snapshot stays empty until the
+        // next true state transition, which can be hours.
+        void this.maybePublishEchoState(state, cfg);
       } catch (err) {
         log('warn', `PriceMonitoringWorker tick ${state.symbol} failed`, { error: String(err) });
       }
@@ -472,13 +501,16 @@ export class PriceMonitoringWorker {
 
   /**
    * Echo arm-state publisher. Computes current armed/armEndAt from state +
-   * cfg and publishes ONLY when something changed since last publish. This
-   * keeps the bus quiet (~1-2 events per arm cycle, vs hundreds of T+4s).
+   * cfg and publishes when EITHER:
+   *   (a) something changed since last publish (transition), OR
+   *   (b) `ECHO_REPUBLISH_INTERVAL_MS` has elapsed since last publish (heartbeat)
    *
-   * Transitions emitted:
-   *   - First-ever evaluation for this coin → baseline state.
-   *   - Trigger fires (lastEchoTriggerAt updated) → "armed (refreshed)".
-   *   - Arm window expires between ticks → "not armed".
+   * The heartbeat ensures API restart recovery: when API restarts its in-memory
+   * `engine.echoStates` Map clears, and without a heartbeat the FE would stare
+   * at empty echo panels until the next state transition (could be hours).
+   * With heartbeat, recovery is bounded by ECHO_REPUBLISH_INTERVAL_MS.
+   *
+   * On the no-change common path (most ticks) this is a cheap dedupe check.
    */
   private async maybePublishEchoState(state: CoinState, cfg: CoinConfig): Promise<void> {
     if (cfg.strategy !== 'echo') return;
@@ -505,10 +537,12 @@ export class PriceMonitoringWorker {
       && last.armEndAt === armEndAt
       && last.defensiveActive === defensiveActive
       && last.lastExtremeStreakAt === state.lastExtremeStreakAt;
-    if (same) return;
+    const heartbeatDue = !last || (now - last.at) >= ECHO_REPUBLISH_INTERVAL_MS;
+    if (same && !heartbeatDue) return;
     state.lastEchoStatePublished = {
       armed, armEndAt, defensiveActive,
       lastExtremeStreakAt: state.lastExtremeStreakAt,
+      at: now,
     };
     // Effective threshold reflects defensive override.
     let threshold = armed ? cfg.echo_signal_min_streak : cfg.echo_baseline_streak;
@@ -833,6 +867,22 @@ export class PriceMonitoringWorker {
       reason:    string;
     };
   }> {
+    // Concurrency guard — phaseTMinus3 (setTimeout) and phaseT0 Path E (tick)
+    // can both reach here while the other's prior `recordOrder` is still
+    // awaiting CLOB / waitForTokenBalance (~15s). Without this guard both
+    // callers see cycleActive=false AND hasAutoOrderFor=false (no DB row yet),
+    // both pass gates, both call recordOrder → duplicate orders.
+    //
+    // Synchronous check + set: safe on the JS event loop since neither
+    // operation awaits between them. The flag is cleared in finally.
+    if (state.boundaryPlacementInFlight) {
+      return {
+        placed: false,
+        reason: 'boundary placement already in flight (skip duplicate)',
+      };
+    }
+    state.boundaryPlacementInFlight = true;
+    try {
     // Compute adaptive threshold up-front so callers always get context —
     // even when a non-threshold gate fails (ask too high, market missing etc).
     // `base` = the unadjusted baseline threshold:
@@ -1008,6 +1058,9 @@ export class PriceMonitoringWorker {
         reason: err instanceof Error ? err.message : String(err),
         adaptive,
       };
+    }
+    } finally {
+      state.boundaryPlacementInFlight = false;
     }
   }
 

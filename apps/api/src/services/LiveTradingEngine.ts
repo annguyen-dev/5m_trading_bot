@@ -29,6 +29,7 @@ import { EventEmitter } from 'events';
 import { PolymarketService, type PolyClobMarket, type ShareTick } from '@trading-bot/core/PolymarketService';
 import type { SignalEchoStateEvent } from '@trading-bot/core/SignalBus';
 import type { CoinSymbol } from '@trading-bot/core/CoinConfig';
+import { getPool } from '@trading-bot/db';
 import { FutureTickScanner, type FutureTick } from './FutureTickScanner.js';
 import { BinanceFastTicker, type FastTick } from './BinanceFastTicker.js';
 import { log } from '../observability/logger.js';
@@ -83,12 +84,33 @@ export class LiveTradingEngine extends EventEmitter {
 
   async start(): Promise<void> {
     log('info', 'LiveTradingEngine starting');
+    // Hydrate echoStates from DB BEFORE accepting SSE clients so the first
+    // snapshot served already has data. Without this, an API restart leaves
+    // FE clients staring at empty echo panels until the next worker state
+    // transition (could be hours).
+    await this.loadPersistedEchoStates();
     await this.poly.start();
     await this.scanner.start();
     await this.fast.start();
     // Tick every 5s so that when a 5m window ends, FE switches to the new
     // current market within ≤ 5s (without waiting on the 60s discovery loop).
     this.refreshTimer = setInterval(() => this.refreshCurrent(), REFRESH_TICK_MS);
+  }
+
+  /** Read the `echo_state_cache` table (see migration 027) and seed the
+   *  in-memory `echoStates` Map. Best-effort — failures don't block startup. */
+  private async loadPersistedEchoStates(): Promise<void> {
+    try {
+      const { rows } = await getPool().query<{ coin: string; state: SignalEchoStateEvent }>(
+        `SELECT coin, state FROM echo_state_cache`,
+      );
+      for (const r of rows) this.echoStates.set(r.coin as CoinSymbol, r.state);
+      log('info', `LiveTradingEngine: hydrated ${rows.length} echo state(s) from DB`);
+    } catch (err) {
+      log('warn', 'LiveTradingEngine: echo_state_cache hydrate failed (continuing)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   async stop(): Promise<void> {
@@ -116,11 +138,25 @@ export class LiveTradingEngine extends EventEmitter {
 
   /**
    * External hook for the bus → engine bridge to record latest echo state per
-   * coin. Stored so new SSE clients see current state on snapshot, not just
-   * on the next transition. Caller should also fan out via `engine.emit`.
+   * coin. Stored in-memory so new SSE clients see current state on snapshot,
+   * AND persisted to `echo_state_cache` so an API restart doesn't blank out
+   * the Live page panel waiting for the next worker state transition.
+   * Caller should also fan out via `engine.emit`.
    */
   recordEchoState(ev: SignalEchoStateEvent): void {
     this.echoStates.set(ev.coin, ev);
+    // Fire-and-forget UPSERT — DB hiccup must not break SSE fan-out.
+    void getPool().query(
+      `INSERT INTO echo_state_cache (coin, state, updated_at)
+       VALUES ($1, $2::jsonb, $3)
+       ON CONFLICT (coin) DO UPDATE
+         SET state = EXCLUDED.state, updated_at = EXCLUDED.updated_at`,
+      [ev.coin, JSON.stringify(ev), Date.now()],
+    ).catch(err => {
+      log('warn', 'echo_state_cache upsert failed', {
+        coin: ev.coin, error: err instanceof Error ? err.message : String(err),
+      });
+    });
   }
 
   private wire(): void {
