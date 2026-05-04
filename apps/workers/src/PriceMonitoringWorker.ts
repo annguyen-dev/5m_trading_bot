@@ -235,6 +235,44 @@ export class PriceMonitoringWorker {
     return this.shareBids.get(tokenId)?.bestBid ?? null;
   }
 
+  /**
+   * Determine window outcome from the LIVE Polymarket UP-token midpoint.
+   *
+   * Used at T-0 (= 5s before window close) when the Polymarket market has
+   * near-perfect info on which way the candle will close. UP token at 0.99
+   * ≈ certain UP; at 0.01 ≈ certain DOWN; near 0.5 ≈ uncertain. We use a
+   * dead band [0.45, 0.55] → 'unknown' so a doji/whipsaw close doesn't get
+   * forced into a wrong direction (caller falls back to Binance + cross-check).
+   *
+   * Returns 'unknown' when:
+   *   - No Polymarket market exists for this window (e.g. Polymarket discovery
+   *     hasn't picked it up yet, or coin not on Polymarket)
+   *   - WS hasn't streamed any bid/ask for the UP token yet (tracker just
+   *     started, or stale-feed)
+   *   - Midpoint is in the dead band [0.45, 0.55] (genuine uncertainty)
+   *
+   * The 0.45/0.55 thresholds match the in-progress-icon dead band — keeps
+   * the "what direction is the market thinking" semantics consistent.
+   */
+  private async livePolyOutcome(
+    symbol: CoinSymbol, windowStart: number, windowEnd: number,
+  ): Promise<'up' | 'down' | 'unknown'> {
+    const { rows } = await getPool().query<{ token_up: string }>(
+      `SELECT token_up FROM poly_clob_markets
+        WHERE symbol = $1 AND window_start = $2 AND window_end = $3
+        LIMIT 1`,
+      [symbol, windowStart, windowEnd],
+    );
+    const tokenUp = rows[0]?.token_up;
+    if (!tokenUp) return 'unknown';
+    const cache = this.shareBids.get(tokenUp);
+    if (!cache || cache.bestBid == null || cache.bestAsk == null) return 'unknown';
+    const mid = (cache.bestBid + cache.bestAsk) / 2;
+    if (mid > 0.55) return 'up';
+    if (mid < 0.45) return 'down';
+    return 'unknown';
+  }
+
   /** Register a handler called on every share_tick from any subscribed token.
    *  Returns an unsubscribe function. */
   public onShareTick(handler: (tick: ShareTick) => void): () => void {
@@ -1276,7 +1314,18 @@ export class PriceMonitoringWorker {
     if (state.emitted.has(key)) return;
     state.emitted.add(key);
 
-    const outcome = await fetchWindowOutcome(state.symbol, windowStart, windowEnd);
+    // PRIMARY outcome source: live Polymarket UP-token midpoint at T-0.
+    // The 5s before window close, the market has near-perfect info on which
+    // way the candle will close. This avoids the Binance/Chainlink discrepancy
+    // problem where bot saw outcome=down but Polymarket resolved up (or vice
+    // versa). Falls back to the source-vs-poly cross-check (Binance kline +
+    // poly_clob_markets.outcome) when WS midpoint isn't available — which is
+    // the only path used during backfill / restart since live WS isn't
+    // retroactive.
+    let outcome = await this.livePolyOutcome(state.symbol, windowStart, windowEnd);
+    if (outcome === 'unknown') {
+      outcome = await fetchWindowOutcome(state.symbol, windowStart, windowEnd);
+    }
     const t4 = state.lastT4;
 
     // Streak break detection: this window's outcome opposes T+4 streak direction.
