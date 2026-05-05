@@ -1,66 +1,152 @@
-
 # CLAUDE.md
 
-Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
+Project context for Claude Code agents working in this repo. Read this top-to-bottom before touching code.
 
-**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
-
-## 1. Think Before Coding
-
-**Don't assume. Don't hide confusion. Surface tradeoffs.**
-
-Before implementing:
-- State your assumptions explicitly. If uncertain, ask.
-- If multiple interpretations exist, present them - don't pick silently.
-- If a simpler approach exists, say so. Push back when warranted.
-- If something is unclear, stop. Name what's confusing. Ask.
-
-## 2. Simplicity First
-
-**Minimum code that solves the problem. Nothing speculative.**
-
-- No features beyond what was asked.
-- No abstractions for single-use code.
-- No "flexibility" or "configurability" that wasn't requested.
-- No error handling for impossible scenarios.
-- If you write 200 lines and it could be 50, rewrite it.
-
-Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
-
-## 3. Surgical Changes
-
-**Touch only what you must. Clean up only your own mess.**
-
-When editing existing code:
-- Don't "improve" adjacent code, comments, or formatting.
-- Don't refactor things that aren't broken.
-- Match existing style, even if you'd do it differently.
-- If you notice unrelated dead code, mention it - don't delete it.
-
-When your changes create orphans:
-- Remove imports/variables/functions that YOUR changes made unused.
-- Don't remove pre-existing dead code unless asked.
-
-The test: Every changed line should trace directly to the user's request.
-
-## 4. Goal-Driven Execution
-
-**Define success criteria. Loop until verified.**
-
-Transform tasks into verifiable goals:
-- "Add validation" → "Write tests for invalid inputs, then make them pass"
-- "Fix the bug" → "Write a test that reproduces it, then make it pass"
-- "Refactor X" → "Ensure tests pass before and after"
-
-For multi-step tasks, state a brief plan:
-```
-1. [Step] → verify: [check]
-2. [Step] → verify: [check]
-3. [Step] → verify: [check]
-```
-
-Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+> Setup, common tasks, and observability live in [`README.md`](./README.md).
+> Coding conventions (logging, errors, commits) live in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+> Strategy design rationale lives in [`PLAN_POLYMARKET_SIGNAL.md`](./PLAN_POLYMARKET_SIGNAL.md).
 
 ---
 
-**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+## TL;DR
+
+**Trading bot for Polymarket 5-minute binary "up/down" markets.** Every 5 minutes Polymarket lists *"Will BTC go up or down by HH:MM UTC?"*. The bot watches Binance (BTC stream, volume) for context, watches Polymarket for share prices, and bets via an **"Echo Hunt"** mean-reversion strategy that fades extreme streaks.
+
+- **Live host:** `13.235.115.6` (AWS EC2, single VM)
+- **Coins:** BTC (primary), ETH, SOL, XRP, DOGE, HYPE, BNB
+- **Process model:** 2 Node services (api + workers) under PM2 + Postgres + Redis in Docker
+- **Frontend:** React (Vite) at `apps/web` — live dashboard via SSE
+- **Settle currency:** USDC, via Polymarket CLOB v2 API
+
+---
+
+## Architecture at a glance
+
+```
+┌────────────── apps/workers ──────────────┐    ┌────────── apps/api ──────────┐
+│  PriceMonitoringWorker  (decides)        │    │  Express HTTP + SSE          │
+│  OrderResolver          (TP/SL on ticks) │    │  LiveTradingEngine           │
+│  TelegramService        (notifies)       │    │   ├─ PolymarketService       │
+│   ├─ PolymarketService  (WS, REST)       │    │   ├─ FutureTickScanner       │
+│   ├─ PolymarketClobExecutor (places)     │    │   └─ BinanceFastTicker       │
+│   └─ Binance polling/WS                  │    │  → SSE → web/                │
+└──────────────┬───────────────────────────┘    └──────────────┬───────────────┘
+               │                                                │
+               ├──── Redis SignalBus (pub/sub) ─────────────────┤
+               └──── Postgres (state, orders, configs) ─────────┘
+```
+
+**Two processes, isolated for safety:**
+- **`apps/workers`** owns trading WS subscriptions, places orders, fires Telegram. Single instance enforced via PID lockfile.
+- **`apps/api`** owns FE-facing WS subscriptions, serves HTTP, holds in-memory snapshot. Has its OWN Polymarket WS — workers and api never share a WS.
+
+**Why split:** if FE drops the WS or holds a stale snapshot, trading is unaffected. Conversely, a worker restart doesn't blank the dashboard. Loose coupling via SignalBus + Postgres.
+
+---
+
+## Where to look first
+
+| Want to change | Look at |
+|---|---|
+| Trading decision logic (when to fire signal / place order) | `apps/workers/src/PriceMonitoringWorker.ts` |
+| TP/SL trigger logic | `apps/workers/src/OrderResolver.ts` |
+| Order placement details | `packages/core/src/orderPlacement.ts` + `PolymarketClobExecutor.ts` |
+| Polymarket WS / REST integration | `packages/core/src/PolymarketService.ts` |
+| Cross-process events (SignalBus payload shapes) | `packages/core/src/SignalBus.ts` |
+| Per-coin config | `packages/core/src/CoinConfig.ts` (DB-backed) |
+| FE-facing snapshot / SSE stream | `apps/api/src/services/LiveTradingEngine.ts` + `apps/api/src/api/server.ts` |
+| FE Live page | `apps/web/src/pages/LivePage.tsx` |
+| Telegram message formatting | `packages/core/src/TelegramService.ts` |
+| Database schema | `packages/db/src/migrations/*.sql` (numbered, append-only) |
+
+---
+
+## Key concepts
+
+These show up everywhere — internalize them before reading code.
+
+### 5-minute window + phase timing
+Polymarket lists a fresh binary market every 5 min per coin. Two tokens (`tokenUp`, `tokenDown`) — prices sum ≈ 1.0.
+
+The bot ticks through phases relative to window start (T+0):
+
+| Phase | When | What happens |
+|---|---|---|
+| **T+0** | Window start | Stop trading on previous; new market becomes "current" |
+| **T+4** | T+0 + ~4s | **Preview** — emit signal event for FE/Telegram. Threshold gate NOT applied here. Retries every 5s if in-progress icon doesn't match expected direction. |
+| **T-3s** | T+5min - 3s | **Decision** — apply threshold + adaptive gates, place buy if all pass. Idempotent. |
+| **T-0** | Window close | Resolve outcome, settle position (TP fills or SL fires), record `close_reason`. |
+
+### Streak
+Past N consecutive windows with same direction. `+8 UP` means last 8 windows closed up. We look for **extreme streaks** (≥ adaptive threshold, default 8) because they're statistically due for reversal. **Source of truth is Polymarket midpoint at T-0** (Bug 1 fix `c3432e2`); Binance close-vs-open is fallback only for backfill.
+
+### Echo Hunt
+When a streak reaches threshold, bet **against** it (`down` if streak UP, `up` if streak DOWN), expecting mean reversion. Limit-buy at a contrarian price (e.g. 18¢ when market thinks 5%) for asymmetric R:R.
+
+Variants:
+- **Baseline** — fires whenever streak ≥ static threshold.
+- **Armed** — after a recent extreme streak triggered, threshold drops temporarily for 30-90 min.
+- **Defensive** — if no extreme streak in last 3+ hours, threshold raises and we stop trading (regime change protection).
+
+### Cycle state (per coin)
+```
+cycleActive: false ──── extreme streak hit ──→ cycleActive: true
+                                                  ├─ boundary BUY at T-3s
+                                                  ├─ TP rests at limit price (Path A — placed alongside BUY)
+                                                  ├─ SL fires on bid drop (chop filter + sustained 2s dip)
+                                                  ├─ optional DCA on loss
+                                                  └─ resolved at T-0 → cycleActive: false
+```
+
+`CoinState` lives in `PriceMonitoringWorker`. Echo-state heartbeat republishes every 60s (commit `92a0eba`) so API restarts don't blank the FE panel.
+
+### Polymarket WS quirks
+- **Server-side silent timeout at ~15 min** — connection stays "open" but no data flows. We **proactively rotate** at 13 min (commit `5cdf624`). Watchdog at 60s idle is a safety net.
+- **WS subscribe does NOT replay book events for inactive tokens** — every reconnect we force-REST-seed all subscribed token books.
+
+---
+
+## Known gotchas
+
+These have all bitten us. Don't repeat history.
+
+| Gotcha | Fix |
+|---|---|
+| Polymarket WS goes silent at ~15 min without `close` event | `5cdf624` — proactive rotate at 13 min |
+| Adding a new SignalBus event type without updating TelegramService switch → empty message → 400 | `b70aee4` — early-return for non-trade event types |
+| `phaseTMinus3` + `phaseT0 Path E` both placing boundary BUY for same window | `92a0eba` — `boundaryPlacementInFlight` flag set BEFORE any await |
+| Market-sell TP recording bid-at-trigger instead of FAK fill price | `6211cad` — switched to resting limit sell, captured FAK response |
+| SL fires on a noisy bid dip during chop | `9174d2c` — chop filter (≥2 reversals/1s) + sustained 2s dip |
+| Streak direction from Binance kline disagrees with Polymarket resolution | `c3432e2` — use Polymarket midpoint at T-0 as truth |
+| Config edit doesn't repopulate `lastEchoTriggerAt` for new threshold | `3969bc7` — `ensureBackfillFresh` re-backfill on threshold change |
+| API restart blanks Live page echo panel | `92a0eba` — DB persistence (`echo_state_cache`) + 60s heartbeat |
+
+---
+
+## LLM agent guidelines
+
+When working in this repo:
+
+### Think before coding
+- State assumptions before implementing. If multiple interpretations exist, present them — don't pick silently.
+- If a simpler approach exists, say so. Push back on overengineered plans.
+
+### Simplicity first
+Minimum code that solves the problem. No speculative features, no abstractions for single-use code, no error handling for impossible scenarios. If you wrote 200 lines and 50 would do, rewrite.
+
+### Surgical changes
+Touch only what you must. Don't "improve" adjacent code, refactor working code, or fix unrelated lint warnings. Match existing style. Mention dead code; don't delete it unless asked.
+
+### Goal-driven execution
+Convert tasks to verifiable goals: "fix bug" → "write a test that reproduces it, make it pass". State a brief plan for multi-step work. Strong success criteria let you loop independently.
+
+### Verify before claiming done
+- `pnpm typecheck` passes.
+- For a bug fix: cite prod log evidence or a DB query proving the regression is gone.
+- After deploy: pull live logs, verify new code is running (grep deployed `dist/` for new symbols).
+
+### When you fix a bug class — update docs
+- Add a row to **Known gotchas** above with commit hash.
+- Add a grep pattern to `.claude/skills/analyze-prod-logs/SKILL.md`.
+
+Institutional memory belongs in the repo, not in heads.

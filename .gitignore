@@ -12,6 +12,5 @@ keys
 # to commit a vault-protected version (still recommended to keep .yml local).
 deploy/group_vars/all.yml
 deploy/inventory.yml
-.claude/*
-!.claude/skills/
-.turbo/
+.claude/settings.json
+.turbo/*
