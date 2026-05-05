@@ -118,6 +118,7 @@ These have all bitten us. Don't repeat history.
 | Market-sell TP recording bid-at-trigger instead of FAK fill price | `6211cad` — switched to resting limit sell, captured FAK response |
 | SL fires on a noisy bid dip during chop | `9174d2c` — chop filter (≥2 reversals/1s) + sustained 2s dip |
 | Streak direction from Binance kline disagrees with Polymarket resolution | `c3432e2` — use Polymarket midpoint at T-0 as truth |
+| DCA skipped on a real loss because `fetchStreakWithVolume` trusts Binance for the just-closed window when `poly_clob_markets` cache hasn't synced yet (live `/prices-history` returns 'unknown' for ~30-60s after T-0) | TBD — pass T-0 verified `outcome` to `tryPlaceDcaAtBoundary` instead of recomputing via Binance |
 | Config edit doesn't repopulate `lastEchoTriggerAt` for new threshold | `3969bc7` — `ensureBackfillFresh` re-backfill on threshold change |
 | API restart blanks Live page echo panel | `92a0eba` — DB persistence (`echo_state_cache`) + 60s heartbeat |
 

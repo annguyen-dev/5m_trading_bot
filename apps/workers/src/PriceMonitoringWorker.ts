@@ -1119,6 +1119,18 @@ export class PriceMonitoringWorker {
   private async tryPlaceDcaAtBoundary(
     state: CoinState, cfg: CoinConfig,
     justClosedWindowStart: number,
+    /**
+     * The just-closed window's verified outcome (per Polymarket midpoint at T-0).
+     * Required so the streak-direction sanity gate below trusts livePolyOutcome
+     * instead of falling back to Binance close-vs-open via fetchStreakWithVolume,
+     * which can disagree when the Binance candle direction differs from the
+     * Polymarket resolution AND poly_clob_markets cache hasn't been synced yet
+     * (typical window-just-closed scenario; live `/prices-history` returns
+     * 'unknown' for ~30-60s after T-0). Without this, DCA was incorrectly
+     * skipped on losses where Binance happened to call the candle the other
+     * way — verified in prod 2026-05-05 08:04:58 BTC, $5 loss with no DCA.
+     */
+    justClosedOutcome: 'up' | 'down',
   ): Promise<void> {
     if (!state.cycleActive || state.cycleDirection == null) return;
 
@@ -1172,13 +1184,20 @@ export class PriceMonitoringWorker {
       }
     }
 
-    // Sanity: streak direction must still oppose our (contrarian) bet.
-    // If somehow it flipped (data anomaly, etc), skip — Path A will reopen
-    // a fresh cycle if conditions justify.
-    const streakDirection = streak > 0 ? 'up' : 'down';
-    if (streakDirection === direction) {
-      log('warn', `DCA skip ${state.symbol}: streak direction matches our bet (no longer contrarian)`, {
-        nextWindowStart, streak, cycleDirection: direction,
+    // Sanity: the just-closed window's outcome must still oppose our
+    // (contrarian) bet. We're in the loss branch, so by construction
+    // justClosedOutcome !== direction — but we keep this gate as a runtime
+    // assertion in case the caller's branching ever changes.
+    //
+    // Why use `justClosedOutcome` (T-0 verified) instead of `streak > 0`:
+    // fetchStreakWithVolume's verify step can return the wrong direction
+    // for the just-closed window when Binance close-vs-open disagrees with
+    // Polymarket resolution AND the Poly cache hasn't synced yet (live API
+    // returns 'unknown' for ~30-60s after T-0). Trusting the T-0 midpoint
+    // we already computed avoids that race entirely.
+    if (justClosedOutcome === direction) {
+      log('warn', `DCA skip ${state.symbol}: just-closed outcome matches our bet (caller bug — should be loss branch only)`, {
+        nextWindowStart, justClosedOutcome, cycleDirection: direction, streak,
       });
       return;
     }
@@ -1355,7 +1374,10 @@ export class PriceMonitoringWorker {
         // Loss → cycle continues. Fire DCA for the next window NOW that we
         // know the loss is real and the streak length includes it. Whitelist
         // gate (e.g. [4]) is checked inside; silent skip on miss.
-        await this.tryPlaceDcaAtBoundary(state, cfg, windowStart);
+        // Pass the verified T-0 outcome so DCA's streak-direction gate uses
+        // Polymarket truth instead of Binance close-vs-open (which can
+        // disagree, causing wrongful DCA skips — see fn comment).
+        await this.tryPlaceDcaAtBoundary(state, cfg, windowStart, outcome);
       }
     }
 

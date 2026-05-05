@@ -82,6 +82,7 @@ Run each pattern, count occurrences, sample 1 example. Group findings by categor
 | Same `(coin, window_start)` boundary BUY appears 2+ times within 30s | Duplicate-order race condition (we fixed `phaseT-3s` vs `phaseT0` Path E with `boundaryPlacementInFlight`). Regression check. |
 | `close_reason` aggregated by type over window | Compare distribution to baseline. Spikes in `sl` with high avg loss = filter regression or regime shift. |
 | `polymarket.*disagree\|outcome.*unknown\|livePolyOutcome.*fallback` | Bug 1 fallback firing — WS staleness, missing token_up, or pre-warmup state. |
+| `DCA skip.*streak direction matches\|just-closed outcome matches our bet` | Pre-fix: Binance/Poly disagree at T-0 → wrong streak → DCA wrongly skipped on a real loss. Post-fix: this should NEVER fire (caller is loss branch only); if it does, caller invariant is broken. |
 | `lastEchoTriggerAt\|backfill.*threshold` mismatch with current config | Config staleness — `ensureBackfillFresh` should retrigger. If not: state leak. |
 | `cycleActive:true` with no state transition >2h | Cycle stuck — never reset on close. Check OrderResolver eviction. |
 | Worker logs `T+4` event with `streak:0` repeatedly when chart shows clear streak | Outcome data source broken (DB row missing or `outcome IS NULL`). Check `poly_clob_markets` outcome column. |
