@@ -119,7 +119,7 @@ These have all bitten us. Don't repeat history.
 | SL fires on a noisy bid dip during chop | `9174d2c` — chop filter (≥2 reversals/1s) + sustained 2s dip |
 | Streak direction from Binance kline disagrees with Polymarket resolution | `c3432e2` — use Polymarket midpoint at T-0 as truth |
 | DCA skipped on a real loss because `fetchStreakWithVolume` trusts Binance for the just-closed window when `poly_clob_markets` cache hasn't synced yet (live `/prices-history` returns 'unknown' for ~30-60s after T-0) | `c571458` — pass T-0 verified `outcome` to `tryPlaceDcaAtBoundary` instead of recomputing via Binance |
-| `poly_clob_markets.outcome` permanently NULL because the planned `syncPendingOutcomes` background sweep was never implemented — every cross-check at T+4 had to live-fetch from Polymarket, often returning 'unknown' for recent windows | TBD — implement sweep in PMW tick: query `outcome IS NULL AND window_end < now-30s`, cap 20/tick, UPDATE on resolve |
+| `poly_clob_markets.outcome` permanently NULL — sweep via `/prices-history` doesn't work for our zero-liquidity BTC 5m tokens (API returns empty history) | `08f5e57` — write outcome inline from livePolyOutcome at T-0 (primary). `9d3dd54` + `fbccf85` + `f5788e8` — background sweep as best-effort safety net (DESC order, 1h retry, 24h max age). |
 | Config edit doesn't repopulate `lastEchoTriggerAt` for new threshold | `3969bc7` — `ensureBackfillFresh` re-backfill on threshold change |
 | API restart blanks Live page echo panel | `92a0eba` — DB persistence (`echo_state_cache`) + 60s heartbeat |
 
