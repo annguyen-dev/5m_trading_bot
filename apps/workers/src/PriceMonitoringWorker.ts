@@ -50,6 +50,12 @@ const ECHO_REPUBLISH_INTERVAL_MS = 60_000;
 const SYNC_OUTCOMES_BATCH                  = 20;
 const SYNC_OUTCOMES_RESOLVE_BUFFER_MS      = 30_000;
 const SYNC_OUTCOMES_STALE_WARN_MS          = 30 * 60_000;
+/** How long to wait before retrying a row whose live fetch returned 'unknown'.
+ *  Without this throttle, the sweep would re-fetch the same NULL rows every
+ *  tick — fatal when many old markets are permanently unresolvable (Polymarket
+ *  /prices-history has no data for windows >7 days back, verified in prod
+ *  2026-05-05: 4088 NULL rows >1d old, all returning 'unknown'). */
+const SYNC_OUTCOMES_RETRY_INTERVAL_MS      = 60 * 60_000;   // 1h
 
 // Phase slots. Tick-driven phases must be ≥ TICK_MS wide. T-3s placement is
 // NOT tick-driven — it's scheduled precisely via setTimeout from phaseT4 so
@@ -596,16 +602,24 @@ export class PriceMonitoringWorker {
 
     this.syncOutcomesInFlight = true;
     try {
-      const cutoff = Date.now() - SYNC_OUTCOMES_RESOLVE_BUFFER_MS;
+      const now             = Date.now();
+      const cutoff          = now - SYNC_OUTCOMES_RESOLVE_BUFFER_MS;
+      const retryAfter      = now - SYNC_OUTCOMES_RETRY_INTERVAL_MS;
+      // Order DESC so newly-closed windows resolve first — those are the ones
+      // the next tick's DCA / streak cross-check actually depends on. Old
+      // permanently-unresolvable rows process slowly via retry-after gate
+      // without blocking fresh windows.
       const { rows } = await getPool().query<{
         symbol: string; window_start: string; window_end: string; token_up: string;
       }>(
         `SELECT symbol, window_start, window_end, token_up
            FROM poly_clob_markets
-          WHERE outcome IS NULL AND window_end < $1
-          ORDER BY window_end ASC
-          LIMIT $2`,
-        [cutoff, SYNC_OUTCOMES_BATCH],
+          WHERE outcome IS NULL
+            AND window_end < $1
+            AND (outcome_fetched_at IS NULL OR outcome_fetched_at < $2)
+          ORDER BY window_end DESC
+          LIMIT $3`,
+        [cutoff, retryAfter, SYNC_OUTCOMES_BATCH],
       );
       if (rows.length === 0) return;
 
@@ -626,6 +640,15 @@ export class PriceMonitoringWorker {
             synced++;
           } else {
             stillUnknown++;
+            // Record the attempt so the retry-after gate skips this row for
+            // SYNC_OUTCOMES_RETRY_INTERVAL_MS. Without this, every tick re-tries
+            // the same permanently-unresolvable rows and they hog the batch.
+            await getPool().query(
+              `UPDATE poly_clob_markets
+                  SET outcome_fetched_at = $1
+                WHERE symbol = $2 AND window_start = $3`,
+              [Date.now(), r.symbol, wStart],
+            );
             const ageMs = Date.now() - wEnd;
             if (ageMs > SYNC_OUTCOMES_STALE_WARN_MS) {
               log('warn', 'syncPendingOutcomes: market still unresolved', {
