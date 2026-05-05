@@ -87,6 +87,14 @@ export class TelegramService {
    * works out of the box.
    */
   async send(ev: SignalBusEvent): Promise<void> {
+    // echo_state events are FE-only (drive the Live page panel via SSE);
+    // they have no human-readable formatter and must NEVER hit Telegram.
+    // Without this gate, the heartbeat republish (every 60s per coin) would
+    // spam Telegram with 400 "message text is empty" errors because the
+    // switch below has no case for it → text stays undefined → grammy
+    // sends empty string → Telegram rejects.
+    if (ev.type === 'echo_state') return;
+
     // Hard safety gate: never post to real Telegram chats outside production.
     // Cheaper than the simulate-mode trick — short-circuits before formatting,
     // DB lookups, and the grammy API call.
