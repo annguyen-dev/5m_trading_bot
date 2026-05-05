@@ -41,6 +41,16 @@ const WINDOW_MS  = 300_000;
  *  publishes that could take hours; a 60s heartbeat caps the gap. */
 const ECHO_REPUBLISH_INTERVAL_MS = 60_000;
 
+/** Background sync of poly_clob_markets.outcome — closes the gap that
+ *  fetchStreakWithVolume's verify step depends on. Polymarket usually
+ *  publishes resolution within 30-60s of T-0; we wait 30s before first
+ *  attempt, retry on subsequent ticks if still 'unknown'. Cap per tick
+ *  prevents API-rate-limit spam during fresh-start backfills (when many
+ *  windows are simultaneously NULL). */
+const SYNC_OUTCOMES_BATCH                  = 20;
+const SYNC_OUTCOMES_RESOLVE_BUFFER_MS      = 30_000;
+const SYNC_OUTCOMES_STALE_WARN_MS          = 30 * 60_000;
+
 // Phase slots. Tick-driven phases must be ≥ TICK_MS wide. T-3s placement is
 // NOT tick-driven — it's scheduled precisely via setTimeout from phaseT4 so
 // the order fires exactly 3s before window close (was 30s; users observed
@@ -225,6 +235,11 @@ export class PriceMonitoringWorker {
 
   /** Event-driven SL subscribers — called on every share_tick with bestBid set. */
   private shareTickHandlers = new Set<(tick: ShareTick) => void>();
+
+  /** Re-entry guard for the background outcome-sync pass. Prevents overlapping
+   *  runs if a sync slow-path (Polymarket API hiccup) bleeds into the next
+   *  TICK_MS — old run keeps going, next tick skips. */
+  private syncOutcomesInFlight = false;
 
   constructor(
     private readonly bus: SignalBus,
@@ -422,6 +437,15 @@ export class PriceMonitoringWorker {
         log('warn', `PriceMonitoringWorker tick ${state.symbol} failed`, { error: String(err) });
       }
     }
+
+    // Background outcome sync — runs once per tick across all coins. Internal
+    // re-entry guard handles slow-API overlap. Fire-and-forget so per-coin
+    // phase processing isn't blocked by Polymarket REST latency.
+    void this.syncPendingOutcomes().catch(err => {
+      log('warn', 'syncPendingOutcomes failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
   }
 
   private pruneEmitted(state: CoinState, windowStart: number): void {
@@ -550,6 +574,84 @@ export class PriceMonitoringWorker {
    *
    * On the no-change common path (most ticks) this is a cheap dedupe check.
    */
+  /**
+   * Background sweep: query rows in `poly_clob_markets` that still have
+   * `outcome IS NULL` past their `window_end + buffer`, fetch the resolved
+   * outcome via Polymarket `/prices-history`, and write it back. Capped per
+   * tick to avoid API rate-limit spam during fresh-instance backfill.
+   *
+   * Without this sweep, the cache only got populated as a side-effect of
+   * `fetchStreakWithVolume` happening to verify a window — which only touches
+   * the past `n` windows of the current streak (often 1-3). Older windows
+   * stayed NULL forever, defeating the cross-check that depends on this cache
+   * (manifested as Bug A — DCA wrongly skipped on a real loss).
+   *
+   * Fire-and-forget from the tick loop with `void`. Internal re-entry guard
+   * (`syncOutcomesInFlight`) prevents pile-up if the API is slow.
+   */
+  private async syncPendingOutcomes(): Promise<void> {
+    if (this.syncOutcomesInFlight) return;
+    const exec = getClobExecutor();
+    if (!exec) return;                                    // dev mode (no POLY_PRIVATE_KEY)
+
+    this.syncOutcomesInFlight = true;
+    try {
+      const cutoff = Date.now() - SYNC_OUTCOMES_RESOLVE_BUFFER_MS;
+      const { rows } = await getPool().query<{
+        symbol: string; window_start: string; window_end: string; token_up: string;
+      }>(
+        `SELECT symbol, window_start, window_end, token_up
+           FROM poly_clob_markets
+          WHERE outcome IS NULL AND window_end < $1
+          ORDER BY window_end ASC
+          LIMIT $2`,
+        [cutoff, SYNC_OUTCOMES_BATCH],
+      );
+      if (rows.length === 0) return;
+
+      let synced = 0;
+      let stillUnknown = 0;
+      for (const r of rows) {
+        const wStart = Number(r.window_start);
+        const wEnd   = Number(r.window_end);
+        try {
+          const outcome = await exec.fetchResolvedOutcome(r.token_up, wEnd);
+          if (outcome === 'up' || outcome === 'down') {
+            await getPool().query(
+              `UPDATE poly_clob_markets
+                  SET outcome = $1, outcome_fetched_at = $2
+                WHERE symbol = $3 AND window_start = $4`,
+              [outcome, Date.now(), r.symbol, wStart],
+            );
+            synced++;
+          } else {
+            stillUnknown++;
+            const ageMs = Date.now() - wEnd;
+            if (ageMs > SYNC_OUTCOMES_STALE_WARN_MS) {
+              log('warn', 'syncPendingOutcomes: market still unresolved', {
+                symbol: r.symbol, windowStart: wStart, ageMinutes: Math.round(ageMs / 60_000),
+              });
+            }
+          }
+        } catch (err) {
+          log('warn', 'syncPendingOutcomes: fetchResolvedOutcome threw', {
+            symbol: r.symbol, windowStart: wStart,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          // Continue — one bad row shouldn't block the rest of the batch.
+        }
+      }
+
+      if (synced > 0 || stillUnknown > 0) {
+        log('info', 'syncPendingOutcomes', {
+          synced, stillUnknown, totalScanned: rows.length,
+        });
+      }
+    } finally {
+      this.syncOutcomesInFlight = false;
+    }
+  }
+
   private async maybePublishEchoState(state: CoinState, cfg: CoinConfig): Promise<void> {
     if (cfg.strategy !== 'echo') return;
     const now = Date.now();
