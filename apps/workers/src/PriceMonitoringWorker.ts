@@ -1470,6 +1470,32 @@ export class PriceMonitoringWorker {
     if (outcome === 'unknown') {
       outcome = await fetchWindowOutcome(state.symbol, windowStart, windowEnd);
     }
+
+    // Persist the just-computed outcome to poly_clob_markets cache. This is
+    // the PRIMARY mechanism for populating that cache — the background
+    // syncPendingOutcomes sweep using /prices-history is unreliable for
+    // BTC 5m up/down tokens (verified empirically 2026-05-05: API returns
+    // empty history for our tokens because they have near-zero trading
+    // volume, so the resolved-from-trade-price approach can't work).
+    //
+    // livePolyOutcome reads the WS midpoint at T-0, which is the de-facto
+    // resolution signal regardless of whether trades occurred. Writing it
+    // here means downstream cross-checks (fetchStreakWithVolume) find a
+    // ground-truth value within milliseconds of T-0.
+    if (outcome !== 'unknown') {
+      void getPool().query(
+        `UPDATE poly_clob_markets
+            SET outcome = $1, outcome_fetched_at = $2
+          WHERE symbol = $3 AND window_start = $4 AND outcome IS NULL`,
+        [outcome, Date.now(), state.symbol, windowStart],
+      ).catch(err => {
+        log('warn', 'phaseT0: outcome cache write failed', {
+          symbol: state.symbol, windowStart,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+
     const t4 = state.lastT4;
 
     // Streak break detection: this window's outcome opposes T+4 streak direction.
