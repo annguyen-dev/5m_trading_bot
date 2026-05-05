@@ -56,6 +56,12 @@ const SYNC_OUTCOMES_STALE_WARN_MS          = 30 * 60_000;
  *  /prices-history has no data for windows >7 days back, verified in prod
  *  2026-05-05: 4088 NULL rows >1d old, all returning 'unknown'). */
 const SYNC_OUTCOMES_RETRY_INTERVAL_MS      = 60 * 60_000;   // 1h
+/** Skip markets older than this — /prices-history has no trade data for
+ *  zero-liquidity BTC 5m tokens beyond a small recent window. The PRIMARY
+ *  cache-population mechanism is the T-0 inline write in phaseT0; this sweep
+ *  is just a safety net for windows the worker missed during downtime, so
+ *  bounding it to "the last day" keeps the bound on log noise tight. */
+const SYNC_OUTCOMES_MAX_AGE_MS             = 24 * 60 * 60_000;
 
 // Phase slots. Tick-driven phases must be ≥ TICK_MS wide. T-3s placement is
 // NOT tick-driven — it's scheduled precisely via setTimeout from phaseT4 so
@@ -605,10 +611,12 @@ export class PriceMonitoringWorker {
       const now             = Date.now();
       const cutoff          = now - SYNC_OUTCOMES_RESOLVE_BUFFER_MS;
       const retryAfter      = now - SYNC_OUTCOMES_RETRY_INTERVAL_MS;
+      const minAge          = now - SYNC_OUTCOMES_MAX_AGE_MS;
       // Order DESC so newly-closed windows resolve first — those are the ones
-      // the next tick's DCA / streak cross-check actually depends on. Old
-      // permanently-unresolvable rows process slowly via retry-after gate
-      // without blocking fresh windows.
+      // the next tick's DCA / streak cross-check actually depends on. Cap by
+      // age so the sweep doesn't keep hitting the API for permanently
+      // unresolvable old markets — those are zero-liquidity tokens that
+      // /prices-history doesn't have any data for.
       const { rows } = await getPool().query<{
         symbol: string; window_start: string; window_end: string; token_up: string;
       }>(
@@ -616,10 +624,11 @@ export class PriceMonitoringWorker {
            FROM poly_clob_markets
           WHERE outcome IS NULL
             AND window_end < $1
+            AND window_end > $4
             AND (outcome_fetched_at IS NULL OR outcome_fetched_at < $2)
           ORDER BY window_end DESC
           LIMIT $3`,
-        [cutoff, retryAfter, SYNC_OUTCOMES_BATCH],
+        [cutoff, retryAfter, SYNC_OUTCOMES_BATCH, minAge],
       );
       if (rows.length === 0) return;
 
