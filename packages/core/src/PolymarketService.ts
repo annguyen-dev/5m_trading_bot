@@ -73,7 +73,7 @@ const CLOB_BASE  = 'https://clob.polymarket.com';
 const WS_URL     = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
 
 const WINDOW_SECS       = 300;
-const WS_RECONNECT_MS   = 2000;
+const WS_RECONNECT_MS   = 250;
 const DISCOVERY_POLL_MS = 60_000;   // re-scan upcoming markets every 60s
 const FLUSH_INTERVAL_MS = 1000;     // batch DB writes at most every 1s
 const FLUSH_BATCH_MAX   = 200;      // or when buffer hits this size
@@ -86,6 +86,12 @@ const UPCOMING_TRACK    = 3;        // track current + next 2 windows
 const WS_PING_INTERVAL_MS  = 25_000;   // outbound ping → keeps NAT/proxy from idle-killing
 const WS_STALE_MS          = 60_000;   // no DATA message ≥ this → assume zombie, reconnect
 const WS_WATCHDOG_TICK_MS  = 15_000;
+// Proactive rotation — Polymarket server-side appears to silence the WS data
+// stream every ~15 minutes (verified in prod logs: idleMs reaches 60-73s on
+// a 15:00 ± 30s cycle). Rotating BEFORE that silent window starts skips the
+// 60s of frozen FE prices entirely; only the ~750ms reconnect blackout
+// remains. The 60s watchdog above stays as a safety net for unexpected gaps.
+const WS_ROTATE_MS         = 780_000;  // 13 min — buffer before Polymarket's ~15min cut
 
 // ── Service ────────────────────────────────────────────────────────────────
 
@@ -363,9 +369,10 @@ export class PolymarketService extends EventEmitter {
     return new Promise((resolve) => {
       const ws = new WebSocket(WS_URL);
       this.ws = ws;
+      const openedAt = Date.now();
       // Start the staleness clock fresh; if the open handshake itself stalls,
       // the watchdog will close us out within WS_STALE_MS.
-      this.lastWsEventAt = Date.now();
+      this.lastWsEventAt = openedAt;
 
       // Outbound ping keeps NAT/proxy/Polymarket from idle-killing the socket
       // during quiet periods (no book updates). Pong is auto-handled by `ws`.
@@ -390,6 +397,18 @@ export class PolymarketService extends EventEmitter {
           try { ws.terminate(); } catch { /* ignore */ }
         }
       }, WS_WATCHDOG_TICK_MS);
+
+      // Proactive rotation: terminate before Polymarket's ~15min server-side
+      // silent timeout so we never enter the 60s "zombie" window. Reconnect
+      // happens cleanly within ~750ms vs ~62s of frozen FE prices otherwise.
+      const rotateTimer = setTimeout(() => {
+        if (this.ws !== ws) return;             // already superseded
+        log('info', 'Polymarket WS proactive rotate', {
+          ageMs: Date.now() - openedAt,
+          tokens: this.subscribedTokens.size,
+        });
+        try { ws.terminate(); } catch { /* ignore */ }
+      }, WS_ROTATE_MS);
 
       ws.on('open', () => {
         log('info', 'Polymarket WS open', { tokens: this.subscribedTokens.size });
@@ -424,6 +443,7 @@ export class PolymarketService extends EventEmitter {
         log('warn', 'Polymarket WS closed');
         clearInterval(pingTimer);
         clearInterval(watchdog);
+        clearTimeout(rotateTimer);
         if (this.ws === ws) this.ws = null;
         this.emit('disconnect');
         resolve();
