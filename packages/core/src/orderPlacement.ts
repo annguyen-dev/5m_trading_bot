@@ -19,15 +19,22 @@ import { log } from './observability/logger.js';
 export interface RecordOrderParams {
   conditionId: string;
   direction:   'up' | 'down';
-  sharePrice:  number;       // (0, 1) — observed ask at signal time, recorded for traceability
   /**
-   * Max price the FAK order is willing to pay (cents in [0, 1]). Lets the
-   * order sweep across multiple book levels up to this cap when top-of-book
-   * has thin or zero size. Defaults to `sharePrice` for backward-compat
-   * (single-level fills, which historically caused FAK kills on thin books —
-   * verified prod 2026-05-07 09:19-09:20: ask=0.29 had no liquidity, all 5
-   * retries killed at the same price). Callers SHOULD pass the user's
-   * limit_price_cents/100 so the FAK can absorb deeper levels.
+   * Observed ask at signal time. Recorded in DB for traceability of the
+   * entry expectation. NOT the FAK cap — that's `maxPrice` (separate role).
+   */
+  sharePrice:  number;       // (0, 1)
+  /**
+   * FAK price cap — the max we're willing to pay per share. Should be the
+   * user's `limit_price_cents/100` from config, NOT the observed ask.
+   *
+   * Old code reused `sharePrice` for both roles, which capped FAK at the
+   * exact top-of-book price. When the book had thin/zero size at that
+   * level (verified prod 2026-05-07 09:19-09:20 BTC: ask=0.29 had no
+   * liquidity, all 5 retries killed), the FAK could never fill across
+   * deeper levels even though the user's limit (66¢) allowed it.
+   *
+   * Defaults to sharePrice for backward compat (manual orders, etc.).
    */
   maxPrice?:   number;
   sizeUsdc:    number;       // > 0
@@ -107,8 +114,10 @@ export async function recordOrder(p: RecordOrderParams): Promise<RecordOrderResu
   if (mode === 'live') {
     const ex = getClobExecutor();
     if (!ex) throw new Error('live mode but PolymarketClobExecutor not initialized');
-    // Use maxPrice as FAK cap (sweep multiple levels) but still record
-    // sharePrice (the observed ask) as our entry expectation.
+    // FAK cap = user's max acceptable fill price (config limit_price_cents);
+    // NOT the observed ask. Lets the order sweep deeper levels when top-of-book
+    // is thin. recordedPrice below is overwritten with actual avg fill price
+    // so DB remains accurate regardless of sweep depth.
     const fakMaxPrice = Math.min(p.maxPrice ?? p.sharePrice, 0.99);
     const fill = await ex.placeMarketBuy(tokenID, p.sizeUsdc, fakMaxPrice);
     buyClobID     = fill.orderID;

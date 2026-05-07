@@ -1195,8 +1195,9 @@ export class PriceMonitoringWorker {
         conditionId:    market.conditionId,
         direction,
         sharePrice:     ask,
-        // FAK cap = user's limit. Lets the order sweep deeper book levels
-        // when top-of-book is thin (otherwise FAK kills at exact ask price).
+        // FAK cap = user's limit_price_cents (max acceptable fill price), NOT
+        // the observed ask. Lets the order sweep deeper levels when top-of-book
+        // is thin instead of FAK-killing at the exact ask price.
         maxPrice:       cfg.limit_price_cents / 100,
         sizeUsdc:       orderSize,
         source:         'auto',
