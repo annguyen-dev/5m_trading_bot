@@ -19,7 +19,17 @@ import { log } from './observability/logger.js';
 export interface RecordOrderParams {
   conditionId: string;
   direction:   'up' | 'down';
-  sharePrice:  number;       // (0, 1)
+  sharePrice:  number;       // (0, 1) — observed ask at signal time, recorded for traceability
+  /**
+   * Max price the FAK order is willing to pay (cents in [0, 1]). Lets the
+   * order sweep across multiple book levels up to this cap when top-of-book
+   * has thin or zero size. Defaults to `sharePrice` for backward-compat
+   * (single-level fills, which historically caused FAK kills on thin books —
+   * verified prod 2026-05-07 09:19-09:20: ask=0.29 had no liquidity, all 5
+   * retries killed at the same price). Callers SHOULD pass the user's
+   * limit_price_cents/100 so the FAK can absorb deeper levels.
+   */
+  maxPrice?:   number;
   sizeUsdc:    number;       // > 0
   source:      'manual' | 'auto' | 'backtest';
   /** Which StreakSignalEngine path placed this (auto orders only). */
@@ -97,7 +107,10 @@ export async function recordOrder(p: RecordOrderParams): Promise<RecordOrderResu
   if (mode === 'live') {
     const ex = getClobExecutor();
     if (!ex) throw new Error('live mode but PolymarketClobExecutor not initialized');
-    const fill = await ex.placeMarketBuy(tokenID, p.sizeUsdc, p.sharePrice);
+    // Use maxPrice as FAK cap (sweep multiple levels) but still record
+    // sharePrice (the observed ask) as our entry expectation.
+    const fakMaxPrice = Math.min(p.maxPrice ?? p.sharePrice, 0.99);
+    const fill = await ex.placeMarketBuy(tokenID, p.sizeUsdc, fakMaxPrice);
     buyClobID     = fill.orderID;
     recordedSize  = fill.filledUsdc;
     recordedPrice = fill.filledUsdc / fill.filledShares;

@@ -83,6 +83,7 @@ Run each pattern, count occurrences, sample 1 example. Group findings by categor
 | `close_reason` aggregated by type over window | Compare distribution to baseline. Spikes in `sl` with high avg loss = filter regression or regime shift. |
 | `polymarket.*disagree\|outcome.*unknown\|livePolyOutcome.*fallback` | Bug 1 fallback firing — WS staleness, missing token_up, or pre-warmup state. |
 | `fetchStreakWithVolume: Binance/Poly mismatch in streak — suppress` | Pre-fix only; should NEVER fire post-fix. Was disabling arming on real Poly streaks. |
+| `withRetry: CLOB market BUY exhausted after 5 attempts.*no orders found to match with FAK` | Book has thin liquidity at ask. Post-fix the FAK uses `limit_price_cents` as cap, sweeping deeper levels. If still firing post-fix: book is genuinely empty up to limit, or book API returned stale ask. |
 | `DCA skip.*streak direction matches\|just-closed outcome matches our bet` | Pre-fix: Binance/Poly disagree at T-0 → wrong streak → DCA wrongly skipped on a real loss. Post-fix: this should NEVER fire (caller is loss branch only); if it does, caller invariant is broken. |
 | `syncPendingOutcomes` count over 30min window | Healthy: synced=N, stillUnknown=0-1 each run. If `stillUnknown` keeps growing or `market still unresolved >30min` warns appear: Polymarket API hiccup or wrong token_up cached. |
 | `lastEchoTriggerAt\|backfill.*threshold` mismatch with current config | Config staleness — `ensureBackfillFresh` should retrigger. If not: state leak. |
