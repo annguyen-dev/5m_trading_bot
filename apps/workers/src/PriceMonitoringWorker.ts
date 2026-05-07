@@ -398,11 +398,23 @@ export class PriceMonitoringWorker {
     this.coins.set(symbol, state);
     log('info', `PriceMonitoringWorker: tracking ${symbol}`);
 
-    // Backfill echo state from historical bars: lastEchoTriggerAt (so arm
-    // window is correct on first tick after restart), lastExtremeStreakAt +
-    // gap stats (so defensive layer doesn't enter immediate-defensive mode
-    // on every restart). Fire-and-forget — if this fails, the live tracker
-    // catches up on the next observed trigger streak.
+    // ── Restore from echo_state_cache (persisted by API on every event) ──
+    // This MUST run before backfillEchoState so backfill can compare against
+    // the persisted runtime value and keep the more recent of the two.
+    //
+    // Why: backfill scans 30d of Binance bars (close-vs-open). Real-time
+    // T+4 detection uses fetchStreakWithVolume which trusts Polymarket
+    // outcomes (commit 1769269) — these can disagree on individual bars,
+    // so backfill's `lastTriggerAt` may be OLDER than the runtime-detected
+    // value. Without this restore, every restart resets `lastEchoTriggerAt`
+    // to the Binance-only result, dropping legitimate triggers seen by the
+    // prior worker (verified prod 2026-05-07 09:45 UTC: prior PID detected
+    // streak=5 at 06:44 UTC, restart's backfill found 04:05:50, arm window
+    // ended 2.5h before user expected).
+    await restoreEchoStateFromCache(state);
+
+    // Backfill echo state from historical bars. Combined with the restore
+    // above: keeps max(persisted, backfill) for both triggers + extreme.
     void backfillEchoState(state).catch(err => {
       log('warn', 'echo backfill failed', { symbol, error: String(err) });
     });
@@ -2078,6 +2090,52 @@ async function fetchStreakWithVolume(
  * Sets `state.backfillInFlight` for the duration to prevent concurrent
  * re-entries on rapid config edits (in-flight check in caller too).
  */
+/** Pick the more recent of two optional timestamps; null counts as -∞. */
+function pickMostRecent(a: number | null, b: number | null): number | null {
+  if (a == null) return b;
+  if (b == null) return a;
+  return Math.max(a, b);
+}
+
+/**
+ * Restore in-memory `lastEchoTriggerAt` + `lastExtremeStreakAt` from the
+ * `echo_state_cache` table at worker startup. The cache is written by API
+ * (LiveTradingEngine.recordEchoState) on every echo_state event the worker
+ * publishes, so it carries the most recent runtime-detected values across
+ * restarts. Without restoring, every restart drops legitimate triggers seen
+ * by the prior worker's runtime path (see addCoin call site comment for
+ * the prod incident that motivated this).
+ *
+ * Best-effort: failures (DB unavailable, stale schema, etc.) just leave
+ * the in-memory values null and let backfill fully repopulate.
+ */
+async function restoreEchoStateFromCache(state: CoinState): Promise<void> {
+  try {
+    const { rows } = await getPool().query<{ state: {
+      lastTriggerAt?: number | null;
+      lastExtremeStreakAt?: number | null;
+    } }>(
+      `SELECT state FROM echo_state_cache WHERE coin = $1 LIMIT 1`,
+      [state.symbol],
+    );
+    const cached = rows[0]?.state;
+    if (!cached) return;
+    const trigger = typeof cached.lastTriggerAt       === 'number' ? cached.lastTriggerAt       : null;
+    const extreme = typeof cached.lastExtremeStreakAt === 'number' ? cached.lastExtremeStreakAt : null;
+    state.lastEchoTriggerAt    = trigger;
+    state.lastExtremeStreakAt  = extreme;
+    log('info', `echo state restored from cache ${state.symbol}`, {
+      lastTriggerAt: trigger,
+      lastExtremeStreakAt: extreme,
+      triggerAgoMin: trigger != null ? Math.round((Date.now() - trigger) / 60_000) : null,
+    });
+  } catch (err) {
+    log('warn', 'echo state restore failed (continuing with backfill only)', {
+      symbol: state.symbol, error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 const BACKFILL_DAYS = 30;
 async function backfillEchoState(state: CoinState): Promise<void> {
   if (state.backfillInFlight) return;
@@ -2131,18 +2189,21 @@ async function backfillEchoState(state: CoinState): Promise<void> {
     i++;
   }
 
-  // Trigger-side state (always set for echo).
-  state.lastEchoTriggerAt        = lastTriggerAt;
+  // Trigger-side state. Take MAX(backfill, in-memory) so a more recent
+  // runtime-detected trigger (e.g., from prior PID's T+4 using Poly truth)
+  // isn't downgraded by Binance-only backfill. Pre-restore (addCoin) seeded
+  // the in-memory value from echo_state_cache.
+  state.lastEchoTriggerAt        = pickMostRecent(state.lastEchoTriggerAt, lastTriggerAt);
   state.backfillTriggerThreshold = triggerThreshold;
 
-  // Defensive-side state (only when enabled).
+  // Defensive-side state (only when enabled). Same max-merge semantic.
   if (defensiveThreshold !== null) {
     const gaps: number[] = [];
     for (let j = 1; j < extremeEventStarts.length; j++) {
       gaps.push(extremeEventStarts[j]! - extremeEventStarts[j - 1]!);
     }
     state.defensiveGapStats            = gaps.length > 0 ? computeGapStats(gaps) : null;
-    state.lastExtremeStreakAt          = lastExtremeAt;
+    state.lastExtremeStreakAt          = pickMostRecent(state.lastExtremeStreakAt, lastExtremeAt);
     state.backfillDefensiveThreshold   = defensiveThreshold;
   } else {
     state.defensiveGapStats            = null;
