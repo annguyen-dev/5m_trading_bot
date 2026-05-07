@@ -1979,11 +1979,37 @@ async function fetchStreakWithVolume(
     });
   }
 
-  const outcomes: ('up' | 'down' | 'doji')[] = bars.map(b =>
-    b.close > b.open ? 'up' :
-    b.close < b.open ? 'down' :
-    'doji',
+  // ── Build effective outcomes — Polymarket first, Binance fallback ────────
+  // Polymarket midpoint at T-0 is the resolution of record (Bug 1 fix path).
+  // Binance close-vs-open can diverge (volatile last seconds, exchange-specific
+  // ticks) — when they disagree, trust Polymarket. Pre-fetch Poly outcomes for
+  // ALL bars in the lookback window in ONE query, then merge.
+  //
+  // Previous design suppressed streak to 0 on any single mismatch — that
+  // disabled arming on real extreme streaks (verified prod 2026-05-07
+  // 02:00-02:30 UTC: 5-bar DOWN streak per Poly, 1 mismatch at 01:55, bot
+  // saw streak=0 the entire arm trigger window → never armed).
+  const allWindowStarts: number[] = bars.map((_, i) => startTime + i * WINDOW_MS);
+  const { rows: cachedOutcomes } = await getPool().query<{
+    window_start: string; outcome: string | null;
+  }>(
+    `SELECT window_start, outcome FROM poly_clob_markets
+      WHERE symbol = $1 AND window_start = ANY($2::bigint[])`,
+    [symbol, allWindowStarts],
   );
+  const polyMap = new Map<number, 'up' | 'down'>();
+  for (const r of cachedOutcomes) {
+    if (r.outcome === 'up' || r.outcome === 'down') {
+      polyMap.set(Number(r.window_start), r.outcome);
+    }
+  }
+
+  const outcomes: ('up' | 'down' | 'doji')[] = bars.map((b, i) => {
+    const polyOut = polyMap.get(allWindowStarts[i]!);
+    if (polyOut) return polyOut;
+    return b.close > b.open ? 'up' : b.close < b.open ? 'down' : 'doji';
+  });
+
   const newest = outcomes[outcomes.length - 1];
   if (!newest || newest === 'doji') {
     return { streak: 0, volumeBuckets: [], bodyHasHigh: false, bodyHasTiny: false, meanBodyRatio: 0, bodyHasVeryExtreme: false };
@@ -1995,54 +2021,6 @@ async function fetchStreakWithVolume(
     n++;
   }
   const streak = newest === 'up' ? n : -n;
-
-  // ── Poly cross-check ──────────────────────────────────────────────────────
-  // Per-coin policy: every window in the streak must agree with Polymarket's
-  // resolved outcome. If ANY window in the streak shows a Binance/Poly diff,
-  // the data is unreliable → return streak=0 → no T+4 signal → no T-3s order
-  // for the next window (the user-facing "cancel" effect).
-  //
-  // Batch-query the cached outcomes in one DB roundtrip; live-fetch only the
-  // windows that haven't been resolved yet.
-  const verifyStarts: number[] = [];
-  for (let i = 0; i < n; i++) verifyStarts.push(windowStart - (i + 1) * WINDOW_MS);
-
-  const { rows: cached } = await getPool().query<{
-    window_start: string; outcome: string | null; token_up: string;
-  }>(
-    `SELECT window_start, outcome, token_up FROM poly_clob_markets
-      WHERE symbol = $1 AND window_start = ANY($2::bigint[])`,
-    [symbol, verifyStarts],
-  );
-  const cacheMap = new Map(cached.map(r => [Number(r.window_start), r]));
-  const exec = getClobExecutor();
-
-  for (const wStart of verifyStarts) {
-    const row = cacheMap.get(wStart);
-    if (!row) continue;                          // no Poly market at this window — can't verify, skip
-    let polyOutcome: 'up' | 'down' | 'unknown' =
-      row.outcome === 'up' || row.outcome === 'down' ? row.outcome : 'unknown';
-
-    if (polyOutcome === 'unknown' && exec) {
-      polyOutcome = await exec.fetchResolvedOutcome(row.token_up, wStart + WINDOW_MS);
-      if (polyOutcome === 'up' || polyOutcome === 'down') {
-        await getPool().query(
-          `UPDATE poly_clob_markets
-             SET outcome = $1, outcome_fetched_at = $2
-           WHERE symbol = $3 AND window_start = $4`,
-          [polyOutcome, Date.now(), symbol, wStart],
-        );
-      }
-    }
-
-    if (polyOutcome !== 'unknown' && polyOutcome !== newest) {
-      log('warn', 'fetchStreakWithVolume: Binance/Poly mismatch in streak — suppress', {
-        symbol, windowStart, mismatchAt: wStart,
-        binance: newest, poly: polyOutcome,
-      });
-      return { streak: 0, volumeBuckets: [], bodyHasHigh: false, bodyHasTiny: false, meanBodyRatio: 0, bodyHasVeryExtreme: false };
-    }
-  }
 
   const avgVol = bars.reduce((a, b) => a + b.volume, 0) / bars.length;
   const streakBars = bars.slice(-n);
