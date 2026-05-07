@@ -216,6 +216,15 @@ interface CoinState {
    */
   lastEchoTriggerAt: number | null;
   /**
+   * Sliding window of recent arm-event timestamps (each arm = streak hit
+   * ≥ echo_trigger_streak). Used by the chain soft-defensive detector:
+   * when ≥ echo_chain_threshold arms occur within echo_chain_lookback_min,
+   * the entry threshold gets bumped (signal +chain_signal_bump, baseline
+   * +chain_baseline_bump) until echo_chain_cooldown_min passes with no
+   * new arm. Pruned to the lookback window on each append.
+   */
+  chainArmTimestamps: number[];
+  /**
    * Last published echo arm state (for transition-only emission). When the
    * computed state matches this AND `at` is recent (< ECHO_REPUBLISH_INTERVAL_MS),
    * we skip republish — keeps the bus quiet on the common path while still
@@ -229,6 +238,7 @@ interface CoinState {
     armEndAt: number | null;
     defensiveActive: boolean;
     lastExtremeStreakAt: number | null;
+    chainActive: boolean;
     at: number;
   } | null;
 }
@@ -393,6 +403,7 @@ export class PriceMonitoringWorker {
       backfillInFlight:   false,
       recentStreakAbs: [],
       lastEchoTriggerAt: null,
+      chainArmTimestamps: [],
       lastEchoStatePublished: null,
     };
     this.coins.set(symbol, state);
@@ -513,6 +524,18 @@ export class PriceMonitoringWorker {
     if (cfg.strategy === 'echo') {
       if (absStreak >= cfg.echo_trigger_streak) {
         state.lastEchoTriggerAt = Date.now();
+        // Chain detector — track each arm-event timestamp. Pruned to lookback
+        // window. Detection itself happens in effectiveAutoMinStreak (reads
+        // this list to decide bump). De-dup by 5-min bucket so retries within
+        // same window don't inflate the count.
+        const now = Date.now();
+        const bucketMs = 5 * 60_000;
+        const lastTs = state.chainArmTimestamps[state.chainArmTimestamps.length - 1];
+        if (lastTs == null || (now - lastTs) >= bucketMs) {
+          state.chainArmTimestamps.push(now);
+        }
+        const lookbackMs = (cfg.echo_chain_lookback_min ?? 90) * 60_000;
+        state.chainArmTimestamps = state.chainArmTimestamps.filter(t => now - t <= lookbackMs);
       }
       // Defensive tracker — record extreme streak observations so the
       // overdue-gap check in tryPlaceBoundary has data.
@@ -711,27 +734,37 @@ export class PriceMonitoringWorker {
     const defensiveActive = cfg.echo_defensive_enabled
       && (defensiveActivatesAt == null || now > defensiveActivatesAt);
 
+    // Compute chain regime state — bump thresholds when active.
+    const chain = computeChainState(state, cfg);
+
     // Re-publish on any state transition: armed, armEndAt, defensive active,
-    // or extreme observation timestamp. The latter matters even when
-    // defensive flag doesn't flip — FE needs the fresh timestamp to compute
-    // the live countdown to next defensive activation.
+    // chain active, or extreme observation timestamp. The latter matters
+    // even when defensive flag doesn't flip — FE needs the fresh timestamp
+    // to compute the live countdown to next defensive activation.
     const last = state.lastEchoStatePublished;
     const same = last
       && last.armed === armed
       && last.armEndAt === armEndAt
       && last.defensiveActive === defensiveActive
-      && last.lastExtremeStreakAt === state.lastExtremeStreakAt;
+      && last.lastExtremeStreakAt === state.lastExtremeStreakAt
+      && last.chainActive === chain.active;
     const heartbeatDue = !last || (now - last.at) >= ECHO_REPUBLISH_INTERVAL_MS;
     if (same && !heartbeatDue) return;
     state.lastEchoStatePublished = {
       armed, armEndAt, defensiveActive,
       lastExtremeStreakAt: state.lastExtremeStreakAt,
+      chainActive: chain.active,
       at: now,
     };
-    // Effective threshold reflects defensive override.
+    // Effective threshold reflects defensive AND chain overrides (additive).
     let threshold = armed ? cfg.echo_signal_min_streak : cfg.echo_baseline_streak;
     if (defensiveActive && cfg.echo_defensive_action === 'disable_armed' && armed) {
       threshold = cfg.echo_baseline_streak;
+    }
+    const sigBump = chain.active ? cfg.echo_chain_signal_bump   : 0;
+    const baseBump = chain.active ? cfg.echo_chain_baseline_bump : 0;
+    if (chain.active) {
+      threshold += armed ? sigBump : baseBump;
     }
     await this.bus.publish<SignalEchoStateEvent>({
       type:                  'echo_state',
@@ -751,10 +784,21 @@ export class PriceMonitoringWorker {
       defensiveStreakThreshold: cfg.echo_defensive_streak_threshold,
       defensiveOverdueMinutes:  cfg.echo_defensive_overdue_minutes,
       defensiveGapStats:        state.defensiveGapStats,
+      // Chain regime fields
+      chainEnabled:             cfg.echo_chain_enabled,
+      chainActive:              chain.active,
+      chainArmCount:            chain.armCount,
+      chainLookbackMinutes:     cfg.echo_chain_lookback_min,
+      chainArmThreshold:        cfg.echo_chain_threshold,
+      chainLastArmAt:           chain.lastArmAt,
+      chainExpiresAt:           chain.expiresAt,
+      chainSignalBumpApplied:   sigBump,
+      chainBaselineBumpApplied: baseBump,
       emittedAt:             now,
     });
     log('info', `echo state ${state.symbol}`, {
-      armed, threshold, defensiveActive,
+      armed, threshold, defensiveActive, chainActive: chain.active,
+      chainArmCount: chain.armCount,
       lastTriggerAt: state.lastEchoTriggerAt,
       armEndAt, defensiveActivatesAt,
     });
@@ -811,21 +855,26 @@ export class PriceMonitoringWorker {
     if (cfg.strategy === 'echo') {
       const armed = state.lastEchoTriggerAt != null
         && (Date.now() - state.lastEchoTriggerAt) <= cfg.echo_window_minutes * 60_000;
+      // Chain regime check — bump thresholds when arm events cluster.
+      // Reactive (not predictive); fires on observation of consecutive arms.
+      const chain = computeChainState(state, cfg);
       if (armed) {
         const minLeft = Math.max(0, Math.round(
           (state.lastEchoTriggerAt! + cfg.echo_window_minutes * 60_000 - Date.now()) / 60_000,
         ));
-        return {
-          threshold: cfg.echo_signal_min_streak,
-          mode: 'aggressive',
-          reason: `echo armed — ${minLeft}m left in arm window (signal_min=${cfg.echo_signal_min_streak})`,
-        };
+        const baseSig = cfg.echo_signal_min_streak;
+        const threshold = chain.active ? baseSig + cfg.echo_chain_signal_bump : baseSig;
+        const reason = chain.active
+          ? `echo armed (CHAIN — ${chain.armCount} arms in ${cfg.echo_chain_lookback_min}m, threshold ${baseSig}→${threshold}) — ${minLeft}m left in arm window`
+          : `echo armed — ${minLeft}m left in arm window (signal_min=${baseSig})`;
+        return { threshold, mode: 'aggressive', reason };
       }
-      return {
-        threshold: cfg.echo_baseline_streak,
-        mode: 'default',
-        reason: `echo idle — using baseline echo_baseline_streak=${cfg.echo_baseline_streak}`,
-      };
+      const baseIdle = cfg.echo_baseline_streak;
+      const threshold = chain.active ? baseIdle + cfg.echo_chain_baseline_bump : baseIdle;
+      const reason = chain.active
+        ? `echo idle (CHAIN — ${chain.armCount} arms in ${cfg.echo_chain_lookback_min}m, threshold ${baseIdle}→${threshold})`
+        : `echo idle — using baseline echo_baseline_streak=${baseIdle}`;
+      return { threshold, mode: chain.active ? 'conservative' : 'default', reason };
     }
     const base = cfg.auto_order_min_streak;
     const hour = new Date().getUTCHours();
@@ -2095,6 +2144,43 @@ function pickMostRecent(a: number | null, b: number | null): number | null {
   if (a == null) return b;
   if (b == null) return a;
   return Math.max(a, b);
+}
+
+/**
+ * Chain regime detector — soft defensive trigger.
+ *
+ * Reactive (not predictive): when arm events cluster within a short lookback,
+ * the regime is chaotic enough that contrarian Echo bets compound losses
+ * across cycles. Bumping the entry threshold (instead of full skip) keeps
+ * the bot trading on STRONG setups only — preserves Echo edge while
+ * filtering weak/marginal entries during regime risk.
+ *
+ * Returns: { active, armCount, lastArmAt, expiresAt }
+ *   - active: chain trigger met right now (≥ threshold arms in lookback)
+ *   - armCount: # arms in current lookback window (display)
+ *   - expiresAt: when chain auto-clears (last arm + cooldown_min)
+ */
+function computeChainState(state: CoinState, cfg: CoinConfig): {
+  active: boolean; armCount: number; lastArmAt: number | null; expiresAt: number | null;
+} {
+  if (!cfg.echo_chain_enabled || cfg.strategy !== 'echo') {
+    return { active: false, armCount: 0, lastArmAt: null, expiresAt: null };
+  }
+  const now = Date.now();
+  const lookbackMs = cfg.echo_chain_lookback_min * 60_000;
+  const cooldownMs = cfg.echo_chain_cooldown_min * 60_000;
+  const recentArms = state.chainArmTimestamps.filter(t => now - t <= lookbackMs);
+  const lastArmAt = recentArms.length > 0 ? recentArms[recentArms.length - 1]! : null;
+  // Chain stays active for cooldown_min after the LAST arm. Threshold is the
+  // count within lookback window (not cooldown) — short-term density signal.
+  const inCooldown = lastArmAt != null && (now - lastArmAt) <= cooldownMs;
+  const active = recentArms.length >= cfg.echo_chain_threshold && inCooldown;
+  return {
+    active,
+    armCount: recentArms.length,
+    lastArmAt,
+    expiresAt: lastArmAt != null ? lastArmAt + cooldownMs : null,
+  };
 }
 
 /**

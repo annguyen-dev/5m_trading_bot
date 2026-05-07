@@ -193,6 +193,26 @@ export interface SignalEchoStateEvent {
   /** Inter-event gap percentiles from the 30-day backfill at startup. null
    *  when the backfill saw fewer than 2 extreme events (no gaps to measure). */
   defensiveGapStats: DefensiveGapStats | null;
+
+  // ── Chain regime soft-defensive state ─────────────────────────────────
+  /** Whether chain detector is enabled in config. */
+  chainEnabled:        boolean;
+  /** Whether chain regime is CURRENTLY active (≥ threshold arms in lookback). */
+  chainActive:         boolean;
+  /** # of arm events observed within current lookback window. */
+  chainArmCount:       number;
+  /** Lookback window in minutes (mirrors cfg.echo_chain_lookback_min). */
+  chainLookbackMinutes: number;
+  /** Trigger threshold (mirrors cfg.echo_chain_threshold). */
+  chainArmThreshold:   number;
+  /** ms timestamp of the most recent arm event (null when no recent arm). */
+  chainLastArmAt:      number | null;
+  /** ms timestamp when chain auto-clears if no new arm (= lastArmAt + cooldown_min). */
+  chainExpiresAt:      number | null;
+  /** Effective threshold delta from chain mode. 0 when inactive. */
+  chainSignalBumpApplied:   number;
+  chainBaselineBumpApplied: number;
+
   emittedAt:      number;
 }
 

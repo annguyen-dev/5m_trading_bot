@@ -1902,6 +1902,61 @@ const EchoStatusRow = React.memo(function EchoStatusRow({
       ) : (
         <span style={{ ...ES.defensive, color: '#6e7681' }}>DEF off</span>
       )}
+      <ChainStatus echo={echo} nowMs={nowMs} fmtMin={fmtMin} />
+    </div>
+  );
+});
+
+// Chain regime soft-defensive status — shows current state + reason WHY
+// the threshold may be bumped above the configured baseline/armed values.
+const ChainStatus = React.memo(function ChainStatus({
+  echo, nowMs, fmtMin,
+}: {
+  echo: NonNullable<CoinEventsEntry['echo']>;
+  nowMs: number;
+  fmtMin: (m: number) => string;
+}) {
+  if (echo.chainEnabled !== true) {
+    return <span style={{ ...ES.defensive, color: '#6e7681' }}>CHAIN off</span>;
+  }
+  const expiresAt = echo.chainExpiresAt;
+  const lastArmAt = echo.chainLastArmAt;
+  const expiresIn = expiresAt != null
+    ? Math.max(0, Math.round((expiresAt - nowMs) / 60000))
+    : null;
+  const lastArmAgo = lastArmAt != null
+    ? Math.round((nowMs - lastArmAt) / 60000)
+    : null;
+  const sigBump   = echo.chainSignalBumpApplied   ?? 0;
+  const baseBump  = echo.chainBaselineBumpApplied ?? 0;
+  const armCount  = echo.chainArmCount            ?? 0;
+  const lookback  = echo.chainLookbackMinutes     ?? 0;
+  const threshold = echo.chainArmThreshold        ?? 0;
+  const active    = echo.chainActive === true;
+  return (
+    <div style={ES.defensive}>
+      <div>
+        CHAIN{' '}
+        {active ? (
+          <span style={{ color: '#f0a500', fontWeight: 600 }}>
+            ACTIVE → bumped armed +{sigBump} / idle +{baseBump}
+          </span>
+        ) : (
+          <span style={{ color: '#8b949e' }}>idle</span>
+        )}
+        <span style={ES.hint}>
+          {' '}· trigger ≥{threshold} arms in {lookback}m
+        </span>
+      </div>
+      <div style={ES.subline}>
+        {armCount} arms in last {lookback}m
+        {lastArmAgo != null && (
+          <>{' · last arm '}<b>{fmtMin(lastArmAgo)}</b>{' ago'}</>
+        )}
+        {active && expiresIn != null && (
+          <>{' · clears in '}<b>{fmtMin(expiresIn)}</b>{' if no new arm'}</>
+        )}
+      </div>
     </div>
   );
 });

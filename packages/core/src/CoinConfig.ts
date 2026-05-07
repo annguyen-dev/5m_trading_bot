@@ -167,6 +167,29 @@ export interface CoinConfig {
    *                     resets the timer.
    */
   echo_defensive_action: 'disable_armed' | 'skip_all';
+
+  // ── Chain regime soft-defensive (echo only) ───────────────────────────────
+  // When arm events fire close together (chaotic/trending regime), the bot
+  // accumulates losses across multiple cycles even if individual cycle EV is
+  // marginal. Detect "chain regime" reactively (not predictively — verified
+  // 60d data shows arms are ~independent statistically) and bump the entry
+  // threshold so the bot still trades but only on strong setups.
+  //
+  // Soft mode: instead of full skip, raise streak thresholds by configurable
+  // amounts. Echo strategy spirit preserved — bot doesn't full-stop, just
+  // tightens the bar during regime risk.
+  /** Master toggle for chain soft-defensive. */
+  echo_chain_enabled: boolean;
+  /** Minutes to look back for arm events. */
+  echo_chain_lookback_min: number;
+  /** Min number of arm events in lookback window to trigger chain. */
+  echo_chain_threshold: number;
+  /** Minutes after last arm event before chain auto-resets to normal. */
+  echo_chain_cooldown_min: number;
+  /** Bump applied to echo_signal_min_streak when chain active (additive). */
+  echo_chain_signal_bump: number;
+  /** Bump applied to echo_baseline_streak when chain active (additive). */
+  echo_chain_baseline_bump: number;
 }
 
 export type CoinConfigs = Partial<Record<CoinSymbol, CoinConfig>>;
@@ -198,6 +221,13 @@ const DEFAULT_CONFIG: CoinConfig = {
   echo_defensive_streak_threshold:  7,
   echo_defensive_overdue_minutes:   1440,
   echo_defensive_action:            'disable_armed',
+  // Chain soft-defensive defaults (off by default; user must opt in per coin)
+  echo_chain_enabled:               false,
+  echo_chain_lookback_min:          90,
+  echo_chain_threshold:             2,
+  echo_chain_cooldown_min:          120,
+  echo_chain_signal_bump:           2,
+  echo_chain_baseline_bump:         1,
 };
 
 export const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB'];

@@ -41,6 +41,12 @@ const DEFAULT_CONFIG: CoinConfig = {
   echo_defensive_streak_threshold:  7,
   echo_defensive_overdue_minutes:   1440,
   echo_defensive_action:            'disable_armed',
+  echo_chain_enabled:               false,
+  echo_chain_lookback_min:          90,
+  echo_chain_threshold:             2,
+  echo_chain_cooldown_min:          120,
+  echo_chain_signal_bump:           2,
+  echo_chain_baseline_bump:         1,
 };
 
 /** GET /api/coin-configs → array of { symbol, ...config } for all 7 coins. */
