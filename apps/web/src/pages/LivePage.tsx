@@ -1919,20 +1919,19 @@ const ChainStatus = React.memo(function ChainStatus({
   if (echo.chainEnabled !== true) {
     return <span style={{ ...ES.defensive, color: '#6e7681' }}>CHAIN off</span>;
   }
-  const expiresAt = echo.chainExpiresAt;
-  const lastArmAt = echo.chainLastArmAt;
-  const expiresIn = expiresAt != null
-    ? Math.max(0, Math.round((expiresAt - nowMs) / 60000))
-    : null;
-  const lastArmAgo = lastArmAt != null
-    ? Math.round((nowMs - lastArmAt) / 60000)
-    : null;
+  const lastEventAt = echo.chainLastEventAt;
+  const gapMin      = echo.chainGapMinutes ?? null;
+  const activatesAt = echo.chainActivatesAt;
   const sigBump   = echo.chainSignalBumpApplied   ?? 0;
   const baseBump  = echo.chainBaselineBumpApplied ?? 0;
-  const armCount  = echo.chainArmCount            ?? 0;
-  const lookback  = echo.chainLookbackMinutes     ?? 0;
-  const threshold = echo.chainArmThreshold        ?? 0;
+  const eventArms = echo.chainEventArmCount       ?? 0;
+  const eventWin  = echo.chainEventWindowMinutes  ?? 0;
+  const overdue   = echo.chainOverdueMinutes      ?? 0;
+  const armsNow   = echo.chainArmsInWindow        ?? 0;
   const active    = echo.chainActive === true;
+  const activatesIn = activatesAt != null
+    ? Math.max(0, Math.round((activatesAt - nowMs) / 60000))
+    : null;
   return (
     <div style={ES.defensive}>
       <div>
@@ -1945,17 +1944,17 @@ const ChainStatus = React.memo(function ChainStatus({
           <span style={{ color: '#8b949e' }}>idle</span>
         )}
         <span style={ES.hint}>
-          {' '}· trigger ≥{threshold} arms in {lookback}m
+          {' '}· event = ≥{eventArms} arms in {eventWin}m  · overdue ≥{fmtMin(overdue)}
         </span>
       </div>
       <div style={ES.subline}>
-        {armCount} arms in last {lookback}m
-        {lastArmAgo != null && (
-          <>{' · last arm '}<b>{fmtMin(lastArmAgo)}</b>{' ago'}</>
+        {lastEventAt != null && gapMin != null
+          ? <>last chain <b>{fmtMin(gapMin)}</b> ago</>
+          : <span style={{ color: '#f0a500' }}>no chain event observed yet → enforced</span>}
+        {!active && activatesIn != null && (
+          <>{' · activates in '}<b>{fmtMin(activatesIn)}</b>{' if no new chain'}</>
         )}
-        {active && expiresIn != null && (
-          <>{' · clears in '}<b>{fmtMin(expiresIn)}</b>{' if no new arm'}</>
-        )}
+        {' · current window '}<b>{armsNow}/{eventArms}</b>{' arms'}
       </div>
     </div>
   );

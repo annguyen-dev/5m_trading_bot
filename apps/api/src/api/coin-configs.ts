@@ -42,9 +42,9 @@ const DEFAULT_CONFIG: CoinConfig = {
   echo_defensive_overdue_minutes:   1440,
   echo_defensive_action:            'disable_armed',
   echo_chain_enabled:               false,
-  echo_chain_lookback_min:          90,
-  echo_chain_threshold:             2,
-  echo_chain_cooldown_min:          120,
+  echo_chain_event_arm_count:       2,
+  echo_chain_event_window_min:      60,
+  echo_chain_overdue_min:           1600,
   echo_chain_signal_bump:           2,
   echo_chain_baseline_bump:         1,
 };

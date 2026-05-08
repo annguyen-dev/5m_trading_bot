@@ -194,24 +194,28 @@ export interface SignalEchoStateEvent {
    *  when the backfill saw fewer than 2 extreme events (no gaps to measure). */
   defensiveGapStats: DefensiveGapStats | null;
 
-  // ── Chain regime soft-defensive state ─────────────────────────────────
-  /** Whether chain detector is enabled in config. */
-  chainEnabled:        boolean;
-  /** Whether chain regime is CURRENTLY active (≥ threshold arms in lookback). */
-  chainActive:         boolean;
-  /** # of arm events observed within current lookback window. */
-  chainArmCount:       number;
-  /** Lookback window in minutes (mirrors cfg.echo_chain_lookback_min). */
-  chainLookbackMinutes: number;
-  /** Trigger threshold (mirrors cfg.echo_chain_threshold). */
-  chainArmThreshold:   number;
-  /** ms timestamp of the most recent arm event (null when no recent arm). */
-  chainLastArmAt:      number | null;
-  /** ms timestamp when chain auto-clears if no new arm (= lastArmAt + cooldown_min). */
-  chainExpiresAt:      number | null;
-  /** Effective threshold delta from chain mode. 0 when inactive. */
-  chainSignalBumpApplied:   number;
-  chainBaselineBumpApplied: number;
+  // ── Chain predictive defensive state ──────────────────────────────────
+  /** Whether chain predictive defensive is enabled in config. */
+  chainEnabled:               boolean;
+  /** Whether defensive is CURRENTLY active (gap > overdue OR never observed). */
+  chainActive:                boolean;
+  /** ms timestamp of last chain event (≥N arms in window). null = never. */
+  chainLastEventAt:           number | null;
+  /** Minutes since last chain event (informational; null when never). */
+  chainGapMinutes:            number | null;
+  /** Live arm count in current event window (counts toward next chain event). */
+  chainArmsInWindow:          number;
+  /** Mirrors cfg: how many arms in window define a chain event. */
+  chainEventArmCount:         number;
+  /** Mirrors cfg: event window length (minutes). */
+  chainEventWindowMinutes:    number;
+  /** Mirrors cfg: gap that triggers defensive (minutes). */
+  chainOverdueMinutes:        number;
+  /** ms timestamp when defensive activates (null when already active or never). */
+  chainActivatesAt:           number | null;
+  /** Effective threshold delta currently applied (0 when inactive). */
+  chainSignalBumpApplied:     number;
+  chainBaselineBumpApplied:   number;
 
   emittedAt:      number;
 }

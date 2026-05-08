@@ -188,14 +188,16 @@ export interface CoinEchoEvent {
   defensiveStreakThreshold: number;
   defensiveOverdueMinutes:  number;
   defensiveGapStats:        DefensiveGapStats | null;
-  // Chain regime soft-defensive
-  chainEnabled?:        boolean;
-  chainActive?:         boolean;
-  chainArmCount?:       number;
-  chainLookbackMinutes?: number;
-  chainArmThreshold?:   number;
-  chainLastArmAt?:      number | null;
-  chainExpiresAt?:      number | null;
+  // Chain predictive defensive
+  chainEnabled?:             boolean;
+  chainActive?:              boolean;
+  chainLastEventAt?:         number | null;
+  chainGapMinutes?:          number | null;
+  chainArmsInWindow?:        number;
+  chainEventArmCount?:       number;
+  chainEventWindowMinutes?:  number;
+  chainOverdueMinutes?:      number;
+  chainActivatesAt?:         number | null;
   chainSignalBumpApplied?:   number;
   chainBaselineBumpApplied?: number;
   emittedAt:         number;

@@ -169,26 +169,29 @@ export interface CoinConfig {
   echo_defensive_action: 'disable_armed' | 'skip_all';
 
   // ── Chain regime soft-defensive (echo only) ───────────────────────────────
-  // When arm events fire close together (chaotic/trending regime), the bot
-  // accumulates losses across multiple cycles even if individual cycle EV is
-  // marginal. Detect "chain regime" reactively (not predictively — verified
-  // 60d data shows arms are ~independent statistically) and bump the entry
-  // threshold so the bot still trades but only on strong setups.
+  // PREDICTIVE mode: track time since last "chain event" (cluster of arm
+  // events in a short window). When the gap exceeds a data-derived overdue
+  // threshold, the next chain is statistically due — enter defensive mode
+  // (bump entry threshold so only STRONG setups fire). Auto-clears when the
+  // next chain event manifests.
   //
-  // Soft mode: instead of full skip, raise streak thresholds by configurable
-  // amounts. Echo strategy spirit preserved — bot doesn't full-stop, just
-  // tightens the bar during regime risk.
-  /** Master toggle for chain soft-defensive. */
+  // Empirical (BTC 60d): chain event = ≥2 arms in 1h. Inter-event gap p75
+  // ≈ 27h; samples in 32-64h gap range show 1.25x lift in P(chain in next
+  // 6h). Modest predictive signal but consistent with vol-clustering.
+  /** Master toggle for chain predictive defensive. */
   echo_chain_enabled: boolean;
-  /** Minutes to look back for arm events. */
-  echo_chain_lookback_min: number;
-  /** Min number of arm events in lookback window to trigger chain. */
-  echo_chain_threshold: number;
-  /** Minutes after last arm event before chain auto-resets to normal. */
-  echo_chain_cooldown_min: number;
-  /** Bump applied to echo_signal_min_streak when chain active (additive). */
+  /** A chain event is recorded when ≥ this many arms fire within
+   *  `echo_chain_event_window_min` of each other. Default 2. */
+  echo_chain_event_arm_count: number;
+  /** Minutes window for clustering arm events into a chain event. Default 60. */
+  echo_chain_event_window_min: number;
+  /** Defensive activates when (now - lastChainEventAt) exceeds this. Use a
+   *  data-derived value (e.g., p75 of historical inter-event gaps).
+   *  Default 1600 = ~27h (BTC p75). */
+  echo_chain_overdue_min: number;
+  /** Bump added to echo_signal_min_streak when defensive active (armed mode). */
   echo_chain_signal_bump: number;
-  /** Bump applied to echo_baseline_streak when chain active (additive). */
+  /** Bump added to echo_baseline_streak when defensive active (idle mode). */
   echo_chain_baseline_bump: number;
 }
 
@@ -221,11 +224,14 @@ const DEFAULT_CONFIG: CoinConfig = {
   echo_defensive_streak_threshold:  7,
   echo_defensive_overdue_minutes:   1440,
   echo_defensive_action:            'disable_armed',
-  // Chain soft-defensive defaults (off by default; user must opt in per coin)
+  // Chain predictive defensive defaults (off by default; opt-in per coin).
+  // Defaults derived from BTC 60d data:
+  //   chain event = ≥2 arms in 60min (gap median 13.8h, p75 26.6h)
+  //   overdue threshold = ~p75 = 1600min (≈27h) → top quartile of gaps
   echo_chain_enabled:               false,
-  echo_chain_lookback_min:          90,
-  echo_chain_threshold:             2,
-  echo_chain_cooldown_min:          120,
+  echo_chain_event_arm_count:       2,
+  echo_chain_event_window_min:      60,
+  echo_chain_overdue_min:           1600,
   echo_chain_signal_bump:           2,
   echo_chain_baseline_bump:         1,
 };
