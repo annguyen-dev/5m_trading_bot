@@ -231,6 +231,13 @@ interface CoinState {
    */
   lastChainEventAt: number | null;
   /**
+   * Set of windowStarts (ms) for which Binance/Poly mismatch alert has
+   * already been fired. Prevents spam when fetchStreakWithVolume runs
+   * repeatedly within the same 5m window (T+4 retry loop). Pruned to bars
+   * still within current streak lookback (48 bars × 5min).
+   */
+  alertedMismatchWindows: Set<number>;
+  /**
    * Last published echo arm state (for transition-only emission). When the
    * computed state matches this AND `at` is recent (< ECHO_REPUBLISH_INTERVAL_MS),
    * we skip republish — keeps the bus quiet on the common path while still
@@ -411,6 +418,7 @@ export class PriceMonitoringWorker {
       lastEchoTriggerAt: null,
       recentArmTimestamps: [],
       lastChainEventAt: null,
+      alertedMismatchWindows: new Set(),
       lastEchoStatePublished: null,
     };
     this.coins.set(symbol, state);
@@ -511,9 +519,45 @@ export class PriceMonitoringWorker {
   private async evaluateT4Gates(
     state: CoinState, cfg: CoinConfig, windowStart: number, windowEnd: number,
   ): Promise<{ event?: SignalT4Event; reason?: string; persistentSkip: boolean }> {
-    const { streak, volumeBuckets, bodyHasHigh, bodyHasTiny, meanBodyRatio, bodyHasVeryExtreme } =
-      await fetchStreakWithVolume(state.symbol, windowStart);
+    const streakResult = await fetchStreakWithVolume(state.symbol, windowStart);
+    const { streak, volumeBuckets, bodyHasHigh, bodyHasTiny, meanBodyRatio,
+            bodyHasVeryExtreme, mismatches, binanceStreak } = streakResult;
     const absStreak    = Math.abs(streak);
+
+    // Surface Binance/Poly disagreements that affected streak interpretation.
+    // Bot uses Poly truth (commit 1769269); Telegram alert lets user know
+    // the streak count differs from chart visual. Dedupe per window so retries
+    // within same 5m don't spam — alert fires ONCE per (coin, window).
+    if (mismatches.length > 0) {
+      const newMismatches = mismatches.filter(m => !state.alertedMismatchWindows.has(m.windowStart));
+      for (const m of newMismatches) {
+        state.alertedMismatchWindows.add(m.windowStart);
+        log('warn', `Binance/Poly mismatch ${state.symbol}`, {
+          windowStart: m.windowStart, windowEnd: m.windowEnd,
+          binance: m.binanceDirection, poly: m.polyDirection,
+          binanceMovePct: m.binanceMovePct.toFixed(3),
+          binanceStreak, effectiveStreak: streak,
+        });
+        await this.bus.publish({
+          type:               'streak_data_mismatch',
+          coin:               state.symbol,
+          windowStart:        m.windowStart,
+          windowEnd:          m.windowEnd,
+          binanceDirection:   m.binanceDirection,
+          polyDirection:      m.polyDirection,
+          binanceMovePct:     m.binanceMovePct,
+          binanceStreak,
+          effectiveStreak:    streak,
+          emittedAt:          Date.now(),
+        });
+      }
+      // Prune dedup set: drop entries older than 6h (well past current
+      // streak lookback so we don't re-alert if streak walks back to them).
+      const cutoff = Date.now() - 6 * 3600_000;
+      for (const ts of state.alertedMismatchWindows) {
+        if (ts < cutoff) state.alertedMismatchWindows.delete(ts);
+      }
+    }
     const expectedIcon = streak > 0 ? '🟢' : '🔴';
     // Fetch the in-progress candle direction up-front so the echo gate can
     // count it as +1 to the closed streak when it aligns. Streak strategy
@@ -2028,6 +2072,27 @@ interface StreakResult {
   /** True if any streak bar has body > 4× avg (extreme climax candle).
    *  Drives edge case A3 (mid-streak very-extreme override). */
   bodyHasVeryExtreme: boolean;
+  /**
+   * Binance/Poly direction disagreements detected within the visible streak
+   * window (the bars that would-have-been-streak per Binance). Each entry
+   * tells which bar disagreed and how it affected the effective streak.
+   *
+   * Empty when no disagreement OR when all disagreements were outside the
+   * visible streak window. Caller (PMW) dedupes by windowStart to avoid
+   * spam on retries within the same 5m window.
+   */
+  mismatches: Array<{
+    windowStart: number;
+    windowEnd: number;
+    binanceDirection: 'up' | 'down';
+    polyDirection: 'up' | 'down';
+    /** Binance close - open as % of open. Tiny values (< 0.05%) flag near-flat
+     *  bars where Chainlink/Binance routing inherently can disagree. */
+    binanceMovePct: number;
+  }>;
+  /** Streak length per Binance-only (no Poly override). When > |streak|,
+   *  Poly disagreement shortened it. Informational for the alert message. */
+  binanceStreak: number;
 }
 
 /**
@@ -2054,7 +2119,11 @@ async function fetchStreakWithVolume(
       symbol, windowStart,
       source: PYTH_SYMBOL[symbol] ? 'pyth' : 'binance',
     });
-    return { streak: 0, volumeBuckets: [], bodyHasHigh: false, bodyHasTiny: false, meanBodyRatio: 0, bodyHasVeryExtreme: false };
+    return {
+      streak: 0, volumeBuckets: [], bodyHasHigh: false, bodyHasTiny: false,
+      meanBodyRatio: 0, bodyHasVeryExtreme: false,
+      mismatches: [], binanceStreak: 0,
+    };
   }
 
   // Stale data check: most recent bar's open should be ~5min before windowStart.
@@ -2091,15 +2160,25 @@ async function fetchStreakWithVolume(
     }
   }
 
+  // Compute Binance-only outcomes (for chart-pattern reference + mismatch detection).
+  const binanceOutcomes: ('up' | 'down' | 'doji')[] = bars.map(b =>
+    b.close > b.open ? 'up' : b.close < b.open ? 'down' : 'doji',
+  );
+
+  // Effective outcomes: Poly truth if cached, Binance fallback when Poly NULL.
   const outcomes: ('up' | 'down' | 'doji')[] = bars.map((b, i) => {
     const polyOut = polyMap.get(allWindowStarts[i]!);
     if (polyOut) return polyOut;
-    return b.close > b.open ? 'up' : b.close < b.open ? 'down' : 'doji';
+    return binanceOutcomes[i]!;
   });
 
   const newest = outcomes[outcomes.length - 1];
   if (!newest || newest === 'doji') {
-    return { streak: 0, volumeBuckets: [], bodyHasHigh: false, bodyHasTiny: false, meanBodyRatio: 0, bodyHasVeryExtreme: false };
+    return {
+      streak: 0, volumeBuckets: [], bodyHasHigh: false, bodyHasTiny: false,
+      meanBodyRatio: 0, bodyHasVeryExtreme: false,
+      mismatches: [], binanceStreak: 0,
+    };
   }
 
   let n = 0;
@@ -2108,6 +2187,46 @@ async function fetchStreakWithVolume(
     n++;
   }
   const streak = newest === 'up' ? n : -n;
+
+  // ── Mismatch detection ─────────────────────────────────────────────────
+  // Compute the Binance-only streak (no Poly override) as reference for the
+  // chart visual user sees. When Poly truth shortens it, surface the
+  // disagreement so user understands why bot's streak differs from chart.
+  const binanceNewest = binanceOutcomes[binanceOutcomes.length - 1];
+  let binanceN = 0;
+  if (binanceNewest && binanceNewest !== 'doji') {
+    for (let i = binanceOutcomes.length - 1; i >= 0; i--) {
+      if (binanceOutcomes[i] !== binanceNewest) break;
+      binanceN++;
+    }
+  }
+  const binanceStreak = binanceNewest === 'up' ? binanceN : -binanceN;
+
+  // Find disagreements within the visible streak window (the bars Binance
+  // would have counted). These are the ones that mattered for the streak
+  // calculation. Disagreements OUTSIDE this window don't affect streak.
+  const mismatches: StreakResult['mismatches'] = [];
+  if (binanceN > 0) {
+    const visibleStart = bars.length - binanceN;
+    for (let i = visibleStart; i < bars.length; i++) {
+      const polyOut = polyMap.get(allWindowStarts[i]!);
+      const binOut  = binanceOutcomes[i]!;
+      // Only consider non-doji Binance bars — doji means no direction, can't
+      // meaningfully "disagree". (binanceN > 0 ensures binanceNewest is not
+      // doji, but middle bars in lookback can still be doji.)
+      if (polyOut && (binOut === 'up' || binOut === 'down') && polyOut !== binOut) {
+        const bar = bars[i]!;
+        const movePct = bar.open > 0 ? ((bar.close - bar.open) / bar.open) * 100 : 0;
+        mismatches.push({
+          windowStart: allWindowStarts[i]!,
+          windowEnd:   allWindowStarts[i]! + WINDOW_MS,
+          binanceDirection: binOut,
+          polyDirection:    polyOut,
+          binanceMovePct: movePct,
+        });
+      }
+    }
+  }
 
   const avgVol = bars.reduce((a, b) => a + b.volume, 0) / bars.length;
   const streakBars = bars.slice(-n);
@@ -2132,7 +2251,10 @@ async function fetchStreakWithVolume(
   }
   const meanBodyRatio = streakBars.length > 0 ? sumRatios / streakBars.length : 0;
 
-  return { streak, volumeBuckets, bodyHasHigh, bodyHasTiny, meanBodyRatio, bodyHasVeryExtreme };
+  return {
+    streak, volumeBuckets, bodyHasHigh, bodyHasTiny, meanBodyRatio, bodyHasVeryExtreme,
+    mismatches, binanceStreak,
+  };
 }
 
 /**

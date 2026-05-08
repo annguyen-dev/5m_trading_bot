@@ -22,7 +22,7 @@ import { Bot } from 'grammy';
 import { log } from './observability/logger.js';
 import type {
   SignalBusEvent, SignalT0PlusEvent, SignalT4Event, SignalTMinus3Event,
-  SignalT0Event,
+  SignalT0Event, SignalStreakDataMismatchEvent,
 } from './SignalBus.js';
 import type { Signal } from '@trading-bot/shared';
 import {
@@ -78,7 +78,10 @@ export class TelegramService {
   }
 
   private infoTypeFor(ev: SignalBusEvent): TelegramInfoType {
-    return ev.type === 'T+4' ? 'signal' : 'order';
+    // T+4 + data alerts both fan to 'signal' channels; trade-life events
+    // (T+0 / T-3s / T-0) go to 'order' channels.
+    if (ev.type === 'T+4' || ev.type === 'streak_data_mismatch') return 'signal';
+    return 'order';
   }
 
   /**
@@ -113,6 +116,7 @@ export class TelegramService {
         case 'T+4':   text = formatT4(ev);        break;
         case 'T-3s': text = formatTMinus3(ev);  break;
         case 'T-0':   text = formatT0(ev);        break;
+        case 'streak_data_mismatch': text = formatStreakMismatch(ev); break;
       }
     } catch (err) {
       log('warn', 'TelegramService formatter failed', {
@@ -270,4 +274,20 @@ function formatT0(ev: SignalT0Event): string {
 
 function fmtStreak(streak: number): string {
   return streak > 0 ? `+${streak} UP` : `${streak} DOWN`;
+}
+
+function formatStreakMismatch(ev: SignalStreakDataMismatchEvent): string {
+  const winLabel = fmtWindow(ev.windowStart, ev.windowEnd);
+  const moveSign = ev.binanceMovePct >= 0 ? '+' : '';
+  const tinyMove = Math.abs(ev.binanceMovePct) < 0.05;
+  const binIcon  = ev.binanceDirection === 'up' ? '🟢' : '🔴';
+  const polyIcon = ev.polyDirection    === 'up' ? '🟢' : '🔴';
+  return [
+    `⚠ <b>${ev.coin}</b> · Binance/Poly mismatch · <code>${winLabel}</code>`,
+    `Binance: ${binIcon} ${ev.binanceDirection.toUpperCase()} (close-open ${moveSign}${ev.binanceMovePct.toFixed(3)}%)`
+      + (tinyMove ? ' <i>tiny move — feed routing can disagree</i>' : ''),
+    `Polymarket: ${polyIcon} ${ev.polyDirection.toUpperCase()}`,
+    `→ Streak shortened: chart visual ${fmtStreak(ev.binanceStreak)} → bot uses ${fmtStreak(ev.effectiveStreak)} (Poly truth)`,
+    `<i>Bot fires arms / signals based on Poly. If unexpected on chart, this is why.</i>`,
+  ].join('\n');
 }

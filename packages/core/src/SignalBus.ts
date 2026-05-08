@@ -220,9 +220,39 @@ export interface SignalEchoStateEvent {
   emittedAt:      number;
 }
 
+/**
+ * Data quality alert: Binance close-vs-open disagreed with Polymarket
+ * resolution for a specific 5m window. Bot uses Poly truth (commit 1769269)
+ * for streak detection, but the disagreement may surprise users who expect
+ * streak to match the chart visual. Telegram-routable so user is informed
+ * the moment a mismatch shifts streak interpretation.
+ *
+ * Emitted ONCE per (coin, windowStart) pair to avoid spam on retries.
+ */
+export interface SignalStreakDataMismatchEvent {
+  type:               'streak_data_mismatch';
+  coin:               CoinSymbol;
+  /** The 5m window where Binance and Poly disagree. */
+  windowStart:        number;
+  windowEnd:          number;
+  /** Binance close-vs-open verdict for this bar. */
+  binanceDirection:   'up' | 'down';
+  /** Polymarket midpoint-at-T-0 / cached resolution for this bar. */
+  polyDirection:      'up' | 'down';
+  /** Binance bar's close-open as % of open (positive = up move). Tiny
+   *  values (< 0.05%) flag near-flat bars where small price-feed differences
+   *  inherently can yield different binary verdicts. */
+  binanceMovePct:     number;
+  /** Streak the bot would have seen with Binance-only logic. */
+  binanceStreak:      number;
+  /** Streak the bot actually used (Poly truth). */
+  effectiveStreak:    number;
+  emittedAt:          number;
+}
+
 export type SignalBusEvent =
   | SignalT0PlusEvent | SignalT4Event | SignalTMinus3Event | SignalT0Event
-  | SignalEchoStateEvent;
+  | SignalEchoStateEvent | SignalStreakDataMismatchEvent;
 
 // ── Channel names ──────────────────────────────────────────────────────────
 
@@ -231,7 +261,8 @@ const CHANNEL_T4        = 'signal:T+4';
 const CHANNEL_T3        = 'signal:T-3s';
 const CHANNEL_T0        = 'signal:T-0';
 const CHANNEL_ECHO      = 'signal:echo_state';
-const ALL_CHANNELS      = [CHANNEL_T0PLUS, CHANNEL_T4, CHANNEL_T3, CHANNEL_T0, CHANNEL_ECHO] as const;
+const CHANNEL_MISMATCH  = 'signal:streak_data_mismatch';
+const ALL_CHANNELS      = [CHANNEL_T0PLUS, CHANNEL_T4, CHANNEL_T3, CHANNEL_T0, CHANNEL_ECHO, CHANNEL_MISMATCH] as const;
 
 function channelFor(ev: SignalBusEvent): string {
   switch (ev.type) {
@@ -240,6 +271,7 @@ function channelFor(ev: SignalBusEvent): string {
     case 'T-3s':       return CHANNEL_T3;
     case 'T-0':        return CHANNEL_T0;
     case 'echo_state': return CHANNEL_ECHO;
+    case 'streak_data_mismatch': return CHANNEL_MISMATCH;
   }
 }
 
