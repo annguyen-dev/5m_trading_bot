@@ -285,9 +285,9 @@ function formatStreakMismatch(ev: SignalStreakDataMismatchEvent): string {
   return [
     `⚠ <b>${ev.coin}</b> · Binance/Poly mismatch · <code>${winLabel}</code>`,
     `Binance: ${binIcon} ${ev.binanceDirection.toUpperCase()} (close-open ${moveSign}${ev.binanceMovePct.toFixed(3)}%)`
-      + (tinyMove ? ' <i>tiny move — feed routing can disagree</i>' : ''),
+      + (tinyMove ? ' <i>tiny move</i>' : ''),
     `Polymarket: ${polyIcon} ${ev.polyDirection.toUpperCase()}`,
-    `→ Streak shortened: chart visual ${fmtStreak(ev.binanceStreak)} → bot uses ${fmtStreak(ev.effectiveStreak)} (Poly truth)`,
-    `<i>Bot fires arms / signals based on Poly. If unexpected on chart, this is why.</i>`,
+    `<i>Bot uses Binance for streak/arm (chart visual). Poly resolved this bar opposite</i>`,
+    `<i>→ if a contrarian bet was placed on this bar's direction, T-0 outcome may go against us.</i>`,
   ].join('\n');
 }

@@ -2135,44 +2135,27 @@ async function fetchStreakWithVolume(
     });
   }
 
-  // ── Build effective outcomes — Polymarket first, Binance fallback ────────
-  // Polymarket midpoint at T-0 is the resolution of record (Bug 1 fix path).
-  // Binance close-vs-open can diverge (volatile last seconds, exchange-specific
-  // ticks) — when they disagree, trust Polymarket. Pre-fetch Poly outcomes for
-  // ALL bars in the lookback window in ONE query, then merge.
+  // ── Streak from Binance close-vs-open (chart-visual semantic) ──────────
+  // Bot detects arm windows / streaks based on what user sees on the chart.
+  // Polymarket's binary resolution is used SEPARATELY for outcome at T-0
+  // (livePolyOutcome / Bug 1 fix path) — that's about payout truth, not
+  // chart pattern.
   //
-  // Previous design suppressed streak to 0 on any single mismatch — that
-  // disabled arming on real extreme streaks (verified prod 2026-05-07
-  // 02:00-02:30 UTC: 5-bar DOWN streak per Poly, 1 mismatch at 01:55, bot
-  // saw streak=0 the entire arm trigger window → never armed).
-  const allWindowStarts: number[] = bars.map((_, i) => startTime + i * WINDOW_MS);
-  const { rows: cachedOutcomes } = await getPool().query<{
-    window_start: string; outcome: string | null;
-  }>(
-    `SELECT window_start, outcome FROM poly_clob_markets
-      WHERE symbol = $1 AND window_start = ANY($2::bigint[])`,
-    [symbol, allWindowStarts],
-  );
-  const polyMap = new Map<number, 'up' | 'down'>();
-  for (const r of cachedOutcomes) {
-    if (r.outcome === 'up' || r.outcome === 'down') {
-      polyMap.set(Number(r.window_start), r.outcome);
-    }
-  }
-
-  // Compute Binance-only outcomes (for chart-pattern reference + mismatch detection).
+  // Earlier design (commit 1769269) used Poly per-bar to override Binance,
+  // which produced "missing arms" when Poly disagreed on tiny-move bars
+  // (verified prod 2026-05-10 13:30 UTC: 6-bar UP streak on chart, Poly
+  // disagreed on bar 13:10 +0.014%, bot saw effective streak=3 → no arm
+  // even though chart visual was clearly 6 UP). User expectation: arm
+  // tracks chart visual.
+  //
+  // Mismatch detection still queries Poly cache to alert user when the
+  // bot's chart-based streak diverges from Poly's binary resolution —
+  // informational so user knows their bet might resolve differently.
   const binanceOutcomes: ('up' | 'down' | 'doji')[] = bars.map(b =>
     b.close > b.open ? 'up' : b.close < b.open ? 'down' : 'doji',
   );
 
-  // Effective outcomes: Poly truth if cached, Binance fallback when Poly NULL.
-  const outcomes: ('up' | 'down' | 'doji')[] = bars.map((b, i) => {
-    const polyOut = polyMap.get(allWindowStarts[i]!);
-    if (polyOut) return polyOut;
-    return binanceOutcomes[i]!;
-  });
-
-  const newest = outcomes[outcomes.length - 1];
+  const newest = binanceOutcomes[binanceOutcomes.length - 1];
   if (!newest || newest === 'doji') {
     return {
       streak: 0, volumeBuckets: [], bodyHasHigh: false, bodyHasTiny: false,
@@ -2182,49 +2165,48 @@ async function fetchStreakWithVolume(
   }
 
   let n = 0;
-  for (let i = outcomes.length - 1; i >= 0; i--) {
-    if (outcomes[i] !== newest) break;   // doji !== up/down → breaks
+  for (let i = binanceOutcomes.length - 1; i >= 0; i--) {
+    if (binanceOutcomes[i] !== newest) break;   // doji breaks
     n++;
   }
   const streak = newest === 'up' ? n : -n;
+  const binanceStreak = streak;   // synonymous post-revert; kept in event payload
 
-  // ── Mismatch detection ─────────────────────────────────────────────────
-  // Compute the Binance-only streak (no Poly override) as reference for the
-  // chart visual user sees. When Poly truth shortens it, surface the
-  // disagreement so user understands why bot's streak differs from chart.
-  const binanceNewest = binanceOutcomes[binanceOutcomes.length - 1];
-  let binanceN = 0;
-  if (binanceNewest && binanceNewest !== 'doji') {
-    for (let i = binanceOutcomes.length - 1; i >= 0; i--) {
-      if (binanceOutcomes[i] !== binanceNewest) break;
-      binanceN++;
+  // ── Mismatch detection (info-only, doesn't affect streak) ──────────────
+  // Query Poly cache for bars in the visible streak window; flag bars where
+  // Poly direction disagrees with Binance. PMW publishes 'streak_data_mismatch'
+  // events for each (deduped) so user gets Telegram alert when their
+  // chart-based bet might resolve against them at T-0.
+  const allWindowStarts: number[] = bars.map((_, i) => startTime + i * WINDOW_MS);
+  const visibleStart = bars.length - n;
+  const visibleWindowStarts = allWindowStarts.slice(visibleStart);
+  const { rows: cachedOutcomes } = visibleWindowStarts.length > 0
+    ? await getPool().query<{ window_start: string; outcome: string | null }>(
+        `SELECT window_start, outcome FROM poly_clob_markets
+          WHERE symbol = $1 AND window_start = ANY($2::bigint[])`,
+        [symbol, visibleWindowStarts],
+      )
+    : { rows: [] as Array<{ window_start: string; outcome: string | null }> };
+  const polyMap = new Map<number, 'up' | 'down'>();
+  for (const r of cachedOutcomes) {
+    if (r.outcome === 'up' || r.outcome === 'down') {
+      polyMap.set(Number(r.window_start), r.outcome);
     }
   }
-  const binanceStreak = binanceNewest === 'up' ? binanceN : -binanceN;
-
-  // Find disagreements within the visible streak window (the bars Binance
-  // would have counted). These are the ones that mattered for the streak
-  // calculation. Disagreements OUTSIDE this window don't affect streak.
   const mismatches: StreakResult['mismatches'] = [];
-  if (binanceN > 0) {
-    const visibleStart = bars.length - binanceN;
-    for (let i = visibleStart; i < bars.length; i++) {
-      const polyOut = polyMap.get(allWindowStarts[i]!);
-      const binOut  = binanceOutcomes[i]!;
-      // Only consider non-doji Binance bars — doji means no direction, can't
-      // meaningfully "disagree". (binanceN > 0 ensures binanceNewest is not
-      // doji, but middle bars in lookback can still be doji.)
-      if (polyOut && (binOut === 'up' || binOut === 'down') && polyOut !== binOut) {
-        const bar = bars[i]!;
-        const movePct = bar.open > 0 ? ((bar.close - bar.open) / bar.open) * 100 : 0;
-        mismatches.push({
-          windowStart: allWindowStarts[i]!,
-          windowEnd:   allWindowStarts[i]! + WINDOW_MS,
-          binanceDirection: binOut,
-          polyDirection:    polyOut,
-          binanceMovePct: movePct,
-        });
-      }
+  for (let i = visibleStart; i < bars.length; i++) {
+    const polyOut = polyMap.get(allWindowStarts[i]!);
+    const binOut  = binanceOutcomes[i]!;
+    if (polyOut && (binOut === 'up' || binOut === 'down') && polyOut !== binOut) {
+      const bar = bars[i]!;
+      const movePct = bar.open > 0 ? ((bar.close - bar.open) / bar.open) * 100 : 0;
+      mismatches.push({
+        windowStart: allWindowStarts[i]!,
+        windowEnd:   allWindowStarts[i]! + WINDOW_MS,
+        binanceDirection: binOut,
+        polyDirection:    polyOut,
+        binanceMovePct: movePct,
+      });
     }
   }
 
