@@ -574,7 +574,16 @@ export class PriceMonitoringWorker {
     // actual threshold switch happens in `effectiveAutoMinStreak`.
     if (cfg.strategy === 'echo') {
       if (absStreak >= cfg.echo_trigger_streak) {
-        state.lastEchoTriggerAt = Date.now();
+        // Set to windowEnd, NOT Date.now(). Armed mode kicks in from the
+        // NEXT window onwards — the current bar that just armed the bot
+        // is itself the contrarian setup, so user's baseline_streak still
+        // gates its placement. Without this, trigger_streak (5) below
+        // baseline_streak (8) would create a loophole where same-window
+        // arm + fire bypasses baseline (verified prod 2026-05-13 06:59:
+        // streak=5 detected at T+4, T-3s of same window fired despite
+        // baseline=8). Effective from window close → armed valid for the
+        // next echo_window_minutes from that moment.
+        state.lastEchoTriggerAt = windowEnd;
         // Chain event detection — when ≥N arms cluster within the event
         // window, record a chain event. The predictive defensive then uses
         // (now - lastChainEventAt) vs overdue threshold. De-dup arm
@@ -780,7 +789,13 @@ export class PriceMonitoringWorker {
     const armEndAt = state.lastEchoTriggerAt
       ? state.lastEchoTriggerAt + cfg.echo_window_minutes * 60_000
       : null;
-    const armed = armEndAt !== null && now <= armEndAt;
+    // Armed valid in [lastEchoTriggerAt, armEndAt]. lastEchoTriggerAt = end
+    // of the triggering window, so armed only kicks in AFTER current window
+    // closes — same-window arm + fire bypass of baseline_streak is prevented.
+    const armed = state.lastEchoTriggerAt != null
+      && armEndAt !== null
+      && now >= state.lastEchoTriggerAt
+      && now <= armEndAt;
 
     // Defensive layer state.
     const defensiveActivatesAt = state.lastExtremeStreakAt != null
@@ -910,8 +925,15 @@ export class PriceMonitoringWorker {
     // No hour-of-day schedule or small-adjust on echo — the arm window IS
     // the adaptive layer here.
     if (cfg.strategy === 'echo') {
+      // Armed valid in [lastEchoTriggerAt, armEndAt]. lastEchoTriggerAt =
+      // end of the window that triggered arming, so the same-window
+      // placement uses baseline (not armed signal_min). Armed mode kicks
+      // in from the NEXT window onwards — preserves baseline as the floor
+      // for the bar that creates the contrarian setup.
+      const now = Date.now();
       const armed = state.lastEchoTriggerAt != null
-        && (Date.now() - state.lastEchoTriggerAt) <= cfg.echo_window_minutes * 60_000;
+        && now >= state.lastEchoTriggerAt
+        && (now - state.lastEchoTriggerAt) <= cfg.echo_window_minutes * 60_000;
       // Chain predictive defensive — bump thresholds when last chain event
       // is "overdue" (gap > echo_chain_overdue_min). Statistical lift modest
       // (~1.25x at 32-64h gap range) but reduces compound-loss risk on the
