@@ -269,6 +269,31 @@ const DEFAULT_CONFIG: CoinConfig = {
 
 export const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB'];
 
+/**
+ * Per-coin overrides applied on top of DEFAULT_CONFIG. Used for fields where
+ * a single global default would be wrong for some coins (e.g. body3 thresholds
+ * scale with the coin's typical price). User-saved values still win — these
+ * just provide better starting points than 0.
+ *
+ * BTC body3 defaults derived from 365d BTC 5m analysis (see
+ * apps/api/scripts/analyze-armed-fade.ts):
+ *   idle  ≥ $400  → streak 5+ reversal 62.7%, trapped 13.3%
+ *   armed ≥ $300  → streak 3+ reversal 55.8%, trapped 5.5%
+ *   DCA   ≥ $200/$150 — looser to allow recovery on borderline cycles
+ *
+ * Other coins need their own analysis before getting non-zero defaults — the
+ * absolute USD body sums scale with price (ETH ≈ $30 for similar pct move,
+ * SOL ≈ $5 etc). Until analysed they stay disabled.
+ */
+export const PER_COIN_OVERRIDES: Partial<Record<CoinSymbol, Partial<CoinConfig>>> = {
+  BTC: {
+    idle_body3_min:      400,
+    armed_body3_min:     300,
+    dca_body3_min_idle:  200,
+    dca_body3_min_armed: 150,
+  },
+};
+
 export async function getAllCoinConfigs(): Promise<CoinConfigs> {
   const { rows } = await getPool().query<{ value: string }>(
     `SELECT value FROM settings WHERE key = 'coin_configs'`,
@@ -281,10 +306,15 @@ export async function getAllCoinConfigs(): Promise<CoinConfigs> {
 export async function getCoinConfig(symbol: CoinSymbol): Promise<CoinConfig> {
   const all = await getAllCoinConfigs();
   const stored = all[symbol];
-  if (!stored) return { ...DEFAULT_CONFIG };
-  // Merge over defaults so configs saved before a field existed still get
-  // sensible defaults for the new field (e.g., auto_schedule added in #026).
-  return { ...DEFAULT_CONFIG, ...stored };
+  const coinDefaults = { ...DEFAULT_CONFIG, ...(PER_COIN_OVERRIDES[symbol] ?? {}) };
+  if (!stored) return coinDefaults;
+  // Merge order:
+  //   1. DEFAULT_CONFIG (global)
+  //   2. PER_COIN_OVERRIDES (per-coin tuned defaults — e.g. BTC body3 values)
+  //   3. stored (user-saved DB values — always win)
+  // So configs saved before a field existed still get sensible defaults
+  // (auto_schedule added in #026, body3 in #2026-05-15 etc).
+  return { ...coinDefaults, ...stored };
 }
 
 export async function getEnabledCoins(): Promise<CoinSymbol[]> {

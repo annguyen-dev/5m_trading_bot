@@ -10,6 +10,7 @@ import {
   ALL_COINS,
   getAllCoinConfigs,
   updateCoinConfig,
+  PER_COIN_OVERRIDES,
   type CoinSymbol,
   type CoinConfig,
 } from '@trading-bot/core/CoinConfig';
@@ -60,9 +61,13 @@ export async function listCoinConfigs(_req: Request, res: Response): Promise<voi
     // Merge over DEFAULT_CONFIG so configs saved BEFORE a field existed (e.g.
     // pre-echo BTC config) still expose defaults for the newer fields. Without
     // this, FE renders empty inputs and validation fails on otherwise-saved coins.
+    // Merge: DEFAULT_CONFIG → PER_COIN_OVERRIDES (e.g. BTC body3 tuned values)
+    // → stored. So FE sees sensible per-coin defaults for fields the user
+    // hasn't explicitly set.
     const rows = ALL_COINS.map(sym => ({
       symbol: sym,
       ...DEFAULT_CONFIG,
+      ...(PER_COIN_OVERRIDES[sym] ?? {}),
       ...(all[sym] ?? {}),
     }));
     res.json(rows);
