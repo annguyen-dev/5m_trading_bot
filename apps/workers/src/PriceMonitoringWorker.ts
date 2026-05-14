@@ -1318,13 +1318,32 @@ export class PriceMonitoringWorker {
     //   streak=5 + body3 < $300 → P(reversal)=46-52%, P(trapped)=23-29%
     // Bypasses if cfg.*_body3_min = 0 (default — preserves prior behavior).
     // DCA continuation uses its own gate inside tryPlaceDcaAtBoundary.
+    //
+    // Refresh body3 from LIVE bars at T-3s (or whatever current call time is):
+    //   liveBars = [bar-2 closed, bar-1 closed, current in-progress]
+    // The current in-progress bar's body matters most — at T-3s it's ~99%
+    // formed and reflects the FRESH momentum the bot is fading. Falling back
+    // to t4.body3Sum (3 closed bars at T+4) is fine if the fetch fails.
     const armedMode = adapt.mode === 'aggressive';
     const body3Min  = armedMode ? cfg.armed_body3_min : cfg.idle_body3_min;
-    const body3Sum  = t4.body3Sum ?? 0;
+    let body3Sum    = t4.body3Sum ?? 0;
+    let body3Src: 'live' | 't4_fallback' = 't4_fallback';
+    if (body3Min > 0) {
+      const liveBars = await fetchBars(
+        state.symbol,
+        t4.windowStart - 2 * WINDOW_MS,
+        Date.now(),
+        3,
+      );
+      if (liveBars.length >= 2) {
+        body3Sum = liveBars.reduce((s, b) => s + Math.abs(b.close - b.open), 0);
+        body3Src = 'live';
+      }
+    }
     if (body3Min > 0 && body3Sum < body3Min) {
       return {
         placed: false,
-        reason: `body3 $${body3Sum.toFixed(0)} < ${armedMode ? 'armed' : 'idle'}_body3_min $${body3Min}`,
+        reason: `body3 $${body3Sum.toFixed(0)} (${body3Src}) < ${armedMode ? 'armed' : 'idle'}_body3_min $${body3Min}`,
         adaptive,
       };
     }
