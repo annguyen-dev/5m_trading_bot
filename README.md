@@ -73,19 +73,76 @@ SERVER_HOST=13.235.115.6 pnpm remote:logs:workers  # tail -f workers log
 Use the **`/analyze-prod-logs`** Claude skill — see `.claude/skills/analyze-prod-logs/SKILL.md`. It pulls logs, classifies into Technical / Business buckets, and suggests fix file:line. Add new patterns to its tables when you find a new bug class.
 
 ### Deploy
+
+The deploy pipeline is Ansible-based, two playbooks:
+
+| Playbook | When | What it does |
+|---|---|---|
+| `bootstrap.yml` | **First time only** (new server) | Install Node 22, pnpm, Docker; create `bot` user; spin up Postgres + Redis containers; configure UFW |
+| `deploy.yml` | **Every release** | rsync repo, `pnpm install + build`, render PM2 manifest, reload api + workers, run health checks |
+
+#### First-time setup (bootstrap)
+
+Required ONCE per new host. Skip if the host already has the bot stack running.
+
+```bash
+# 1. Configure inventory + secrets
+cd deploy
+cp inventory.example.yml      inventory.yml
+cp group_vars/all.example.yml group_vars/all.yml
+
+# Edit inventory.yml:
+#   - ansible_host: server IP/DNS
+#   - ansible_user: SSH user (root or sudoer)
+#   - ansible_ssh_private_key_file: path to your SSH key
+
+# Edit group_vars/all.yml — fill in:
+#   - pg_password, jwt_secret      (run: openssl rand -hex 32)
+#   - poly_private_key, poly_funder_address
+#   - telegram_token, telegram_channel_id
+#   - anthropic_api_key, voyage_api_key, grafana_* (optional)
+
+# 2. Bootstrap the host (installs runtime + DB containers)
+ansible-playbook -i inventory.yml bootstrap.yml
+# or from repo root: pnpm release:bootstrap
+
+# 3. First deploy
+ansible-playbook -i inventory.yml deploy.yml
+# or: pnpm release
+```
+
+After bootstrap completes, `/opt/trading-bot/` exists on the server with Postgres + Redis running. Subsequent releases only need step 3.
+
+⚠ **`group_vars/all.yml` contains plaintext secrets.** Either:
+- keep it local only (it's gitignored), OR
+- encrypt with `ansible-vault encrypt group_vars/all.yml` and pass `--ask-vault-pass` on every play
+  (then use `pnpm release:vault` to edit it inline)
+
+#### Regular release
+
 ```bash
 git push origin master
-cd deploy && ansible-playbook -i inventory.yml deploy.yml
+pnpm release
+# equivalent to:  cd deploy && ansible-playbook -i inventory.yml deploy.yml
 ```
-Health checks run automatically. Both api + workers PM2-restart cleanly.
 
-⚠ Migrations run on startup automatically — failing migrations crash the process. Test locally first.
+Health checks run automatically (direct API + via nginx). Both api + workers PM2-restart cleanly via `startOrReload`.
+
+⚠ **Migrations run on startup automatically** — a failing migration crashes the worker. Test locally first via `pnpm --filter @trading-bot/api migrate`.
+
+#### Other ops
+
+```bash
+pnpm release:env         # push only env vars (faster than full release)
+pnpm release:vault       # edit encrypted group_vars/all.yml inline
+pnpm release:fix-perms   # repair file ownership if something got chown'd wrong
+```
 
 ### Roll back
 ```bash
 git revert <commit>
 git push origin master
-cd deploy && ansible-playbook -i inventory.yml deploy.yml
+pnpm release
 ```
 We don't blue-green; PM2 restart is instant enough.
 
