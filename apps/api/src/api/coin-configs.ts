@@ -47,6 +47,9 @@ const DEFAULT_CONFIG: CoinConfig = {
   echo_chain_overdue_min:           1600,
   echo_chain_signal_bump:           2,
   echo_chain_baseline_bump:         1,
+  idle_body3_min:                   0,
+  armed_body3_min:                  0,
+  dca_body3_min:                    0,
 };
 
 /** GET /api/coin-configs → array of { symbol, ...config } for all 7 coins. */
@@ -102,6 +105,12 @@ const patchSchema = z.object({
   echo_defensive_streak_threshold: z.number().int().min(3).max(20).optional(),
   echo_defensive_overdue_minutes:  z.number().int().min(10).max(43200).optional(),  // 10min..30d
   echo_defensive_action:           z.enum(['disable_armed', 'skip_all']).optional(),
+  // Body-3 gates (price USD). 0 = disabled. Wide bound to cover any coin
+  // (BTC body3 can hit thousands; ETH/SOL smaller). FE chooses sensible
+  // per-coin defaults.
+  idle_body3_min:                  z.number().min(0).max(10_000).optional(),
+  armed_body3_min:                 z.number().min(0).max(10_000).optional(),
+  dca_body3_min:                   z.number().min(0).max(10_000).optional(),
 }).strict();
 
 export async function updateCoinConfigHandler(

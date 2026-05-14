@@ -521,7 +521,7 @@ export class PriceMonitoringWorker {
   ): Promise<{ event?: SignalT4Event; reason?: string; persistentSkip: boolean }> {
     const streakResult = await fetchStreakWithVolume(state.symbol, windowStart);
     const { streak, volumeBuckets, bodyHasHigh, bodyHasTiny, meanBodyRatio,
-            bodyHasVeryExtreme, mismatches, binanceStreak } = streakResult;
+            bodyHasVeryExtreme, mismatches, binanceStreak, body3Sum } = streakResult;
     const absStreak    = Math.abs(streak);
 
     // Surface Binance/Poly disagreements that affected streak interpretation.
@@ -665,6 +665,7 @@ export class PriceMonitoringWorker {
         bodyHasTiny,
         meanBodyRatio,
         bodyHasVeryExtreme,
+        body3Sum,
         limitCents:    cfg.limit_price_cents,
         emittedAt:     Date.now(),
       },
@@ -1311,6 +1312,23 @@ export class PriceMonitoringWorker {
       }
     }
 
+    // Gate 2b: body-3 minimum (idle vs armed). Quality filter on top of the
+    // streak threshold — cuts low-edge fades. Empirical (BTC 365d):
+    //   streak=5 + body3 ≥ $400 → P(reversal)=62.7%, P(trapped to 7+)=13%
+    //   streak=5 + body3 < $300 → P(reversal)=46-52%, P(trapped)=23-29%
+    // Bypasses if cfg.*_body3_min = 0 (default — preserves prior behavior).
+    // DCA continuation uses its own gate inside tryPlaceDcaAtBoundary.
+    const armedMode = adapt.mode === 'aggressive';
+    const body3Min  = armedMode ? cfg.armed_body3_min : cfg.idle_body3_min;
+    const body3Sum  = t4.body3Sum ?? 0;
+    if (body3Min > 0 && body3Sum < body3Min) {
+      return {
+        placed: false,
+        reason: `body3 $${body3Sum.toFixed(0)} < ${armedMode ? 'armed' : 'idle'}_body3_min $${body3Min}`,
+        adaptive,
+      };
+    }
+
     // Gate 3: N+1 market exists
     const nextWindowStartMs = t4.windowStart + WINDOW_MS;
     const market = await state.poly.findMarketAt(Math.floor(nextWindowStartMs / 1000));
@@ -1422,9 +1440,20 @@ export class PriceMonitoringWorker {
     const nextWindowStart = justClosedWindowStart + WINDOW_MS;
 
     // Compute streak as of nextWindowStart — includes the just-closed loss.
-    const { streak } = await fetchStreakWithVolume(state.symbol, nextWindowStart);
+    const { streak, body3Sum } = await fetchStreakWithVolume(state.symbol, nextWindowStart);
     const absStreak = Math.abs(streak);
     const direction = state.cycleDirection;
+
+    // Body-3 DCA gate: averaging down only when the trend's 3-bar body sum
+    // still signals exhaustion. After a loss the streak has just extended
+    // by 1; we recompute body3 on the new bar set. Skip DCA if body3 < min.
+    // Disabled when cfg.dca_body3_min = 0 (default).
+    if (cfg.dca_body3_min > 0 && body3Sum < cfg.dca_body3_min) {
+      log('info', `DCA skip ${state.symbol}: body3 $${body3Sum.toFixed(0)} < dca_body3_min $${cfg.dca_body3_min}`, {
+        nextWindowStart, streak,
+      });
+      return;
+    }
 
     if (cfg.strategy === 'echo') {
       // Defensive: if regime is overdue (long quiet stretch precedes outsized
@@ -2115,6 +2144,20 @@ interface StreakResult {
   /** Streak length per Binance-only (no Poly override). When > |streak|,
    *  Poly disagreement shortened it. Informational for the alert message. */
   binanceStreak: number;
+  /**
+   * Sum of |close − open| over the last 3 CLOSED bars before windowStart.
+   * Units = price USD (BTC ≈ tens to thousands, ETH ≈ ones to hundreds).
+   * Drives the body-conditioned entry gate (CoinConfig.idle_body3_min /
+   * armed_body3_min / dca_body3_min).
+   *
+   * Empirical (BTC 365d): at streak=5, body3 ≥ $400 → P(reversal)=62.7% and
+   * P(trapped to 7+)=13.3%; body3 < $300 at same streak → P(reversal) only
+   * 46-52% and P(trapped) 23-29%. Filter cuts low-quality fades.
+   *
+   * When fewer than 3 bars are loaded, body3Sum = 0 (gate skipped — same as
+   * "filter disabled" behavior).
+   */
+  body3Sum: number;
 }
 
 /**
@@ -2144,7 +2187,7 @@ async function fetchStreakWithVolume(
     return {
       streak: 0, volumeBuckets: [], bodyHasHigh: false, bodyHasTiny: false,
       meanBodyRatio: 0, bodyHasVeryExtreme: false,
-      mismatches: [], binanceStreak: 0,
+      mismatches: [], binanceStreak: 0, body3Sum: 0,
     };
   }
 
@@ -2182,7 +2225,7 @@ async function fetchStreakWithVolume(
     return {
       streak: 0, volumeBuckets: [], bodyHasHigh: false, bodyHasTiny: false,
       meanBodyRatio: 0, bodyHasVeryExtreme: false,
-      mismatches: [], binanceStreak: 0,
+      mismatches: [], binanceStreak: 0, body3Sum: 0,
     };
   }
 
@@ -2255,9 +2298,15 @@ async function fetchStreakWithVolume(
   }
   const meanBodyRatio = streakBars.length > 0 ? sumRatios / streakBars.length : 0;
 
+  // Body-3 gate input: |close-open| sum over the LAST 3 closed bars before
+  // windowStart (regardless of direction — within a streak ≥ 3 these are all
+  // same direction by definition; for streak < 3 the sum is informational).
+  let body3Sum = 0;
+  for (const b of bars.slice(-3)) body3Sum += Math.abs(b.close - b.open);
+
   return {
     streak, volumeBuckets, bodyHasHigh, bodyHasTiny, meanBodyRatio, bodyHasVeryExtreme,
-    mismatches, binanceStreak,
+    mismatches, binanceStreak, body3Sum,
   };
 }
 

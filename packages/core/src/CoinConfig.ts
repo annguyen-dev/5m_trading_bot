@@ -193,6 +193,26 @@ export interface CoinConfig {
   echo_chain_signal_bump: number;
   /** Bump added to echo_baseline_streak when defensive active (idle mode). */
   echo_chain_baseline_bump: number;
+
+  // ── Body-3 gate (data-driven entry quality filter) ────────────────────────
+  // Sum of |close-open| (absolute, in price USD) for the last 3 CLOSED
+  // Binance bars before window start. Lets the bot skip "trend still strong"
+  // setups: streak length is the same but body3 distinguishes a fading move
+  // (good fade) from a steadily-running trend (bad fade — keeps extending).
+  //
+  // Empirical 365d BTC (5m bars):
+  //   • streak=5 + body3 ≥ $400 → P(reversal)=62.7%, P(trapped to 7+)=13.3%
+  //   • streak=5 + body3 < $300 → P(reversal)=46-52%, P(trapped)=23-29% — avoid
+  //   • streak=3 (armed) + body3 ≥ $300 → P(reversal)=55.8%, P(trapped)=5.5%
+  //
+  // Set 0 to disable the gate (preserves prior behavior).
+  /** Minimum |body3| for IDLE-mode entry (echo strategy). 0 = disabled. */
+  idle_body3_min:  number;
+  /** Minimum |body3| for ARMED-mode entry. 0 = disabled. */
+  armed_body3_min: number;
+  /** Minimum |body3| for DCA placement (computed at the NEW boundary, after
+   *  the loss extended the streak). 0 = disabled. */
+  dca_body3_min:   number;
 }
 
 export type CoinConfigs = Partial<Record<CoinSymbol, CoinConfig>>;
@@ -234,6 +254,11 @@ const DEFAULT_CONFIG: CoinConfig = {
   echo_chain_overdue_min:           1600,
   echo_chain_signal_bump:           2,
   echo_chain_baseline_bump:         1,
+  // Body-3 gate: disabled by default. Users opt-in per coin via Settings
+  // (sensible BTC values from analysis: idle 400, armed 300, dca 200).
+  idle_body3_min:                   0,
+  armed_body3_min:                  0,
+  dca_body3_min:                    0,
 };
 
 export const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB'];

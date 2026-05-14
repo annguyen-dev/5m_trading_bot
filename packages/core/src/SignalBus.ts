@@ -74,6 +74,12 @@ export interface SignalT4Event {
   /** True if any streak bar's body > 4× avg (extreme climax candle).
    *  Drives edge case A3 (idle override). */
   bodyHasVeryExtreme?: boolean;
+  /**
+   * Sum of |close − open| over the LAST 3 closed bars (price USD). Drives
+   * the body-conditioned entry gate (CoinConfig.idle_body3_min /
+   * armed_body3_min). 0 if fewer than 3 bars loaded.
+   */
+  body3Sum?:     number;
   limitCents:    number;
   emittedAt:     number;
 }
