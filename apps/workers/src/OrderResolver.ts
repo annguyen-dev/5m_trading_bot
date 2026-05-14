@@ -510,28 +510,86 @@ export class OrderResolver {
       }
     }
 
-    const { rows } = await pool.query<{ open_price: number | null; close_price: number | null }>(
-      `SELECT
-         (SELECT price FROM future_ticks_5s
-            WHERE ts >= $1 AND ts < $2 ORDER BY ts ASC  LIMIT 1) AS open_price,
-         (SELECT price FROM future_ticks_5s
-            WHERE ts >= $1 AND ts < $2 ORDER BY ts DESC LIMIT 1) AS close_price`,
-      [ws, we],
+    // ── Outcome from Polymarket WS midpoint at T-0 (not Binance ticker) ────
+    // Polymarket BTC up/down markets resolve via Chainlink price oracle, NOT
+    // the Binance ticker. For tiny BTC moves (< 0.05%), the two feeds can
+    // disagree and produce OPPOSITE binary outcomes. Verified prod 2026-05-14
+    // 07:35-07:40: Binance +0.010% UP, but Polymarket UP token settled at
+    // $0.014 (DOWN clearly won). OrderResolver using Binance ticker recorded
+    // the bet as LOST even though wallet's DOWN tokens redeemed at ~$0.99.
+    // → DB pnl was off by ~$27 on this single cycle.
+    //
+    // Approach: read the bet token's mid from poly_share_ticks at T-0+5s
+    // (post-resolution, market converged to 0 or 1). exit_price = actual
+    // mid (not hardcoded 0/1), so partial-resolution states are captured.
+    // Fallback to Binance ticker only when no Poly tick is available.
+    const tokenLookup = await pool.query<{ token_up: string; token_down: string }>(
+      `SELECT token_up, token_down FROM poly_clob_markets
+        WHERE condition_id = $1 LIMIT 1`,
+      [o.market_id],
     );
-    const openP  = rows[0]?.open_price  ?? null;
-    const closeP = rows[0]?.close_price ?? null;
-    if (openP == null || closeP == null) {
-      log('warn', 'OrderResolver: no btc ticks for window, skipping', {
+    const betToken = o.direction === 'up'
+      ? tokenLookup.rows[0]?.token_up
+      : tokenLookup.rows[0]?.token_down;
+
+    let outcome: 'up' | 'down';
+    let exitPrice: number;
+    let outcomeSource: 'poly_ws' | 'binance_fallback';
+
+    const polyTick = betToken
+      ? await pool.query<{ best_bid: number | null; best_ask: number | null }>(
+          `SELECT best_bid, best_ask FROM poly_share_ticks
+            WHERE token_id = $1
+              AND ts >= $2 AND ts <= $3
+              AND best_bid IS NOT NULL AND best_ask IS NOT NULL
+            ORDER BY ts DESC LIMIT 1`,
+          [betToken, we, we + 30_000],   // T-0 → T-0+30s
+        )
+      : { rows: [] as Array<{ best_bid: number | null; best_ask: number | null }> };
+    const pBid = polyTick.rows[0]?.best_bid;
+    const pAsk = polyTick.rows[0]?.best_ask;
+
+    if (pBid != null && pAsk != null) {
+      // Polymarket-side outcome. Bet token mid > 0.5 = our bet won.
+      const betMid = (pBid + pAsk) / 2;
+      const betWon = betMid > 0.5;
+      outcome = betWon ? o.direction : (o.direction === 'up' ? 'down' : 'up');
+      exitPrice = betMid;
+      outcomeSource = 'poly_ws';
+    } else {
+      // Fallback: Binance ticker (when Poly ticks unavailable — shouldn't
+      // happen post-deploy but keeps the resolver robust on partial data).
+      const { rows } = await pool.query<{ open_price: number | null; close_price: number | null }>(
+        `SELECT
+           (SELECT price FROM future_ticks_5s
+              WHERE ts >= $1 AND ts < $2 ORDER BY ts ASC  LIMIT 1) AS open_price,
+           (SELECT price FROM future_ticks_5s
+              WHERE ts >= $1 AND ts < $2 ORDER BY ts DESC LIMIT 1) AS close_price`,
+        [ws, we],
+      );
+      const openP  = rows[0]?.open_price  ?? null;
+      const closeP = rows[0]?.close_price ?? null;
+      if (openP == null || closeP == null) {
+        log('warn', 'OrderResolver: no Poly tick AND no Binance tick for window, skipping', {
+          order: o.id, window_start: ws, window_end: we,
+        });
+        return;
+      }
+      outcome = closeP >= openP ? 'up' : 'down';
+      exitPrice = (outcome === o.direction) ? 1.0 : 0.0;
+      outcomeSource = 'binance_fallback';
+      log('warn', 'OrderResolver: Poly tick missing, using Binance fallback', {
         order: o.id, window_start: ws, window_end: we,
+        binance_open: openP, binance_close: closeP, outcome,
       });
-      return;
     }
 
-    const outcome: 'up' | 'down' = closeP >= openP ? 'up' : 'down';
     const sharesOwned = o.size_usdc / o.share_price;
-    const won  = outcome === o.direction;
-    const pnl  = won ? sharesOwned - o.size_usdc : -o.size_usdc;
-    const exitPrice = won ? 1.0 : 0.0;
+    const won = outcome === o.direction;
+    // pnl = actual market value at T-0 (shares × exitPrice) − cost basis.
+    // For Poly-sourced exit: captures real wallet value even when WS midpoint
+    // isn't exactly 0 or 1 (briefly post-T-0 before settlement converges).
+    const pnl = sharesOwned * exitPrice - o.size_usdc;
 
     const now = Date.now();
     // 1. Close BUY via resolution
@@ -555,8 +613,9 @@ export class OrderResolver {
       [now, o.id],
     );
     log('info', 'OrderResolver resolution', {
-      id: o.id, direction: o.direction, outcome, pnl: pnl.toFixed(2),
-      btc_open: openP, btc_close: closeP,
+      id: o.id, direction: o.direction, outcome, won,
+      exitPrice: exitPrice.toFixed(3), pnl: pnl.toFixed(2),
+      source: outcomeSource,
     });
     // FE polls /api/poly/orders every 5s → picks up the closed row.
   }
