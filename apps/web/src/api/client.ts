@@ -566,8 +566,10 @@ export interface CoinConfigPatch {
   idle_body3_min:                  number;
   /** Body-3 armed gate: same but for armed mode. 0 = disabled. */
   armed_body3_min:                 number;
-  /** Body-3 DCA gate: require body3 ≥ this at the NEW boundary after a loss. 0 = disabled. */
-  dca_body3_min:                   number;
+  /** Body-3 DCA gate when the cycle was opened in IDLE mode. 0 = disabled. */
+  dca_body3_min_idle:              number;
+  /** Body-3 DCA gate when the cycle was opened in ARMED mode. 0 = disabled. */
+  dca_body3_min_armed:             number;
 }
 
 export interface CoinConfigRow extends CoinConfigPatch {

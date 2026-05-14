@@ -166,9 +166,10 @@ function CoinRow({
     || draft.echo_defensive_streak_threshold !== initial.echo_defensive_streak_threshold
     || draft.echo_defensive_overdue_minutes  !== initial.echo_defensive_overdue_minutes
     || draft.echo_defensive_action           !== initial.echo_defensive_action
-    || (draft.idle_body3_min  ?? 0) !== (initial.idle_body3_min  ?? 0)
-    || (draft.armed_body3_min ?? 0) !== (initial.armed_body3_min ?? 0)
-    || (draft.dca_body3_min   ?? 0) !== (initial.dca_body3_min   ?? 0)
+    || (draft.idle_body3_min       ?? 0) !== (initial.idle_body3_min       ?? 0)
+    || (draft.armed_body3_min      ?? 0) !== (initial.armed_body3_min      ?? 0)
+    || (draft.dca_body3_min_idle   ?? 0) !== (initial.dca_body3_min_idle   ?? 0)
+    || (draft.dca_body3_min_armed  ?? 0) !== (initial.dca_body3_min_armed  ?? 0)
     || scheduleDirty
     || dcaWhitelistDirty;
 
@@ -199,9 +200,10 @@ function CoinRow({
     && draft.tp_cents > draft.sl_cents
     && draft.auto_order_min_streak >= draft.streak_min
     // Body-3 bounds: 0 = disabled; up to 10000 to cover BTC (price-USD units).
-    && (draft.idle_body3_min  ?? 0) >= 0 && (draft.idle_body3_min  ?? 0) <= 10_000
-    && (draft.armed_body3_min ?? 0) >= 0 && (draft.armed_body3_min ?? 0) <= 10_000
-    && (draft.dca_body3_min   ?? 0) >= 0 && (draft.dca_body3_min   ?? 0) <= 10_000
+    && (draft.idle_body3_min       ?? 0) >= 0 && (draft.idle_body3_min       ?? 0) <= 10_000
+    && (draft.armed_body3_min      ?? 0) >= 0 && (draft.armed_body3_min      ?? 0) <= 10_000
+    && (draft.dca_body3_min_idle   ?? 0) >= 0 && (draft.dca_body3_min_idle   ?? 0) <= 10_000
+    && (draft.dca_body3_min_armed  ?? 0) >= 0 && (draft.dca_body3_min_armed  ?? 0) <= 10_000
     && scheduleValid
     && echoValid;
 
@@ -234,9 +236,10 @@ function CoinRow({
         echo_defensive_streak_threshold: draft.echo_defensive_streak_threshold,
         echo_defensive_overdue_minutes:  draft.echo_defensive_overdue_minutes,
         echo_defensive_action:           draft.echo_defensive_action,
-        idle_body3_min:                  draft.idle_body3_min  ?? 0,
-        armed_body3_min:                 draft.armed_body3_min ?? 0,
-        dca_body3_min:                   draft.dca_body3_min   ?? 0,
+        idle_body3_min:                  draft.idle_body3_min       ?? 0,
+        armed_body3_min:                 draft.armed_body3_min      ?? 0,
+        dca_body3_min_idle:              draft.dca_body3_min_idle   ?? 0,
+        dca_body3_min_armed:             draft.dca_body3_min_armed  ?? 0,
       });
       setFlash(true);
       setTimeout(() => setFlash(false), 1500);
@@ -455,12 +458,20 @@ function CoinRow({
                           onChange={v => setDraft({ ...draft, armed_body3_min: v })} />
               </label>
               <label style={{ color: '#8b949e' }}
-                     title="Body-3 DCA gate: after a loss, recompute body3 on new bar set. Skip DCA if body3 < this. Recommended lower than entry (averaging-down at lower price tolerates weaker signal). BTC ~200.">
-                DCA body3 ≥{' '}
-                <NumInput value={draft.dca_body3_min ?? 0}
+                     title="Body-3 DCA gate when cycle was opened in IDLE mode. After a loss, recompute body3 on new bar set; skip DCA if body3 < this. Recommended lower than idle entry (averaging-down at lower price tolerates weaker signal). BTC ~200.">
+                DCA idle body3 ≥{' '}
+                <NumInput value={draft.dca_body3_min_idle ?? 0}
                           min={0} max={10_000} step={10}
                           disabled={saving || !draft.enabled}
-                          onChange={v => setDraft({ ...draft, dca_body3_min: v })} />
+                          onChange={v => setDraft({ ...draft, dca_body3_min_idle: v })} />
+              </label>
+              <label style={{ color: '#8b949e' }}
+                     title="Body-3 DCA gate when cycle was opened in ARMED mode. Typically lowest threshold of the four (armed cycle already validated regime). BTC ~150.">
+                DCA armed body3 ≥{' '}
+                <NumInput value={draft.dca_body3_min_armed ?? 0}
+                          min={0} max={10_000} step={10}
+                          disabled={saving || !draft.enabled}
+                          onChange={v => setDraft({ ...draft, dca_body3_min_armed: v })} />
               </label>
               <label style={{ color: '#8b949e' }}
                      title="ARMED-mode DCA — comma-separated multipliers indexed by loss-count. e.g. '3,4' = base×3 after L1, base×4 after L2, then stop.">

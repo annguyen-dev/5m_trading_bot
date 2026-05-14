@@ -1446,11 +1446,15 @@ export class PriceMonitoringWorker {
 
     // Body-3 DCA gate: averaging down only when the trend's 3-bar body sum
     // still signals exhaustion. After a loss the streak has just extended
-    // by 1; we recompute body3 on the new bar set. Skip DCA if body3 < min.
-    // Disabled when cfg.dca_body3_min = 0 (default).
-    if (cfg.dca_body3_min > 0 && body3Sum < cfg.dca_body3_min) {
-      log('info', `DCA skip ${state.symbol}: body3 $${body3Sum.toFixed(0)} < dca_body3_min $${cfg.dca_body3_min}`, {
-        nextWindowStart, streak,
+    // by 1; we recompute body3 on the new bar set. Threshold picked by the
+    // ORIGINAL cycle mode (mirrors echo_dca_scale_idle vs echo_dca_scale).
+    // Skip DCA if body3 < the relevant min. 0 = disabled.
+    const dcaBody3Min = state.cycleMode === 'armed'
+      ? cfg.dca_body3_min_armed
+      : cfg.dca_body3_min_idle;
+    if (dcaBody3Min > 0 && body3Sum < dcaBody3Min) {
+      log('info', `DCA skip ${state.symbol}: body3 $${body3Sum.toFixed(0)} < dca_body3_min_${state.cycleMode ?? 'idle'} $${dcaBody3Min}`, {
+        nextWindowStart, streak, cycleMode: state.cycleMode,
       });
       return;
     }

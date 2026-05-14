@@ -210,9 +210,14 @@ export interface CoinConfig {
   idle_body3_min:  number;
   /** Minimum |body3| for ARMED-mode entry. 0 = disabled. */
   armed_body3_min: number;
-  /** Minimum |body3| for DCA placement (computed at the NEW boundary, after
-   *  the loss extended the streak). 0 = disabled. */
-  dca_body3_min:   number;
+  /** Minimum |body3| for DCA placement when the CYCLE was opened in IDLE mode
+   *  (state.cycleMode === 'idle'). Recomputed at the NEW boundary, after the
+   *  loss extended the streak. 0 = disabled. */
+  dca_body3_min_idle:  number;
+  /** Minimum |body3| for DCA placement when the CYCLE was opened in ARMED
+   *  mode. Typically lower than idle (armed cycles already validated regime).
+   *  0 = disabled. */
+  dca_body3_min_armed: number;
 }
 
 export type CoinConfigs = Partial<Record<CoinSymbol, CoinConfig>>;
@@ -255,10 +260,11 @@ const DEFAULT_CONFIG: CoinConfig = {
   echo_chain_signal_bump:           2,
   echo_chain_baseline_bump:         1,
   // Body-3 gate: disabled by default. Users opt-in per coin via Settings
-  // (sensible BTC values from analysis: idle 400, armed 300, dca 200).
+  // (sensible BTC values: idle 400, armed 300, DCA idle 200, DCA armed 150).
   idle_body3_min:                   0,
   armed_body3_min:                  0,
-  dca_body3_min:                    0,
+  dca_body3_min_idle:               0,
+  dca_body3_min_armed:              0,
 };
 
 export const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB'];
