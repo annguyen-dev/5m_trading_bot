@@ -119,6 +119,41 @@ async function main(): Promise<void> {
   console.log(`Open positions cost  : $${openCostBasis.toFixed(2)}`);
   console.log();
 
+  // 3b. Unredeemed winning shares. After window close the bot marks orders
+  // closed in DB, but the wallet still holds the binary tokens until the
+  // user manually calls redeem on the CTF contract. Winning shares = ~$1
+  // each, losing = ~$0. We scan every distinct token ever bought (where
+  // the corresponding order is already closed) and report any chain balance
+  // > 0. Sum × winning-side count gives unredeemed USDC value.
+  const { rows: tokenRows } = await pool.query<{ token_id: string; was_win_side: boolean }>(
+    `SELECT DISTINCT
+            CASE WHEN o.direction = 'up' THEN m.token_up ELSE m.token_down END AS token_id,
+            (o.pnl_usdc > 0) AS was_win_side
+       FROM poly_orders o
+       JOIN poly_clob_markets m ON m.condition_id = o.market_id
+      WHERE o.side = 'buy'
+        AND o.status = 'closed'`,
+  );
+  let unredeemedValue = 0;
+  let unredeemedTokens = 0;
+  let losingTokensStillHeld = 0;
+  for (const t of tokenRows) {
+    const shares = await exec.getTokenBalance(t.token_id);
+    if (shares <= 0.001) continue;
+    if (t.was_win_side) {
+      // Winning side — each share redeems for ~$1.
+      unredeemedValue += shares;
+      unredeemedTokens++;
+    } else {
+      // Losing side — worthless. Count for visibility.
+      losingTokensStillHeld++;
+    }
+  }
+  console.log('UNREDEEMED SHARES (still in wallet after window close)');
+  console.log(`  winning tokens     : ${unredeemedTokens} → claimable ≈ $${unredeemedValue.toFixed(2)}`);
+  console.log(`  losing tokens held : ${losingTokensStillHeld} (worth $0, no action needed)`);
+  console.log();
+
   // 4. DB-side cumulative.
   const { rows: aggRows } = await pool.query<{
     total_pnl: string | null;
@@ -151,10 +186,11 @@ async function main(): Promise<void> {
   console.log();
 
   // 5. Total liquid value snapshot.
-  const totalLiquid = usdc.balance + openValueAtMarket;
+  const totalLiquid = usdc.balance + openValueAtMarket + unredeemedValue;
   console.log('LIQUID VALUE NOW');
   console.log(`  USDC               : $${usdc.balance.toFixed(2)}`);
   console.log(`  open positions     : $${openValueAtMarket.toFixed(2)}`);
+  console.log(`  unredeemed winners : $${unredeemedValue.toFixed(2)}`);
   console.log(`  total              : $${totalLiquid.toFixed(2)}`);
   console.log();
 
