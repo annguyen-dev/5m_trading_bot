@@ -331,7 +331,19 @@ export async function getCoinConfig(symbol: CoinSymbol): Promise<CoinConfig> {
   //   3. stored (user-saved DB values — always win)
   // So configs saved before a field existed still get sensible defaults
   // (auto_schedule added in #026, body3 in #2026-05-15 etc).
-  return { ...coinDefaults, ...stored };
+  const merged = { ...coinDefaults, ...stored };
+  // Migrate: drop pre-2026-05-15 string-enum echo_edge_cases entries
+  // (replaced by EchoEdgeCase objects). String entries make matchEchoEdgeCase
+  // throw at runtime; safer to filter at config load.
+  const cases = merged.echo_edge_cases as unknown;
+  if (Array.isArray(cases)) {
+    merged.echo_edge_cases = cases.filter(c =>
+      c != null && typeof c === 'object' && typeof (c as { id?: unknown }).id === 'string'
+    ) as CoinConfig['echo_edge_cases'];
+  } else {
+    merged.echo_edge_cases = [];
+  }
+  return merged;
 }
 
 export async function getEnabledCoins(): Promise<CoinSymbol[]> {

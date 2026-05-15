@@ -64,12 +64,27 @@ export async function listCoinConfigs(_req: Request, res: Response): Promise<voi
     // Merge: DEFAULT_CONFIG → PER_COIN_OVERRIDES (e.g. BTC body3 tuned values)
     // → stored. So FE sees sensible per-coin defaults for fields the user
     // hasn't explicitly set.
-    const rows = ALL_COINS.map(sym => ({
-      symbol: sym,
-      ...DEFAULT_CONFIG,
-      ...(PER_COIN_OVERRIDES[sym] ?? {}),
-      ...(all[sym] ?? {}),
-    }));
+    const rows = ALL_COINS.map(sym => {
+      const merged = {
+        symbol: sym,
+        ...DEFAULT_CONFIG,
+        ...(PER_COIN_OVERRIDES[sym] ?? {}),
+        ...(all[sym] ?? {}),
+      };
+      // Migrate: pre-2026-05-15 echo_edge_cases was string[] (enum names);
+      // post-migration it's EchoEdgeCase[] (objects). Drop any non-object
+      // legacy entries so FE doesn't try to render strings as objects and
+      // PUT validation doesn't fail on missing `id`.
+      const cases = merged.echo_edge_cases as unknown;
+      if (Array.isArray(cases)) {
+        merged.echo_edge_cases = cases.filter(c =>
+          c != null && typeof c === 'object' && typeof (c as { id?: unknown }).id === 'string'
+        ) as typeof merged.echo_edge_cases;
+      } else {
+        merged.echo_edge_cases = [];
+      }
+      return merged;
+    });
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: String(err) });
