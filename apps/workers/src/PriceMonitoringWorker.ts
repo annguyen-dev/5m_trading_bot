@@ -160,6 +160,13 @@ interface CoinState {
    */
   cycleMode:          'idle' | 'armed' | null;
   /**
+   * If the cycle was opened via an idle-mode edge-case override, the matching
+   * edge case's id. Used at DCA time to pick the case's `dcaBody3Min` instead
+   * of the global `dca_body3_min_idle`. null for normal (non-override) cycles
+   * and for armed-mode cycles. Reset to null on cycle close.
+   */
+  cycleEdgeCaseId:    string | null;
+  /**
    * Echo defensive layer: ms timestamp of the most recent extreme streak
    * event (run end with |streak| ≥ `echo_defensive_streak_threshold`). When
    * the gap to now exceeds `echo_defensive_overdue_minutes`, bot enters
@@ -408,6 +415,7 @@ export class PriceMonitoringWorker {
       lastCycleOrderSize: null,
       dcaFiredCount:      0,
       cycleMode:          null,
+      cycleEdgeCaseId:    null,
       boundaryPlacementInFlight: false,
       lastExtremeStreakAt: null,
       defensiveGapStats:  null,
@@ -1325,25 +1333,43 @@ export class PriceMonitoringWorker {
     // streak. If current flipped (echo only, when we accept it), the
     // closed streak has ENDED at the current bar — don't add the +1.
     const effectiveStreak = absStreak + (currentAligns ? 1 : 0);
+
+    // Compute live body3 first — used by BOTH the body3 gate (Gate 2b) and
+    // the edge-case matcher. Includes the in-progress bar, so reflects fresh
+    // momentum at decision time. Falls back to t4.body3Sum on fetch error.
+    const armedMode = adapt.mode === 'aggressive';
+    let body3Sum    = t4.body3Sum ?? 0;
+    let body3Src: 'live' | 't4_fallback' = 't4_fallback';
+    const liveBars = await fetchBars(
+      state.symbol,
+      t4.windowStart - 2 * WINDOW_MS,
+      Date.now(),
+      3,
+    );
+    if (liveBars.length >= 2) {
+      body3Sum = liveBars.reduce((s, b) => s + Math.abs(b.close - b.open), 0);
+      body3Src = 'live';
+    }
+
+    // Gate 2: effective streak ≥ threshold, OR a configured edge case matches.
+    // Edge cases (idle echo only): user-defined { streak range, body3 floor,
+    // dca body3 floor } objects. The matched case's id is recorded on the
+    // cycle so its dcaBody3Min applies for any subsequent DCA placement.
+    let matchedEdgeCase: EchoEdgeCase | null = null;
     if (effectiveStreak < threshold) {
-      const overrideName = adapt.mode === 'default' && cfg.strategy === 'echo'
-        ? matchEchoEdgeCase(
-            cfg.echo_edge_cases ?? [],
-            absStreak,
-            t4,
-            cfg.echo_short_streak_body3_min ?? 0,
-          )
-        : null;
-      if (overrideName) {
+      if (adapt.mode === 'default' && cfg.strategy === 'echo') {
+        matchedEdgeCase = matchEchoEdgeCase(cfg.echo_edge_cases ?? [], absStreak, body3Sum);
+      }
+      if (matchedEdgeCase) {
         log('info', `echo edge-case override fires ${state.symbol}`, {
-          edgeCase: overrideName,
-          streak: t4.streak, effectiveStreak, threshold,
-          meanBodyRatio: t4.meanBodyRatio,
-          bodyHasVeryExtreme: t4.bodyHasVeryExtreme,
-          body3Sum: t4.body3Sum,
+          edgeCaseId:    matchedEdgeCase.id,
+          edgeCaseLabel: matchedEdgeCase.label,
+          streak:        t4.streak,
+          effectiveStreak,
+          threshold,
+          body3Sum, body3Src,
         });
-        // Annotate adaptive so downstream events show why we fired.
-        adaptive.reason = `${reason} → override [${overrideName}]`;
+        adaptive.reason = `${reason} → edge "${matchedEdgeCase.label ?? matchedEdgeCase.id}" (streak ${absStreak} body3 $${body3Sum.toFixed(0)})`;
       } else {
         return {
           placed: false,
@@ -1357,36 +1383,19 @@ export class PriceMonitoringWorker {
     // streak threshold — cuts low-edge fades. Empirical (BTC 365d):
     //   streak=5 + body3 ≥ $400 → P(reversal)=62.7%, P(trapped to 7+)=13%
     //   streak=5 + body3 < $300 → P(reversal)=46-52%, P(trapped)=23-29%
-    // Bypasses if cfg.*_body3_min = 0 (default — preserves prior behavior).
-    // DCA continuation uses its own gate inside tryPlaceDcaAtBoundary.
-    //
-    // Refresh body3 from LIVE bars at T-3s (or whatever current call time is):
-    //   liveBars = [bar-2 closed, bar-1 closed, current in-progress]
-    // The current in-progress bar's body matters most — at T-3s it's ~99%
-    // formed and reflects the FRESH momentum the bot is fading. Falling back
-    // to t4.body3Sum (3 closed bars at T+4) is fine if the fetch fails.
-    const armedMode = adapt.mode === 'aggressive';
-    const body3Min  = armedMode ? cfg.armed_body3_min : cfg.idle_body3_min;
-    let body3Sum    = t4.body3Sum ?? 0;
-    let body3Src: 'live' | 't4_fallback' = 't4_fallback';
-    if (body3Min > 0) {
-      const liveBars = await fetchBars(
-        state.symbol,
-        t4.windowStart - 2 * WINDOW_MS,
-        Date.now(),
-        3,
-      );
-      if (liveBars.length >= 2) {
-        body3Sum = liveBars.reduce((s, b) => s + Math.abs(b.close - b.open), 0);
-        body3Src = 'live';
+    // SKIPPED when an edge case matched — the edge case's body3Min already
+    // gated entry; applying the global gate too would double-filter and
+    // potentially reject premium short-streak setups that intentionally
+    // bypass the normal threshold.
+    if (!matchedEdgeCase) {
+      const body3Min = armedMode ? cfg.armed_body3_min : cfg.idle_body3_min;
+      if (body3Min > 0 && body3Sum < body3Min) {
+        return {
+          placed: false,
+          reason: `body3 $${body3Sum.toFixed(0)} (${body3Src}) < ${armedMode ? 'armed' : 'idle'}_body3_min $${body3Min}`,
+          adaptive,
+        };
       }
-    }
-    if (body3Min > 0 && body3Sum < body3Min) {
-      return {
-        placed: false,
-        reason: `body3 $${body3Sum.toFixed(0)} (${body3Src}) < ${armedMode ? 'armed' : 'idle'}_body3_min $${body3Min}`,
-        adaptive,
-      };
     }
 
     // Gate 3: N+1 market exists
@@ -1433,7 +1442,8 @@ export class PriceMonitoringWorker {
       });
 
       // Cycle starts. Tag the cycle's mode so DCA continuation picks the
-      // right scale (idle vs armed) — echo only.
+      // right scale (idle vs armed) — echo only. Also tag the matching
+      // edge case id (if any) so DCA can use the case's own dcaBody3Min.
       state.cycleActive        = true;
       state.cycleDirection     = direction;
       state.lastCycleOrderSize = null;
@@ -1441,8 +1451,11 @@ export class PriceMonitoringWorker {
       state.cycleMode          = cfg.strategy === 'echo'
         ? (adapt.mode === 'aggressive' ? 'armed' : 'idle')
         : null;
+      state.cycleEdgeCaseId    = matchedEdgeCase?.id ?? null;
       log('info', `Boundary placed (cycle start) ${state.symbol}`, {
-        streakAbs: absStreak, direction, size: orderSize, cycleMode: state.cycleMode,
+        streakAbs: absStreak, direction, size: orderSize,
+        cycleMode: state.cycleMode,
+        edgeCaseId: state.cycleEdgeCaseId,
       });
 
       return {
@@ -1506,14 +1519,31 @@ export class PriceMonitoringWorker {
 
     // Body-3 DCA gate: averaging down only when the trend's 3-bar body sum
     // still signals exhaustion. After a loss the streak has just extended
-    // by 1; we recompute body3 on the new bar set. Threshold picked by the
-    // ORIGINAL cycle mode (mirrors echo_dca_scale_idle vs echo_dca_scale).
-    // Skip DCA if body3 < the relevant min. 0 = disabled.
-    const dcaBody3Min = state.cycleMode === 'armed'
-      ? cfg.dca_body3_min_armed
-      : cfg.dca_body3_min_idle;
+    // by 1; we recompute body3 on the new bar set.
+    //
+    // Threshold source priority:
+    //   1. If cycle opened via an edge-case override (state.cycleEdgeCaseId
+    //      set), use that case's dcaBody3Min (per-case override).
+    //   2. Else, use the global dca_body3_min_armed / dca_body3_min_idle
+    //      based on cycle mode.
+    // 0 = disabled.
+    let dcaBody3Min: number;
+    let dcaBody3Src: string;
+    const matchedCase = state.cycleEdgeCaseId
+      ? (cfg.echo_edge_cases ?? []).find(c => c.id === state.cycleEdgeCaseId)
+      : null;
+    if (matchedCase) {
+      dcaBody3Min = matchedCase.dcaBody3Min;
+      dcaBody3Src = `edge "${matchedCase.label ?? matchedCase.id}"`;
+    } else if (state.cycleMode === 'armed') {
+      dcaBody3Min = cfg.dca_body3_min_armed;
+      dcaBody3Src = 'dca_body3_min_armed';
+    } else {
+      dcaBody3Min = cfg.dca_body3_min_idle;
+      dcaBody3Src = 'dca_body3_min_idle';
+    }
     if (dcaBody3Min > 0 && body3Sum < dcaBody3Min) {
-      log('info', `DCA skip ${state.symbol}: body3 $${body3Sum.toFixed(0)} < dca_body3_min_${state.cycleMode ?? 'idle'} $${dcaBody3Min}`, {
+      log('info', `DCA skip ${state.symbol}: body3 $${body3Sum.toFixed(0)} < ${dcaBody3Src} $${dcaBody3Min}`, {
         nextWindowStart, streak, cycleMode: state.cycleMode,
       });
       return;
@@ -1775,6 +1805,7 @@ export class PriceMonitoringWorker {
         state.lastCycleOrderSize = null;
         state.dcaFiredCount      = 0;
         state.cycleMode          = null;
+        state.cycleEdgeCaseId    = null;
       } else {
         // Loss → cycle continues. Fire DCA for the next window NOW that we
         // know the loss is real and the streak length includes it. Whitelist
@@ -2699,32 +2730,24 @@ function bucketize(vol: number, avgVol: number): VolumeBucket {
  * edge case (so caller can log which one fired) or null if none match.
  * Patterns + samples + WR are documented on `EchoEdgeCase` in CoinConfig.ts.
  */
+/**
+ * Generic edge-case matcher. Returns the FIRST enabled case in array order
+ * where:
+ *   - absStreak ∈ [streakMin, streakMax]
+ *   - |body3| ≥ body3Min
+ * Returns null if no match. Caller logs which case (by id/label) fired and
+ * tags the cycle so the matching case's `dcaBody3Min` applies at DCA time.
+ */
 function matchEchoEdgeCase(
-  enabled: readonly EchoEdgeCase[],
+  cases: readonly EchoEdgeCase[],
   absStreak: number,
-  ctx: { meanBodyRatio?: number; bodyHasVeryExtreme?: boolean; body3Sum?: number },
-  shortStreakBody3Min: number,
+  body3Sum: number,
 ): EchoEdgeCase | null {
-  // A1: streak 3-4 + mean body > 1.5× avg.
-  if (enabled.includes('short_streak_strong_mean')
-      && absStreak >= 3 && absStreak <= 4
-      && (ctx.meanBodyRatio ?? 0) > 1.5) {
-    return 'short_streak_strong_mean';
-  }
-  // A3: streak 5-7 + ≥1 very-extreme body bar (>4× avg).
-  if (enabled.includes('mid_streak_very_extreme')
-      && absStreak >= 5 && absStreak <= 7
-      && ctx.bodyHasVeryExtreme === true) {
-    return 'mid_streak_very_extreme';
-  }
-  // NEW: streak 3-4 + |body3| ≥ configured absolute threshold (per-coin USD).
-  // Captures premium-edge short-streak setups that ratio-based gates miss.
-  // shortStreakBody3Min=0 disables even when toggled on (safe default).
-  if (enabled.includes('short_streak_big_body3')
-      && absStreak >= 3 && absStreak <= 4
-      && shortStreakBody3Min > 0
-      && (ctx.body3Sum ?? 0) >= shortStreakBody3Min) {
-    return 'short_streak_big_body3';
+  for (const ec of cases) {
+    if (!ec.enabled) continue;
+    if (absStreak < ec.streakMin || absStreak > ec.streakMax) continue;
+    if (body3Sum < ec.body3Min) continue;
+    return ec;
   }
   return null;
 }

@@ -158,8 +158,7 @@ function CoinRow({
     || draft.echo_signal_min_streak !== initial.echo_signal_min_streak
     || draft.echo_baseline_streak   !== initial.echo_baseline_streak
     || draft.echo_require_high_body !== initial.echo_require_high_body
-    || JSON.stringify([...(draft.echo_edge_cases ?? [])].sort())
-       !== JSON.stringify([...(initial.echo_edge_cases ?? [])].sort())
+    || JSON.stringify(draft.echo_edge_cases ?? []) !== JSON.stringify(initial.echo_edge_cases ?? [])
     || JSON.stringify(draft.echo_dca_scale ?? []) !== JSON.stringify(initial.echo_dca_scale ?? [])
     || JSON.stringify(draft.echo_dca_scale_idle ?? []) !== JSON.stringify(initial.echo_dca_scale_idle ?? [])
     || draft.echo_defensive_enabled          !== initial.echo_defensive_enabled
@@ -170,7 +169,6 @@ function CoinRow({
     || (draft.armed_body3_min           ?? 0) !== (initial.armed_body3_min           ?? 0)
     || (draft.dca_body3_min_idle        ?? 0) !== (initial.dca_body3_min_idle        ?? 0)
     || (draft.dca_body3_min_armed       ?? 0) !== (initial.dca_body3_min_armed       ?? 0)
-    || (draft.echo_short_streak_body3_min ?? 0) !== (initial.echo_short_streak_body3_min ?? 0)
     || scheduleDirty
     || dcaWhitelistDirty;
 
@@ -205,7 +203,13 @@ function CoinRow({
     && (draft.armed_body3_min           ?? 0) >= 0 && (draft.armed_body3_min           ?? 0) <= 10_000
     && (draft.dca_body3_min_idle        ?? 0) >= 0 && (draft.dca_body3_min_idle        ?? 0) <= 10_000
     && (draft.dca_body3_min_armed       ?? 0) >= 0 && (draft.dca_body3_min_armed       ?? 0) <= 10_000
-    && (draft.echo_short_streak_body3_min ?? 0) >= 0 && (draft.echo_short_streak_body3_min ?? 0) <= 10_000
+    // Edge cases: each must have valid streak range + body3 thresholds.
+    && (draft.echo_edge_cases ?? []).every(ec =>
+         ec.streakMin >= 2 && ec.streakMin <= 20
+      && ec.streakMax >= ec.streakMin && ec.streakMax <= 20
+      && ec.body3Min    >= 0 && ec.body3Min    <= 10_000
+      && ec.dcaBody3Min >= 0 && ec.dcaBody3Min <= 10_000
+    )
     && scheduleValid
     && echoValid;
 
@@ -242,7 +246,6 @@ function CoinRow({
         armed_body3_min:                 draft.armed_body3_min           ?? 0,
         dca_body3_min_idle:              draft.dca_body3_min_idle        ?? 0,
         dca_body3_min_armed:             draft.dca_body3_min_armed       ?? 0,
-        echo_short_streak_body3_min:     draft.echo_short_streak_body3_min ?? 0,
       });
       setFlash(true);
       setTimeout(() => setFlash(false), 1500);
@@ -564,55 +567,12 @@ function CoinRow({
                   </select>
                 </label>
               </div>
-              <div style={{ width: '100%', display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginTop: 4, paddingTop: 4, borderTop: '1px solid #21262d' }}>
-                <span style={{ color: '#79c0ff', fontWeight: 600, fontSize: 11 }}>Idle edge-case overrides:</span>
-                <label style={{ color: '#8b949e', display: 'flex', alignItems: 'center', gap: 4 }}
-                       title="A1: streak 3-4 + mean body > 1.5× avg → fire even when threshold not met. WR 58.1% (n=1384) on BTC 180d, +4.5% over baseline.">
-                  <input type="checkbox"
-                         checked={(draft.echo_edge_cases ?? []).includes('short_streak_strong_mean')}
-                         disabled={saving || !draft.enabled}
-                         onChange={e => {
-                           const cur = new Set(draft.echo_edge_cases ?? []);
-                           if (e.target.checked) cur.add('short_streak_strong_mean');
-                           else                  cur.delete('short_streak_strong_mean');
-                           setDraft({ ...draft, echo_edge_cases: Array.from(cur) as EchoEdgeCase[] });
-                         }}
-                         style={{ margin: 0 }} />
-                  A1: streak 3-4 + strong mean body
-                </label>
-                <label style={{ color: '#8b949e', display: 'flex', alignItems: 'center', gap: 4 }}
-                       title="A3: streak 5-7 + ≥1 very-extreme body bar (>4× avg) → fire. WR 58.5% (n=217) on BTC 180d, +6.2% over baseline.">
-                  <input type="checkbox"
-                         checked={(draft.echo_edge_cases ?? []).includes('mid_streak_very_extreme')}
-                         disabled={saving || !draft.enabled}
-                         onChange={e => {
-                           const cur = new Set(draft.echo_edge_cases ?? []);
-                           if (e.target.checked) cur.add('mid_streak_very_extreme');
-                           else                  cur.delete('mid_streak_very_extreme');
-                           setDraft({ ...draft, echo_edge_cases: Array.from(cur) as EchoEdgeCase[] });
-                         }}
-                         style={{ margin: 0 }} />
-                  A3: streak 5-7 + very-extreme bar
-                </label>
-                <label style={{ color: '#8b949e', display: 'flex', alignItems: 'center', gap: 4 }}
-                       title="B: streak 3-4 + |body3| ≥ short-streak body3 min → fire. BTC 365d: streak=3 body3≥575 = 65% rev / 4.5% trap; streak=4 body3≥475 = 59% rev / 1.3% trap. Per-coin USD threshold — set 0 to disable.">
-                  <input type="checkbox"
-                         checked={(draft.echo_edge_cases ?? []).includes('short_streak_big_body3')}
-                         disabled={saving || !draft.enabled}
-                         onChange={e => {
-                           const cur = new Set(draft.echo_edge_cases ?? []);
-                           if (e.target.checked) cur.add('short_streak_big_body3');
-                           else                  cur.delete('short_streak_big_body3');
-                           setDraft({ ...draft, echo_edge_cases: Array.from(cur) as EchoEdgeCase[] });
-                         }}
-                         style={{ margin: 0 }} />
-                  B: streak 3-4 + big body3 ≥{' '}
-                  <NumInput value={draft.echo_short_streak_body3_min ?? 0}
-                            min={0} max={10_000} step={25}
-                            disabled={saving || !draft.enabled
-                              || !(draft.echo_edge_cases ?? []).includes('short_streak_big_body3')}
-                            onChange={v => setDraft({ ...draft, echo_short_streak_body3_min: v })} />
-                </label>
+              <div style={{ width: '100%', marginTop: 4, paddingTop: 4, borderTop: '1px solid #21262d' }}>
+                <EdgeCaseEditor
+                  value={draft.echo_edge_cases ?? []}
+                  disabled={saving || !draft.enabled}
+                  onChange={cases => setDraft({ ...draft, echo_edge_cases: cases })}
+                />
               </div>
             </div>
           </td>
@@ -915,6 +875,143 @@ function DcaWhitelistEditor({
           </span>
         )}
       </div>
+    </div>
+  );
+}
+
+// ── Idle-mode edge case editor (echo strategy) ────────────────────────────
+
+function EdgeCaseEditor({
+  value, onChange, disabled,
+}: {
+  value:     EchoEdgeCase[];
+  onChange:  (next: EchoEdgeCase[]) => void;
+  disabled?: boolean;
+}) {
+  const add = (): void => {
+    const next: EchoEdgeCase = {
+      id:           uid(),
+      label:        '',
+      enabled:      true,
+      streakMin:    3,
+      streakMax:    4,
+      body3Min:     500,
+      dcaBody3Min:  300,
+    };
+    onChange([...value, next]);
+  };
+  const update = (id: string, patch: Partial<EchoEdgeCase>): void => {
+    onChange(value.map(ec => ec.id === id ? { ...ec, ...patch } : ec));
+  };
+  const remove = (id: string): void => {
+    onChange(value.filter(ec => ec.id !== id));
+  };
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 12 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ color: '#79c0ff', fontWeight: 600 }}>
+          Idle edge cases ({value.length}):
+        </span>
+        <button
+          onClick={add}
+          disabled={disabled}
+          title="Add a new edge-case override: streak ∈ [min, max] AND |body3| ≥ body3Min fires even when baseline threshold not met. dcaBody3Min applies for DCA on cycles opened via this case."
+          style={{
+            padding: '2px 10px', borderRadius: 4,
+            border: '1px solid #30363d',
+            background: disabled ? '#0a0d12' : '#161b22',
+            color: '#79c0ff', cursor: disabled ? 'not-allowed' : 'pointer',
+            fontSize: 12,
+          }}
+        >
+          + Add edge case
+        </button>
+        <span style={{ color: '#6e7681', fontSize: 11, fontStyle: 'italic' }}>
+          Applies only when streak &lt; baseline. First enabled match wins (top-down).
+        </span>
+      </div>
+      {value.length === 0 ? (
+        <span style={{ color: '#6e7681', fontStyle: 'italic', fontSize: 11 }}>
+          No edge cases — bot uses baseline gate only.
+        </span>
+      ) : (
+        <table style={{ borderCollapse: 'collapse', fontSize: 12 }}>
+          <thead>
+            <tr style={{ color: '#6e7681', fontSize: 10 }}>
+              <th style={{ textAlign: 'left',  padding: '2px 6px' }}>on</th>
+              <th style={{ textAlign: 'left',  padding: '2px 6px' }}>label</th>
+              <th style={{ textAlign: 'right', padding: '2px 6px' }}>streak min</th>
+              <th style={{ textAlign: 'right', padding: '2px 6px' }}>streak max</th>
+              <th style={{ textAlign: 'right', padding: '2px 6px' }}>body3 min ($)</th>
+              <th style={{ textAlign: 'right', padding: '2px 6px' }}>DCA body3 min ($)</th>
+              <th style={{ padding: '2px 6px' }}></th>
+            </tr>
+          </thead>
+          <tbody>
+            {value.map(ec => (
+              <tr key={ec.id} style={{ background: ec.enabled ? 'transparent' : '#0a0d12' }}>
+                <td style={{ padding: '2px 6px' }}>
+                  <input type="checkbox"
+                         checked={ec.enabled}
+                         disabled={disabled}
+                         onChange={e => update(ec.id, { enabled: e.target.checked })}
+                         style={{ margin: 0 }} />
+                </td>
+                <td style={{ padding: '2px 6px' }}>
+                  <input type="text"
+                         value={ec.label ?? ''}
+                         disabled={disabled}
+                         onChange={e => update(ec.id, { label: e.target.value })}
+                         placeholder="(optional)"
+                         style={{ width: 120, padding: '2px 6px', borderRadius: 4,
+                                  border: '1px solid #30363d', background: '#0d1117',
+                                  color: '#c9d1d9', fontSize: 12 }} />
+                </td>
+                <td style={{ padding: '2px 6px', textAlign: 'right' }}>
+                  <NumInput value={ec.streakMin}
+                            min={2} max={20}
+                            disabled={disabled}
+                            onChange={v => update(ec.id, { streakMin: v })} />
+                </td>
+                <td style={{ padding: '2px 6px', textAlign: 'right' }}>
+                  <NumInput value={ec.streakMax}
+                            min={ec.streakMin} max={20}
+                            disabled={disabled}
+                            onChange={v => update(ec.id, { streakMax: v })} />
+                </td>
+                <td style={{ padding: '2px 6px', textAlign: 'right' }}>
+                  <NumInput value={ec.body3Min}
+                            min={0} max={10_000} step={25}
+                            disabled={disabled}
+                            onChange={v => update(ec.id, { body3Min: v })} />
+                </td>
+                <td style={{ padding: '2px 6px', textAlign: 'right' }}>
+                  <NumInput value={ec.dcaBody3Min}
+                            min={0} max={10_000} step={25}
+                            disabled={disabled}
+                            onChange={v => update(ec.id, { dcaBody3Min: v })} />
+                </td>
+                <td style={{ padding: '2px 6px' }}>
+                  <button
+                    onClick={() => remove(ec.id)}
+                    disabled={disabled}
+                    title="Remove this edge case"
+                    style={{
+                      padding: '0 6px', borderRadius: 4,
+                      border: '1px solid #30363d',
+                      background: '#0d1117', color: '#f85149',
+                      cursor: disabled ? 'not-allowed' : 'pointer',
+                      fontSize: 12,
+                    }}
+                  >
+                    ✕
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   );
 }

@@ -304,35 +304,9 @@ function ConfigGrid({
               Body filter (idle: bump +2 if no high-body bar)
             </label>
           </div>
-          <div style={{ gridColumn: '1 / -1', display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
-            <span style={{ fontSize: 12, color: '#8b949e', minWidth: 90 }}>Idle overrides</span>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: '#c9d1d9' }}
-                   title="A1: streak 3-4 + mean body > 1.5× → fire (WR 58.1%, n=1384, Δ+4.5%)">
-              <input type="checkbox"
-                     checked={config.echo_edge_cases.includes('short_streak_strong_mean')}
-                     onChange={e => {
-                       const s = new Set(config.echo_edge_cases);
-                       if (e.target.checked) s.add('short_streak_strong_mean');
-                       else                  s.delete('short_streak_strong_mean');
-                       set('echo_edge_cases', Array.from(s) as ('short_streak_strong_mean'|'mid_streak_very_extreme')[]);
-                     }}
-                     style={{ margin: 0 }} />
-              A1
-            </label>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: '#c9d1d9' }}
-                   title="A3: streak 5-7 + ≥1 very-extreme bar (>4×) → fire (WR 58.5%, n=217, Δ+6.2%)">
-              <input type="checkbox"
-                     checked={config.echo_edge_cases.includes('mid_streak_very_extreme')}
-                     onChange={e => {
-                       const s = new Set(config.echo_edge_cases);
-                       if (e.target.checked) s.add('mid_streak_very_extreme');
-                       else                  s.delete('mid_streak_very_extreme');
-                       set('echo_edge_cases', Array.from(s) as ('short_streak_strong_mean'|'mid_streak_very_extreme')[]);
-                     }}
-                     style={{ margin: 0 }} />
-              A3
-            </label>
-          </div>
+          {/* Edge-case override UI removed pending backtest re-implementation
+              against the new generic EchoEdgeCase[] object shape. Backtest
+              currently runs with no overrides (echo_edge_cases = []). */}
           <div style={{ gridColumn: '1 / -1', display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap',
                         paddingTop: 6, borderTop: '1px solid #21262d' }}>
             <span style={{ fontSize: 12, color: '#f0a500', fontWeight: 600, minWidth: 90 }}>Defensive</span>
