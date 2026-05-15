@@ -21,6 +21,7 @@ dotenv.config({
 });
 
 import { migrate } from '@trading-bot/db/migrate';
+import { getPool } from '@trading-bot/db';
 import { getSignalBus, type SignalBusEvent } from '@trading-bot/core/SignalBus';
 import { initClobExecutor } from '@trading-bot/core/PolymarketClobExecutor';
 import { TelegramService } from '@trading-bot/core/TelegramService';
@@ -125,6 +126,32 @@ async function main(): Promise<void> {
   const resolver = new OrderResolver(worker);
   await worker.start();
   resolver.start();
+
+  // Retention: prune poly_share_ticks older than 48h every hour. Without
+  // this the table grew to 47GB / 105M rows in ~2 weeks and crashed the
+  // host (disk full) on 2026-05-15. See migration 028 for the procedure.
+  // First call delayed 5 min so startup isn't dominated by a big DELETE.
+  const SHARE_TICKS_PRUNE_INTERVAL_MS = 60 * 60 * 1000;   // 1h
+  const SHARE_TICKS_RETENTION_HOURS    = 48;
+  const pruneShareTicks = async (): Promise<void> => {
+    try {
+      const t0 = Date.now();
+      await getPool().query(
+        'CALL prune_poly_share_ticks($1::int)',
+        [SHARE_TICKS_RETENTION_HOURS],
+      );
+      log('info', 'poly_share_ticks pruned', {
+        retentionHours: SHARE_TICKS_RETENTION_HOURS,
+        elapsedMs: Date.now() - t0,
+      });
+    } catch (err) {
+      log('warn', 'poly_share_ticks prune failed', { error: String(err) });
+    }
+  };
+  setTimeout(() => {
+    void pruneShareTicks();
+    setInterval(() => { void pruneShareTicks(); }, SHARE_TICKS_PRUNE_INTERVAL_MS);
+  }, 5 * 60 * 1000).unref();
 
   log('info', 'workers: ready');
 
