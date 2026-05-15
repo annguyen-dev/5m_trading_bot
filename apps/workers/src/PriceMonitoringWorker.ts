@@ -640,12 +640,29 @@ export class PriceMonitoringWorker {
     const book = await state.poly.getOrderBook(tokenId);
     const price = bestAskFromBook(book);
 
-    // Universal alignment gate — current candle must continue the streak
-    // direction, otherwise the contrarian premise is breaking and our bet
-    // is on the wrong side.
-    if (currentIcon !== expectedIcon) {
+    // Alignment gate — current candle continues the streak direction.
+    //
+    // For STREAK strategy: keep the legacy hard reject (premise breaking).
+    //
+    // For ECHO strategy: only reject when current FLIPS. A current bar
+    // moving in the OPPOSITE direction is actually the ideal fade setup —
+    // it means the reversal is already starting mid-window, which is
+    // exactly what we're betting on for N+1. Body3 (live, including the
+    // in-progress bar) is the quality filter that decides whether the
+    // reversal magnitude is meaningful enough to bet on.
+    //
+    // The doji case (currentIcon=⚪) keeps the reject for both — neutral
+    // candle gives no signal either way and breaks contrarian premise.
+    if (cfg.strategy !== 'echo') {
+      if (currentIcon !== expectedIcon) {
+        return {
+          reason: `current ${currentIcon} ≠ expected ${expectedIcon}`,
+          persistentSkip: false,
+        };
+      }
+    } else if (currentIcon === '⚪') {
       return {
-        reason: `current ${currentIcon} ≠ expected ${expectedIcon}`,
+        reason: `current ${currentIcon} (doji) — no signal`,
         persistentSkip: false,
       };
     }
@@ -1272,13 +1289,27 @@ export class PriceMonitoringWorker {
       };
     }
 
-    // Gate 1: current candle direction must still match streak
+    // Gate 1: alignment of current in-progress bar.
+    //
+    // STREAK strategy: hard reject if current ≠ streak direction (legacy).
+    // ECHO   strategy: only reject on doji (⚪). Current going OPPOSITE to
+    //                  streak is the ideal fade setup (reversal mid-window)
+    //                  — body3 below decides whether magnitude qualifies.
     const currentIcon = await fetchInProgressIcon(state.symbol, t4.windowStart);
     const expectedIcon = t4.streak > 0 ? '🟢' : '🔴';
-    if (currentIcon !== expectedIcon) {
+    const currentAligns = currentIcon === expectedIcon;
+    if (cfg.strategy !== 'echo') {
+      if (!currentAligns) {
+        return {
+          placed: false,
+          reason: `current flipped to ${currentIcon} (streak ${expectedIcon})`,
+          adaptive,
+        };
+      }
+    } else if (currentIcon === '⚪') {
       return {
         placed: false,
-        reason: `current flipped to ${currentIcon} (streak ${expectedIcon})`,
+        reason: `current ${currentIcon} (doji) — no signal`,
         adaptive,
       };
     }
@@ -1289,7 +1320,11 @@ export class PriceMonitoringWorker {
     // When the normal gate fails AND the streak's body composition matches
     // an enabled edge case (idle echo only), fire anyway. See `EchoEdgeCase`
     // for the available patterns and statistical rationale.
-    const effectiveStreak = absStreak + 1;
+    //
+    // effectiveStreak = closed streak + 1 IFF current bar continues the
+    // streak. If current flipped (echo only, when we accept it), the
+    // closed streak has ENDED at the current bar — don't add the +1.
+    const effectiveStreak = absStreak + (currentAligns ? 1 : 0);
     if (effectiveStreak < threshold) {
       const overrideName = adapt.mode === 'default' && cfg.strategy === 'echo'
         ? matchEchoEdgeCase(cfg.echo_edge_cases ?? [], absStreak, t4)
