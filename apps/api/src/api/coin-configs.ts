@@ -52,6 +52,7 @@ const DEFAULT_CONFIG: CoinConfig = {
   armed_body3_min:                  0,
   dca_body3_min_idle:               0,
   dca_body3_min_armed:              0,
+  echo_short_streak_body3_min:      0,
 };
 
 /** GET /api/coin-configs → array of { symbol, ...config } for all 7 coins. */
@@ -104,7 +105,7 @@ const patchSchema = z.object({
   echo_signal_min_streak: z.number().int().min(1).max(20).optional(),
   echo_baseline_streak:   z.number().int().min(1).max(20).optional(),
   echo_require_high_body: z.boolean().optional(),
-  echo_edge_cases:        z.array(z.enum(['short_streak_strong_mean', 'mid_streak_very_extreme'])).max(8).optional(),
+  echo_edge_cases:        z.array(z.enum(['short_streak_strong_mean', 'mid_streak_very_extreme', 'short_streak_big_body3'])).max(8).optional(),
   echo_dca_scale:         z.array(z.number().min(1).max(20)).max(10).optional(),
   echo_dca_scale_idle:    z.array(z.number().min(1).max(20)).max(10).optional(),
   echo_defensive_enabled:          z.boolean().optional(),
@@ -118,6 +119,7 @@ const patchSchema = z.object({
   armed_body3_min:                 z.number().min(0).max(10_000).optional(),
   dca_body3_min_idle:              z.number().min(0).max(10_000).optional(),
   dca_body3_min_armed:             z.number().min(0).max(10_000).optional(),
+  echo_short_streak_body3_min:     z.number().min(0).max(10_000).optional(),
 }).strict();
 
 export async function updateCoinConfigHandler(

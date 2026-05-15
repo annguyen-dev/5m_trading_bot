@@ -1327,7 +1327,12 @@ export class PriceMonitoringWorker {
     const effectiveStreak = absStreak + (currentAligns ? 1 : 0);
     if (effectiveStreak < threshold) {
       const overrideName = adapt.mode === 'default' && cfg.strategy === 'echo'
-        ? matchEchoEdgeCase(cfg.echo_edge_cases ?? [], absStreak, t4)
+        ? matchEchoEdgeCase(
+            cfg.echo_edge_cases ?? [],
+            absStreak,
+            t4,
+            cfg.echo_short_streak_body3_min ?? 0,
+          )
         : null;
       if (overrideName) {
         log('info', `echo edge-case override fires ${state.symbol}`, {
@@ -1335,6 +1340,7 @@ export class PriceMonitoringWorker {
           streak: t4.streak, effectiveStreak, threshold,
           meanBodyRatio: t4.meanBodyRatio,
           bodyHasVeryExtreme: t4.bodyHasVeryExtreme,
+          body3Sum: t4.body3Sum,
         });
         // Annotate adaptive so downstream events show why we fired.
         adaptive.reason = `${reason} → override [${overrideName}]`;
@@ -2696,7 +2702,8 @@ function bucketize(vol: number, avgVol: number): VolumeBucket {
 function matchEchoEdgeCase(
   enabled: readonly EchoEdgeCase[],
   absStreak: number,
-  ctx: { meanBodyRatio?: number; bodyHasVeryExtreme?: boolean },
+  ctx: { meanBodyRatio?: number; bodyHasVeryExtreme?: boolean; body3Sum?: number },
+  shortStreakBody3Min: number,
 ): EchoEdgeCase | null {
   // A1: streak 3-4 + mean body > 1.5× avg.
   if (enabled.includes('short_streak_strong_mean')
@@ -2709,6 +2716,15 @@ function matchEchoEdgeCase(
       && absStreak >= 5 && absStreak <= 7
       && ctx.bodyHasVeryExtreme === true) {
     return 'mid_streak_very_extreme';
+  }
+  // NEW: streak 3-4 + |body3| ≥ configured absolute threshold (per-coin USD).
+  // Captures premium-edge short-streak setups that ratio-based gates miss.
+  // shortStreakBody3Min=0 disables even when toggled on (safe default).
+  if (enabled.includes('short_streak_big_body3')
+      && absStreak >= 3 && absStreak <= 4
+      && shortStreakBody3Min > 0
+      && (ctx.body3Sum ?? 0) >= shortStreakBody3Min) {
+    return 'short_streak_big_body3';
   }
   return null;
 }

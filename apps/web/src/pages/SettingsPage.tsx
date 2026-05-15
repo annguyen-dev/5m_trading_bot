@@ -166,10 +166,11 @@ function CoinRow({
     || draft.echo_defensive_streak_threshold !== initial.echo_defensive_streak_threshold
     || draft.echo_defensive_overdue_minutes  !== initial.echo_defensive_overdue_minutes
     || draft.echo_defensive_action           !== initial.echo_defensive_action
-    || (draft.idle_body3_min       ?? 0) !== (initial.idle_body3_min       ?? 0)
-    || (draft.armed_body3_min      ?? 0) !== (initial.armed_body3_min      ?? 0)
-    || (draft.dca_body3_min_idle   ?? 0) !== (initial.dca_body3_min_idle   ?? 0)
-    || (draft.dca_body3_min_armed  ?? 0) !== (initial.dca_body3_min_armed  ?? 0)
+    || (draft.idle_body3_min            ?? 0) !== (initial.idle_body3_min            ?? 0)
+    || (draft.armed_body3_min           ?? 0) !== (initial.armed_body3_min           ?? 0)
+    || (draft.dca_body3_min_idle        ?? 0) !== (initial.dca_body3_min_idle        ?? 0)
+    || (draft.dca_body3_min_armed       ?? 0) !== (initial.dca_body3_min_armed       ?? 0)
+    || (draft.echo_short_streak_body3_min ?? 0) !== (initial.echo_short_streak_body3_min ?? 0)
     || scheduleDirty
     || dcaWhitelistDirty;
 
@@ -200,10 +201,11 @@ function CoinRow({
     && draft.tp_cents > draft.sl_cents
     && draft.auto_order_min_streak >= draft.streak_min
     // Body-3 bounds: 0 = disabled; up to 10000 to cover BTC (price-USD units).
-    && (draft.idle_body3_min       ?? 0) >= 0 && (draft.idle_body3_min       ?? 0) <= 10_000
-    && (draft.armed_body3_min      ?? 0) >= 0 && (draft.armed_body3_min      ?? 0) <= 10_000
-    && (draft.dca_body3_min_idle   ?? 0) >= 0 && (draft.dca_body3_min_idle   ?? 0) <= 10_000
-    && (draft.dca_body3_min_armed  ?? 0) >= 0 && (draft.dca_body3_min_armed  ?? 0) <= 10_000
+    && (draft.idle_body3_min            ?? 0) >= 0 && (draft.idle_body3_min            ?? 0) <= 10_000
+    && (draft.armed_body3_min           ?? 0) >= 0 && (draft.armed_body3_min           ?? 0) <= 10_000
+    && (draft.dca_body3_min_idle        ?? 0) >= 0 && (draft.dca_body3_min_idle        ?? 0) <= 10_000
+    && (draft.dca_body3_min_armed       ?? 0) >= 0 && (draft.dca_body3_min_armed       ?? 0) <= 10_000
+    && (draft.echo_short_streak_body3_min ?? 0) >= 0 && (draft.echo_short_streak_body3_min ?? 0) <= 10_000
     && scheduleValid
     && echoValid;
 
@@ -236,10 +238,11 @@ function CoinRow({
         echo_defensive_streak_threshold: draft.echo_defensive_streak_threshold,
         echo_defensive_overdue_minutes:  draft.echo_defensive_overdue_minutes,
         echo_defensive_action:           draft.echo_defensive_action,
-        idle_body3_min:                  draft.idle_body3_min       ?? 0,
-        armed_body3_min:                 draft.armed_body3_min      ?? 0,
-        dca_body3_min_idle:              draft.dca_body3_min_idle   ?? 0,
-        dca_body3_min_armed:             draft.dca_body3_min_armed  ?? 0,
+        idle_body3_min:                  draft.idle_body3_min            ?? 0,
+        armed_body3_min:                 draft.armed_body3_min           ?? 0,
+        dca_body3_min_idle:              draft.dca_body3_min_idle        ?? 0,
+        dca_body3_min_armed:             draft.dca_body3_min_armed       ?? 0,
+        echo_short_streak_body3_min:     draft.echo_short_streak_body3_min ?? 0,
       });
       setFlash(true);
       setTimeout(() => setFlash(false), 1500);
@@ -590,6 +593,25 @@ function CoinRow({
                          }}
                          style={{ margin: 0 }} />
                   A3: streak 5-7 + very-extreme bar
+                </label>
+                <label style={{ color: '#8b949e', display: 'flex', alignItems: 'center', gap: 4 }}
+                       title="B: streak 3-4 + |body3| ≥ short-streak body3 min → fire. BTC 365d: streak=3 body3≥575 = 65% rev / 4.5% trap; streak=4 body3≥475 = 59% rev / 1.3% trap. Per-coin USD threshold — set 0 to disable.">
+                  <input type="checkbox"
+                         checked={(draft.echo_edge_cases ?? []).includes('short_streak_big_body3')}
+                         disabled={saving || !draft.enabled}
+                         onChange={e => {
+                           const cur = new Set(draft.echo_edge_cases ?? []);
+                           if (e.target.checked) cur.add('short_streak_big_body3');
+                           else                  cur.delete('short_streak_big_body3');
+                           setDraft({ ...draft, echo_edge_cases: Array.from(cur) as EchoEdgeCase[] });
+                         }}
+                         style={{ margin: 0 }} />
+                  B: streak 3-4 + big body3 ≥{' '}
+                  <NumInput value={draft.echo_short_streak_body3_min ?? 0}
+                            min={0} max={10_000} step={25}
+                            disabled={saving || !draft.enabled
+                              || !(draft.echo_edge_cases ?? []).includes('short_streak_big_body3')}
+                            onChange={v => setDraft({ ...draft, echo_short_streak_body3_min: v })} />
                 </label>
               </div>
             </div>

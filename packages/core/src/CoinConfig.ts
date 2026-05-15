@@ -25,11 +25,17 @@ export type CoinStrategy = 'streak' | 'echo';
  * skip an order, these patterns can FORCE a fire if the streak's body
  * composition matches a confirmed "early fire" signature.
  *
- * Implemented (BTC 180d data):
+ * Implemented (BTC 180d / 365d data):
  *   - 'short_streak_strong_mean': streak 3-4 + mean body > 1.5× avg. Sample
  *     1384, WR 58.1%, Δ +4.5% over baseline. (A1)
  *   - 'mid_streak_very_extreme':  streak 5-7 + ≥1 bar body > 4× avg. Sample
  *     217, WR 58.5%, Δ +6.2%. (A3)
+ *   - 'short_streak_big_body3':   streak 3-4 + |body3| ≥ echo_short_streak_body3_min.
+ *     Uses ABSOLUTE body sum (price USD) instead of ratios — catches the
+ *     "premium" climax setups that show 60-76% reversal rate in 365d data.
+ *     BTC: 500 → 4-bar at $475-500 = 59.2% rev / 1.3% trap; 3-bar at $575-600
+ *     = 65.2% rev / 4.5% trap. Per-coin threshold (scales with asset price).
+ *     Set echo_short_streak_body3_min=0 to disable even when toggled on.
  *
  * Documented for future evaluation (need cross-coin / longer-window confirm):
  *   - 'short_streak_three_high':       streak 3-4 + ≥3 high-body bars       (A2: WR 58.3%, n=271, Δ+4.7%)
@@ -42,7 +48,8 @@ export type CoinStrategy = 'streak' | 'echo';
  */
 export type EchoEdgeCase =
   | 'short_streak_strong_mean'
-  | 'mid_streak_very_extreme';
+  | 'mid_streak_very_extreme'
+  | 'short_streak_big_body3';
 
 /**
  * One row in `auto_schedule`: overrides `auto_order_min_streak` during the
@@ -218,6 +225,17 @@ export interface CoinConfig {
    *  mode. Typically lower than idle (armed cycles already validated regime).
    *  0 = disabled. */
   dca_body3_min_armed: number;
+
+  /**
+   * |body3| threshold (price USD) for the 'short_streak_big_body3' idle edge
+   * case. When that edge case is enabled in `echo_edge_cases` AND streak is
+   * 3-4 AND |body3| ≥ this value, the bot fires even when the normal
+   * threshold gate would reject (streak too short for baseline).
+   *
+   * Per-coin tuning required — BTC ~500, ETH ~30, scaled to price level.
+   * 0 = disabled (treats the edge case as off regardless of toggle).
+   */
+  echo_short_streak_body3_min: number;
 }
 
 export type CoinConfigs = Partial<Record<CoinSymbol, CoinConfig>>;
@@ -265,6 +283,7 @@ const DEFAULT_CONFIG: CoinConfig = {
   armed_body3_min:                  0,
   dca_body3_min_idle:               0,
   dca_body3_min_armed:              0,
+  echo_short_streak_body3_min:      0,
 };
 
 export const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB'];
@@ -287,10 +306,15 @@ export const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DO
  */
 export const PER_COIN_OVERRIDES: Partial<Record<CoinSymbol, Partial<CoinConfig>>> = {
   BTC: {
-    idle_body3_min:      400,
-    armed_body3_min:     300,
-    dca_body3_min_idle:  200,
-    dca_body3_min_armed: 150,
+    idle_body3_min:              400,
+    armed_body3_min:             300,
+    dca_body3_min_idle:          200,
+    dca_body3_min_armed:         150,
+    // short_streak_big_body3 edge case threshold. Per BTC 365d analysis,
+    // streak=3 at body3≥575 reaches 65% rev / 4.5% trap; streak=4 at body3≥475
+    // hits 59% rev / 1.3% trap. 500 is a midpoint that catches both with
+    // sufficient sample. Edge case still needs toggling on via echo_edge_cases.
+    echo_short_streak_body3_min: 500,
   },
 };
 

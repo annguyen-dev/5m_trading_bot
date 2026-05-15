@@ -439,7 +439,7 @@ export type CoinMode    = 'signal_only' | 'signal_and_order';
 export type CoinStrategy = 'streak' | 'echo';
 
 /** Echo idle-mode override edge cases (see backend EchoEdgeCase). */
-export type EchoEdgeCase = 'short_streak_strong_mean' | 'mid_streak_very_extreme';
+export type EchoEdgeCase = 'short_streak_strong_mean' | 'mid_streak_very_extreme' | 'short_streak_big_body3';
 
 export interface AutoScheduleEntry {
   start_hour:     number;   // 0-23 UTC
@@ -570,6 +570,9 @@ export interface CoinConfigPatch {
   dca_body3_min_idle:              number;
   /** Body-3 DCA gate when the cycle was opened in ARMED mode. 0 = disabled. */
   dca_body3_min_armed:             number;
+  /** |body3| threshold for the 'short_streak_big_body3' edge-case override
+   *  (idle, streak 3-4). 0 = disabled. */
+  echo_short_streak_body3_min:     number;
 }
 
 export interface CoinConfigRow extends CoinConfigPatch {
