@@ -402,133 +402,155 @@ function CoinRow({
           </button>
         </td>
       </tr>
-      {/* Echo Hunt params — inline second row when strategy=echo. Keeps the
-          main row narrow while making all 4 echo params visible at a glance. */}
+      {/* Echo Hunt params — grouped sub-rows. Each section has a colored
+          chip label on the left so the layout reads as: streak thresholds
+          → body3 entry gates → body3 DCA gates → DCA scales. */}
       {draft.strategy === 'echo' && (
         <tr style={{ background: '#0a0d12' }}>
-          <td colSpan={14} style={{ padding: '8px 24px', borderBottom: '1px solid #21262d' }}>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'center', fontSize: 12 }}>
-              <span style={{ color: '#79c0ff', fontWeight: 600 }}>Echo Hunt:</span>
-              <label style={{ color: '#8b949e' }}
-                     title="Idle baseline threshold — bot uses this when NOT armed (between trigger events).">
-                Baseline streak ≥{' '}
-                <NumInput value={draft.echo_baseline_streak}
-                          min={draft.echo_signal_min_streak} max={20}
-                          disabled={saving || !draft.enabled}
-                          onChange={v => setDraft({ ...draft, echo_baseline_streak: v })} />
-              </label>
-              <label style={{ color: '#8b949e' }}>
-                Trigger streak ≥{' '}
-                <NumInput value={draft.echo_trigger_streak}
-                          min={3} max={20}
-                          disabled={saving || !draft.enabled}
-                          onChange={v => setDraft({ ...draft, echo_trigger_streak: v })} />
-              </label>
-              <label style={{ color: '#8b949e' }}>
-                Arm window (min){' '}
-                <NumInput value={draft.echo_window_minutes}
-                          min={5} max={240}
-                          disabled={saving || !draft.enabled}
-                          onChange={v => setDraft({ ...draft, echo_window_minutes: v })} />
-              </label>
-              <label style={{ color: '#8b949e' }}>
-                Signal streak ≥{' '}
-                <NumInput value={draft.echo_signal_min_streak}
-                          min={1} max={draft.echo_trigger_streak}
-                          disabled={saving || !draft.enabled}
-                          onChange={v => setDraft({ ...draft, echo_signal_min_streak: v })} />
-              </label>
-              <label style={{ color: '#8b949e', display: 'flex', alignItems: 'center', gap: 4 }}
-                     title="V9 filter (IDLE mode only): when streak has no high-body bar (>1.5× avg), bump baseline threshold +2 (e.g. 6→8) to wait for a stronger streak. Armed mode unaffected.">
-                <input type="checkbox"
-                       checked={draft.echo_require_high_body}
-                       disabled={saving || !draft.enabled}
-                       onChange={e => setDraft({ ...draft, echo_require_high_body: e.target.checked })}
-                       style={{ margin: 0 }} />
-                Body filter (idle: bump +2 if no high-body)
-              </label>
-              <label style={{ color: '#8b949e' }}
-                     title="Body-3 idle gate (price USD): sum of |close-open| over last 3 closed bars must be ≥ this to fire in idle mode. 0 = disabled. BTC 365d analysis: streak=5 + body3 ≥ 400 → P(rev)=63%, vs 46-52% below 300. Set per coin (BTC ~400, ETH ~30, SOL ~5).">
-                Idle body3 ≥{' '}
-                <NumInput value={draft.idle_body3_min ?? 0}
-                          min={0} max={10_000} step={10}
-                          disabled={saving || !draft.enabled}
-                          onChange={v => setDraft({ ...draft, idle_body3_min: v })} />
-              </label>
-              <label style={{ color: '#8b949e' }}
-                     title="Body-3 armed gate (price USD): same as idle but for armed mode. Recommended lower than idle (armed has higher base edge). BTC ~300.">
-                Armed body3 ≥{' '}
-                <NumInput value={draft.armed_body3_min ?? 0}
-                          min={0} max={10_000} step={10}
-                          disabled={saving || !draft.enabled}
-                          onChange={v => setDraft({ ...draft, armed_body3_min: v })} />
-              </label>
-              <label style={{ color: '#8b949e' }}
-                     title="Body-3 DCA gate when cycle was opened in IDLE mode. After a loss, recompute body3 on new bar set; skip DCA if body3 < this. Recommended lower than idle entry (averaging-down at lower price tolerates weaker signal). BTC ~200.">
-                DCA idle body3 ≥{' '}
-                <NumInput value={draft.dca_body3_min_idle ?? 0}
-                          min={0} max={10_000} step={10}
-                          disabled={saving || !draft.enabled}
-                          onChange={v => setDraft({ ...draft, dca_body3_min_idle: v })} />
-              </label>
-              <label style={{ color: '#8b949e' }}
-                     title="Body-3 DCA gate when cycle was opened in ARMED mode. Typically lowest threshold of the four (armed cycle already validated regime). BTC ~150.">
-                DCA armed body3 ≥{' '}
-                <NumInput value={draft.dca_body3_min_armed ?? 0}
-                          min={0} max={10_000} step={10}
-                          disabled={saving || !draft.enabled}
-                          onChange={v => setDraft({ ...draft, dca_body3_min_armed: v })} />
-              </label>
-              <label style={{ color: '#8b949e' }}
-                     title="ARMED-mode DCA — comma-separated multipliers indexed by loss-count. e.g. '3,4' = base×3 after L1, base×4 after L2, then stop.">
-                DCA armed{' '}
-                <input
-                  type="text"
-                  value={scaleStr}
-                  disabled={saving || !draft.enabled}
-                  onChange={e => {
-                    const text = e.target.value;
-                    setScaleStr(text);
-                    const parsed = text
-                      .split(',')
-                      .map(s => Number(s.trim()))
-                      .filter(n => Number.isFinite(n) && n > 0);
-                    setDraft({ ...draft, echo_dca_scale: parsed });
-                  }}
-                  placeholder="3,4"
-                  style={{ width: 80, padding: '4px 6px', borderRadius: 4,
-                           border: '1px solid #30363d', background: '#0d1117',
-                           color: '#c9d1d9', fontSize: 12, fontFamily: 'monospace' }}
-                />
-              </label>
-              <label style={{ color: '#8b949e' }}
-                     title="IDLE-mode DCA — separate scale for cycles opened at baseline threshold. Empty = use armed scale (above) for both modes.">
-                DCA idle{' '}
-                <input
-                  type="text"
-                  value={scaleStrIdle}
-                  disabled={saving || !draft.enabled}
-                  onChange={e => {
-                    const text = e.target.value;
-                    setScaleStrIdle(text);
-                    const parsed = text
-                      .split(',')
-                      .map(s => Number(s.trim()))
-                      .filter(n => Number.isFinite(n) && n > 0);
-                    setDraft({ ...draft, echo_dca_scale_idle: parsed });
-                  }}
-                  placeholder="(use armed)"
-                  style={{ width: 90, padding: '4px 6px', borderRadius: 4,
-                           border: '1px solid #30363d', background: '#0d1117',
-                           color: '#c9d1d9', fontSize: 12, fontFamily: 'monospace' }}
-                />
-              </label>
-              <span style={{ color: '#6e7681', fontSize: 11, fontStyle: 'italic' }}>
-                Echo idle → threshold = <b>Baseline streak ≥</b>. Echo armed → threshold = <b>Signal streak ≥</b>.
-                Auto ≥ / Schedule / DCA streaks / DCA mult không áp dụng cho echo.
-              </span>
-              <div style={{ width: '100%', display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginTop: 4, paddingTop: 4, borderTop: '1px solid #21262d' }}>
-                <span style={{ color: '#f0a500', fontWeight: 600, fontSize: 11 }}>Defensive regime:</span>
+          <td colSpan={14} style={{ padding: '10px 24px', borderBottom: '1px solid #21262d' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, fontSize: 12 }}>
+
+              {/* Row 1: Streak thresholds + arm + body filter */}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14, alignItems: 'center' }}>
+                <span style={S.echoChip}>Streak</span>
+                <label style={S.echoLabel}
+                       title="Idle baseline threshold — bot uses this when NOT armed (between trigger events).">
+                  Baseline ≥{' '}
+                  <NumInput value={draft.echo_baseline_streak}
+                            min={draft.echo_signal_min_streak} max={20}
+                            disabled={saving || !draft.enabled}
+                            onChange={v => setDraft({ ...draft, echo_baseline_streak: v })} />
+                </label>
+                <label style={S.echoLabel}
+                       title="Streak length that, when it ENDS, opens the arm window.">
+                  Trigger ≥{' '}
+                  <NumInput value={draft.echo_trigger_streak}
+                            min={3} max={20}
+                            disabled={saving || !draft.enabled}
+                            onChange={v => setDraft({ ...draft, echo_trigger_streak: v })} />
+                </label>
+                <label style={S.echoLabel}
+                       title="Inside arm window, fire when |streak| ≥ this (lower than trigger so micro-pullbacks fire).">
+                  Signal ≥{' '}
+                  <NumInput value={draft.echo_signal_min_streak}
+                            min={1} max={draft.echo_trigger_streak}
+                            disabled={saving || !draft.enabled}
+                            onChange={v => setDraft({ ...draft, echo_signal_min_streak: v })} />
+                </label>
+                <label style={S.echoLabel}
+                       title="How long the arm window stays open after a trigger streak ends.">
+                  Arm window (min){' '}
+                  <NumInput value={draft.echo_window_minutes}
+                            min={5} max={240}
+                            disabled={saving || !draft.enabled}
+                            onChange={v => setDraft({ ...draft, echo_window_minutes: v })} />
+                </label>
+                <label style={{ ...S.echoLabel, display: 'flex', alignItems: 'center', gap: 4 }}
+                       title="V9 filter (IDLE mode only): when streak has no high-body bar (>1.5× avg), bump baseline threshold +2 (e.g. 6→8) to wait for a stronger streak. Armed mode unaffected.">
+                  <input type="checkbox"
+                         checked={draft.echo_require_high_body}
+                         disabled={saving || !draft.enabled}
+                         onChange={e => setDraft({ ...draft, echo_require_high_body: e.target.checked })}
+                         style={{ margin: 0 }} />
+                  High-body filter (idle +2)
+                </label>
+              </div>
+
+              {/* Row 2: Body3 entry gates (idle / armed) */}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14, alignItems: 'center' }}>
+                <span style={{ ...S.echoChip, background: '#0d2a4a', color: '#7ee787' }}>Body3 entry</span>
+                <label style={S.echoLabel}
+                       title="Body-3 idle gate (price USD): sum of |close-open| over last 3 bars (incl in-progress) must be ≥ this to fire in idle mode. 0 = disabled. BTC ~400, ETH ~30, SOL ~5.">
+                  Idle ≥{' '}
+                  <NumInput value={draft.idle_body3_min ?? 0}
+                            min={0} max={10_000} step={25}
+                            disabled={saving || !draft.enabled}
+                            onChange={v => setDraft({ ...draft, idle_body3_min: v })} />
+                </label>
+                <label style={S.echoLabel}
+                       title="Body-3 armed gate. Recommended lower than idle (armed has higher base edge). BTC ~300.">
+                  Armed ≥{' '}
+                  <NumInput value={draft.armed_body3_min ?? 0}
+                            min={0} max={10_000} step={25}
+                            disabled={saving || !draft.enabled}
+                            onChange={v => setDraft({ ...draft, armed_body3_min: v })} />
+                </label>
+              </div>
+
+              {/* Row 3: Body3 DCA gates */}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14, alignItems: 'center' }}>
+                <span style={{ ...S.echoChip, background: '#2a1a4a', color: '#d2a8ff' }}>Body3 DCA</span>
+                <label style={S.echoLabel}
+                       title="Body-3 DCA gate when cycle opened in IDLE mode. Skip DCA if body3 < this. BTC ~200.">
+                  Idle ≥{' '}
+                  <NumInput value={draft.dca_body3_min_idle ?? 0}
+                            min={0} max={10_000} step={25}
+                            disabled={saving || !draft.enabled}
+                            onChange={v => setDraft({ ...draft, dca_body3_min_idle: v })} />
+                </label>
+                <label style={S.echoLabel}
+                       title="Body-3 DCA gate when cycle opened in ARMED mode. Typically lowest of the four. BTC ~150.">
+                  Armed ≥{' '}
+                  <NumInput value={draft.dca_body3_min_armed ?? 0}
+                            min={0} max={10_000} step={25}
+                            disabled={saving || !draft.enabled}
+                            onChange={v => setDraft({ ...draft, dca_body3_min_armed: v })} />
+                </label>
+              </div>
+
+              {/* Row 4: DCA size scales (multipliers) */}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14, alignItems: 'center' }}>
+                <span style={{ ...S.echoChip, background: '#3a2a0d', color: '#ffd33d' }}>DCA size</span>
+                <label style={S.echoLabel}
+                       title="ARMED-mode DCA — comma-separated multipliers indexed by loss-count. e.g. '3,4' = base×3 after L1, base×4 after L2, then stop.">
+                  Armed scale{' '}
+                  <input
+                    type="text"
+                    value={scaleStr}
+                    disabled={saving || !draft.enabled}
+                    onChange={e => {
+                      const text = e.target.value;
+                      setScaleStr(text);
+                      const parsed = text
+                        .split(',')
+                        .map(s => Number(s.trim()))
+                        .filter(n => Number.isFinite(n) && n > 0);
+                      setDraft({ ...draft, echo_dca_scale: parsed });
+                    }}
+                    placeholder="3,4"
+                    style={{ width: 80, padding: '4px 6px', borderRadius: 4,
+                             border: '1px solid #30363d', background: '#0d1117',
+                             color: '#c9d1d9', fontSize: 12, fontFamily: 'monospace' }}
+                  />
+                </label>
+                <label style={S.echoLabel}
+                       title="IDLE-mode DCA — separate scale for cycles opened at baseline threshold. Empty = use armed scale for both modes.">
+                  Idle scale{' '}
+                  <input
+                    type="text"
+                    value={scaleStrIdle}
+                    disabled={saving || !draft.enabled}
+                    onChange={e => {
+                      const text = e.target.value;
+                      setScaleStrIdle(text);
+                      const parsed = text
+                        .split(',')
+                        .map(s => Number(s.trim()))
+                        .filter(n => Number.isFinite(n) && n > 0);
+                      setDraft({ ...draft, echo_dca_scale_idle: parsed });
+                    }}
+                    placeholder="(use armed)"
+                    style={{ width: 90, padding: '4px 6px', borderRadius: 4,
+                             border: '1px solid #30363d', background: '#0d1117',
+                             color: '#c9d1d9', fontSize: 12, fontFamily: 'monospace' }}
+                  />
+                </label>
+                <span style={{ color: '#6e7681', fontSize: 11, fontStyle: 'italic' }}>
+                  Idle → use <b>Baseline</b>. Armed → use <b>Signal</b>. Auto ≥ / Schedule / DCA mult above don't apply to echo.
+                </span>
+              </div>
+              <div style={{ display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap', marginTop: 4, paddingTop: 8, borderTop: '1px solid #21262d' }}>
+                <span style={{ ...S.echoChip, background: '#3a2a0d', color: '#f0a500' }}>Defensive</span>
                 <label style={{ color: '#8b949e', display: 'flex', alignItems: 'center', gap: 4 }}
                        title="When enabled, bot tracks time since last extreme streak. If gap exceeds the overdue threshold, applies the defensive action.">
                   <input type="checkbox"
@@ -567,7 +589,7 @@ function CoinRow({
                   </select>
                 </label>
               </div>
-              <div style={{ width: '100%', marginTop: 4, paddingTop: 4, borderTop: '1px solid #21262d' }}>
+              <div style={{ marginTop: 4, paddingTop: 8, borderTop: '1px solid #21262d' }}>
                 <EdgeCaseEditor
                   value={draft.echo_edge_cases ?? []}
                   disabled={saving || !draft.enabled}
@@ -907,27 +929,33 @@ function EdgeCaseEditor({
     onChange(value.filter(ec => ec.id !== id));
   };
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 12 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <span style={{ color: '#79c0ff', fontWeight: 600 }}>
-          Idle edge cases ({value.length}):
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, fontSize: 12 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+        <span style={{
+          padding: '2px 10px', borderRadius: 12, fontSize: 11, fontWeight: 600,
+          background: '#2a1f4a', color: '#bb86fc', minWidth: 92, textAlign: 'center',
+        }}>
+          Edge cases
+        </span>
+        <span style={{ color: '#8b949e' }}>
+          {value.length === 0 ? 'none' : `${value.length} case${value.length === 1 ? '' : 's'}`}
         </span>
         <button
           onClick={add}
           disabled={disabled}
           title="Add a new edge-case override: streak ∈ [min, max] AND |body3| ≥ body3Min fires even when baseline threshold not met. dcaBody3Min applies for DCA on cycles opened via this case."
           style={{
-            padding: '2px 10px', borderRadius: 4,
+            padding: '3px 12px', borderRadius: 4,
             border: '1px solid #30363d',
             background: disabled ? '#0a0d12' : '#161b22',
-            color: '#79c0ff', cursor: disabled ? 'not-allowed' : 'pointer',
-            fontSize: 12,
+            color: '#bb86fc', cursor: disabled ? 'not-allowed' : 'pointer',
+            fontSize: 12, fontWeight: 500,
           }}
         >
-          + Add edge case
+          + Add
         </button>
         <span style={{ color: '#6e7681', fontSize: 11, fontStyle: 'italic' }}>
-          Applies only when streak &lt; baseline. First enabled match wins (top-down).
+          Idle only · streak &lt; baseline · first enabled match wins
         </span>
       </div>
       {value.length === 0 ? (
@@ -1294,6 +1322,9 @@ const S: Record<string, React.CSSProperties> = {
                 fontSize: 12 },
   chip:       { padding: '2px 8px', borderRadius: 12, border: '1px solid #30363d',
                 fontSize: 11, fontWeight: 600, cursor: 'pointer' },
+  echoChip:   { padding: '2px 10px', borderRadius: 12, fontSize: 11, fontWeight: 600,
+                background: '#1f3a5f', color: '#79c0ff', minWidth: 92, textAlign: 'center' as const },
+  echoLabel:  { color: '#8b949e', display: 'inline-flex', alignItems: 'center', gap: 4 },
   saveBtn:    { padding: '4px 12px', borderRadius: 4, border: 'none',
                 fontSize: 12, fontWeight: 600, minWidth: 56 },
   scheduleBtn:{ padding: '4px 10px', borderRadius: 4, border: '1px solid #30363d',
