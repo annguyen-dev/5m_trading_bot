@@ -272,28 +272,59 @@ async function main(): Promise<void> {
     if (matchedEdge?.label) trade.edgeCaseLabel = matchedEdge.label;
     trades.push(trade);
 
-    // DCA on loss.
-    let dcaRound = 0;
+    // DCA on loss — CORRECTED LOGIC.
+    //
+    // Real bot timing:
+    //   - Base bet placed at end of window M for window M+1 outcome.
+    //   - Window M+1 closes → base outcome known.
+    //   - If base lost (M+1 continued streak), bot DCAs at T+0 of M+2
+    //     for window M+2's outcome.
+    //
+    // Backtest mapping:
+    //   - Base bet target = bars[j].
+    //   - After bars[j] closes → outcome = bars[j].dir.
+    //   - If lost (bars[j].dir === regime), DCA target = bars[j+1].
+    //   - Outcome = bars[j+1].dir.
+    //
+    // At DCA decision time (end of bars[j]):
+    //   - Known closed bars: 0..j.
+    //   - body3 = sum |body| of bars[j-2], bars[j-1], bars[j] (last 3 closed).
+    //   - Streak = s + 1 (base bet's bar continued the original streak).
+    //   - We CANNOT peek at bars[j+1] (= DCA target).
+    //
+    // curJ = LAST BAR WE BET ON (target of most recent bet). After base
+    // bet, curJ = j. After DCA round 1, curJ = j+1. Etc.
     let curJ = j;
-    while (!trades[trades.length-1]!.won && dcaRound < dcaScale.length && curJ + 2 < bars.length) {
-      const nextJ = curJ + 1;
-      const newRegime = bars[nextJ]!.dir;
-      if (newRegime === 0) break;
-      if (newRegime !== regime) break;   // streak broke — no DCA
-      const newStreak = s + dcaRound + 1;
+    let curStreak = s;
+    let dcaRound = 0;
+    while (!trades[trades.length-1]!.won
+           && dcaRound < dcaScale.length
+           && curJ + 1 < bars.length) {
+      // Last bet at bars[curJ] LOST. Streak now = curStreak + 1.
+      const newStreak = curStreak + 1;
+      // Body3 from 3 closed bars ending at curJ (which just closed).
       let newBody3 = 0;
       if (args.bodyMetric === 'bodyAll') {
-        for (let k = 0; k < newStreak; k++) newBody3 += Math.abs(bars[nextJ - (newStreak-1) + k]!.body);
+        for (let k = 0; k < newStreak; k++) {
+          const idx = curJ - (newStreak - 1) + k;
+          if (idx < 0) continue;
+          newBody3 += Math.abs(bars[idx]!.body);
+        }
       } else {
-        newBody3 = Math.abs(bars[nextJ]!.body) + Math.abs(bars[curJ]!.body) + Math.abs(bars[curJ-1]!.body);
+        newBody3 = Math.abs(bars[curJ]!.body)
+                 + Math.abs(bars[curJ-1]!.body)
+                 + Math.abs(bars[curJ-2]!.body);
       }
       if (dcaBody3Min > 0 && newBody3 < dcaBody3Min) break;
-      const dcaEntry  = entryPriceFor(newStreak, args);
-      const dcaSize   = size * dcaScale[dcaRound]!;
-      const dcaShares = dcaSize / dcaEntry;
-      const dcaBar    = bars[nextJ + 1]!;
-      const dcaWon    = dcaBar.dir !== 0 && dcaBar.dir === betDir;
-      const dcaPnl    = dcaWon ? dcaShares * (1 - dcaEntry) : -dcaSize;
+
+      // DCA bet on the very next bar.
+      const dcaTargetJ = curJ + 1;
+      const dcaEntry   = entryPriceFor(newStreak, args);
+      const dcaSize    = size * dcaScale[dcaRound]!;
+      const dcaShares  = dcaSize / dcaEntry;
+      const dcaBar     = bars[dcaTargetJ]!;
+      const dcaWon     = dcaBar.dir !== 0 && dcaBar.dir === betDir;
+      const dcaPnl     = dcaWon ? dcaShares * (1 - dcaEntry) : -dcaSize;
       const dcaTrade: Trade = {
         ts: dcaBar.ts, mode, dcaRound: dcaRound + 1,
         streak: newStreak, body3: newBody3,
@@ -303,11 +334,16 @@ async function main(): Promise<void> {
       };
       if (matchedEdge?.label) dcaTrade.edgeCaseLabel = matchedEdge.label;
       trades.push(dcaTrade);
+
+      // Advance state: curJ now = the bar we just bet on.
+      curJ = dcaTargetJ;
+      curStreak = newStreak;
       dcaRound++;
-      curJ = nextJ + 1;
-      if (dcaWon) break;
+
+      if (dcaWon) break;        // cycle wins — stop DCA chain
     }
 
+    // Advance main loop past the LAST bar we bet on (base or DCA).
     j = curJ + 1;
   }
 
