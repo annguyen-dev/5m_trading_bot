@@ -1334,21 +1334,34 @@ export class PriceMonitoringWorker {
     // closed streak has ENDED at the current bar — don't add the +1.
     const effectiveStreak = absStreak + (currentAligns ? 1 : 0);
 
-    // Compute live body3 first — used by BOTH the body3 gate (Gate 2b) and
-    // the edge-case matcher. Includes the in-progress bar, so reflects fresh
-    // momentum at decision time. Falls back to t4.body3Sum on fetch error.
+    // Compute body3 — used by BOTH the body3 gate (Gate 2b) and edge-case
+    // matcher. Goal: measure how exhausted the STREAK is, i.e. sum of |body|
+    // over 3 streak-aligned bars at decision time.
+    //
+    // Two cases based on current bar's direction:
+    //   • currentAligns  → live fetch (bar N-2 + N-1 closed + current in-prog)
+    //                       All 3 align with streak by construction.
+    //   • !currentAligns → fall back to t4.body3Sum (3 closed bars from
+    //                       BEFORE windowStart — all in-streak). Adding the
+    //                       opposing current's |body| would inflate body3
+    //                       and false-positive trigger the gate (verified
+    //                       prod 2026-05-18 03:14:57 BTC: streak=3 UP +
+    //                       current DOWN -118 made body3=$273 ≥ $250 armed
+    //                       threshold; correct calc = $232 < $250 → skip).
     const armedMode = adapt.mode === 'aggressive';
     let body3Sum    = t4.body3Sum ?? 0;
-    let body3Src: 'live' | 't4_fallback' = 't4_fallback';
-    const liveBars = await fetchBars(
-      state.symbol,
-      t4.windowStart - 2 * WINDOW_MS,
-      Date.now(),
-      3,
-    );
-    if (liveBars.length >= 2) {
-      body3Sum = liveBars.reduce((s, b) => s + Math.abs(b.close - b.open), 0);
-      body3Src = 'live';
+    let body3Src: 'live' | 't4_closed' = 't4_closed';
+    if (currentAligns) {
+      const liveBars = await fetchBars(
+        state.symbol,
+        t4.windowStart - 2 * WINDOW_MS,
+        Date.now(),
+        3,
+      );
+      if (liveBars.length >= 2) {
+        body3Sum = liveBars.reduce((s, b) => s + Math.abs(b.close - b.open), 0);
+        body3Src = 'live';
+      }
     }
 
     // Gate 2: effective streak ≥ threshold, OR a configured edge case matches.
@@ -1392,7 +1405,7 @@ export class PriceMonitoringWorker {
       if (body3Min > 0 && body3Sum < body3Min) {
         return {
           placed: false,
-          reason: `body3 $${body3Sum.toFixed(0)} (${body3Src}) < ${armedMode ? 'armed' : 'idle'}_body3_min $${body3Min}`,
+          reason: `body3 $${body3Sum.toFixed(0)} (${body3Src}, currentAligns=${currentAligns}) < ${armedMode ? 'armed' : 'idle'}_body3_min $${body3Min}`,
           adaptive,
         };
       }
