@@ -83,6 +83,7 @@ export default function AnalyzePage() {
           <StreakLengthTable data={data} />
           <HighVolCard data={data} />
           <StreakGapCard data={data} />
+          <ClusterGapCard data={data} />
           <PostExtremeTable data={data} />
           <DayOfWeekHotnessCard data={data} />
           <HourlyHotnessRow data={data} />
@@ -273,6 +274,118 @@ function StreakGapCard({ data }: { data: StreakStatsResponse }) {
             ))}
           </tbody>
         </table>
+      )}
+    </div>
+  );
+}
+
+function ClusterGapCard({ data }: { data: StreakStatsResponse }) {
+  const { byCluster, recentBySize } = data.clusterGaps;
+  // Track which (size, windowMin) bucket is currently selected for "recent events"
+  const defaultKey = byCluster.length > 0 ? `${byCluster[0]!.clusterSize}_${byCluster[0]!.windowMin}` : '';
+  const [selKey, setSelKey] = useState(defaultKey);
+  const recentEvents = (recentBySize[selKey] ?? []) as StreakStatsResponse['clusterGaps']['recentBySize'][string];
+
+  return (
+    <div style={{ ...S.card, marginTop: 16 }}>
+      <div style={S.cardTitle}>Cluster gap — khi 2/3 streak ≥5 dồn dập trong window ngắn</div>
+      <div style={{ ...S.dim, marginBottom: 10 }}>
+        "Cluster event" = N streak-end (length ≥ 5) xảy ra trong W phút.
+        Đo gap giữa các lần cluster event lặp lại. Dùng để biết{' '}
+        <i>regime "butterfly / vol-cluster" có chu kỳ lặp lại bao lâu</i>.
+      </div>
+
+      <table style={S.table}>
+        <thead>
+          <tr>
+            <th style={{ ...S.th, textAlign: 'right' }}>Cluster size N</th>
+            <th style={{ ...S.th, textAlign: 'right' }}>Window W</th>
+            <th style={{ ...S.th, textAlign: 'right' }}>Số cluster events</th>
+            <th style={{ ...S.th, textAlign: 'right' }} title="Mean gap giữa 2 cluster events liên tiếp">
+              Mean gap
+            </th>
+            <th style={{ ...S.th, textAlign: 'right' }}>Median</th>
+            <th style={{ ...S.th, textAlign: 'right' }}>p10</th>
+            <th style={{ ...S.th, textAlign: 'right' }}>p90</th>
+            <th style={{ ...S.th, textAlign: 'right' }}>Max</th>
+          </tr>
+        </thead>
+        <tbody>
+          {byCluster.map(b => {
+            const key = `${b.clusterSize}_${b.windowMin}`;
+            return (
+              <tr key={key}
+                  onClick={() => setSelKey(key)}
+                  style={{ cursor: 'pointer',
+                           background: selKey === key ? 'rgba(31,111,235,0.1)' : 'transparent' }}>
+                <td style={{ ...S.td, textAlign: 'right', fontWeight: 600,
+                              color: selKey === key ? '#58a6ff' : '#f0a500' }}>
+                  {b.clusterSize}
+                </td>
+                <td style={{ ...S.td, textAlign: 'right' }}>{b.windowMin}m</td>
+                <td style={{ ...S.td, textAlign: 'right' }}>{b.occurrences}</td>
+                <td style={{ ...S.td, textAlign: 'right' }}>{fmtMins(b.meanGapMin)}</td>
+                <td style={{ ...S.td, textAlign: 'right', fontWeight: 600 }}>
+                  {fmtMins(b.medianGapMin)}
+                </td>
+                <td style={{ ...S.td, textAlign: 'right', color: '#8b949e' }}>
+                  {fmtMins(b.p10GapMin)}
+                </td>
+                <td style={{ ...S.td, textAlign: 'right', color: '#8b949e' }}>
+                  {fmtMins(b.p90GapMin)}
+                </td>
+                <td style={{ ...S.td, textAlign: 'right', color: '#6e7681' }}>
+                  {fmtMins(b.maxGapMin)}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <div style={{ ...S.dim, fontSize: 11, marginTop: 4 }}>
+        Click row để xem recent events của combo đó.
+      </div>
+
+      {recentEvents.length > 0 && (
+        <>
+          <div style={{ ...S.cardTitle, marginTop: 18 }}>
+            Recent cluster events ({selKey.replace('_', ' streaks ≥5 in ')}m window)
+          </div>
+          <table style={S.table}>
+            <thead>
+              <tr>
+                <th style={S.th}>Triggered at (UTC)</th>
+                <th style={{ ...S.th, textAlign: 'right' }}>Constituents</th>
+                <th style={{ ...S.th, textAlign: 'right' }}>Cluster span</th>
+                <th style={{ ...S.th, textAlign: 'right' }}>Gap before</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recentEvents.map(e => {
+                const span = e.contributingEndsAt.length > 1
+                  ? (e.contributingEndsAt[e.contributingEndsAt.length - 1]! - e.contributingEndsAt[0]!) / 60_000
+                  : 0;
+                return (
+                  <tr key={e.triggeredAt}>
+                    <td style={{ ...S.td, color: '#c9d1d9', fontFamily: 'monospace', fontSize: 12 }}>
+                      {new Date(e.triggeredAt).toISOString().slice(0, 16).replace('T', ' ')}
+                    </td>
+                    <td style={{ ...S.td, textAlign: 'right', color: '#8b949e', fontSize: 11 }}>
+                      {e.contributingEndsAt.length} events
+                    </td>
+                    <td style={{ ...S.td, textAlign: 'right', color: '#8b949e' }}>
+                      {fmtMins(span)}
+                    </td>
+                    <td style={{ ...S.td, textAlign: 'right', fontWeight: 600,
+                                  color: e.gapBeforeMin == null ? '#6e7681' : '#f0a500' }}>
+                      {e.gapBeforeMin == null ? '—' : fmtMins(e.gapBeforeMin)}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </>
       )}
     </div>
   );

@@ -491,6 +491,25 @@ export interface StreakGapEvent {
   gapBeforeMin: number | null;
 }
 
+/** Cluster of N streak-end events of |length| ≥ extLen within `windowMin`. */
+export interface ClusterGapBucket {
+  clusterSize:     number;
+  windowMin:       number;
+  extLen:          number;
+  occurrences:     number;
+  meanGapMin:      number;
+  medianGapMin:    number;
+  p10GapMin:       number;
+  p90GapMin:       number;
+  maxGapMin:       number;
+}
+
+export interface ClusterGapEvent {
+  triggeredAt:        number;
+  contributingEndsAt: number[];
+  gapBeforeMin:       number | null;
+}
+
 export interface StreakStatsResponse {
   coin:          string;
   rangeStartMs:  number;
@@ -518,6 +537,10 @@ export interface StreakStatsResponse {
   streakGaps: {
     byThreshold:  StreakGapBucket[];
     recentEvents: StreakGapEvent[];
+  };
+  clusterGaps: {
+    byCluster:    ClusterGapBucket[];
+    recentBySize: Record<string, ClusterGapEvent[]>;
   };
   suggested: {
     auto_order_min_streak: number;

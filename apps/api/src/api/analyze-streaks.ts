@@ -169,6 +169,36 @@ interface StreakGapBucket {
   maxGapMin:       number;
 }
 
+/**
+ * Cluster event = N streak-end events of |length| ≥ extLen that occurred
+ * within a `windowMin` window. Tracks gap between consecutive cluster
+ * events so user can see how often "butterfly / vol-cluster" patterns
+ * repeat in the analyzed period.
+ *
+ * Example: clusterSize=2, windowMin=120, extLen=5 → "find each moment when
+ * the 2nd streak ≥5 in any rolling 2h window appeared".
+ */
+interface ClusterGapBucket {
+  clusterSize:     number;     // N (e.g., 2 or 3)
+  windowMin:       number;     // W in minutes (lookback for cluster detection)
+  extLen:          number;     // ≥5 typically
+  occurrences:     number;     // number of cluster events found
+  meanGapMin:      number;     // gap between consecutive cluster events
+  medianGapMin:    number;
+  p10GapMin:       number;
+  p90GapMin:       number;
+  maxGapMin:       number;
+}
+
+interface ClusterGapEvent {
+  /** Unix ms of the FINAL streak-end that completed this cluster event. */
+  triggeredAt: number;
+  /** Indices/timestamps of the constituent streak-end events (oldest → newest). */
+  contributingEndsAt: number[];
+  /** Minutes from previous cluster event's trigger. null = first in range. */
+  gapBeforeMin: number | null;
+}
+
 interface StreakGapEvent {
   endedAt:      number;          // unix ms — run ended (= "đảo chiều")
   signed:       number;          // signed length (+UP, -DOWN)
@@ -207,6 +237,13 @@ interface StreakStatsResponse {
     byThreshold:  StreakGapBucket[];
     /** Most recent ≤ 20 events with |length| ≥ 5 (lowest threshold), newest first. */
     recentEvents: StreakGapEvent[];
+  };
+  clusterGaps: {
+    /** Per (clusterSize, windowMin) combo — stats on gap between cluster events. */
+    byCluster: ClusterGapBucket[];
+    /** Most recent ≤ 15 cluster events for visualisation. Keyed by clusterSize.
+     *  Front-end picks which list to show. */
+    recentBySize: Record<string, ClusterGapEvent[]>;
   };
   suggested:        SuggestedConfig;
 }
@@ -442,6 +479,59 @@ export async function getStreakStats(req: Request, res: Response): Promise<void>
       };
     }).reverse();   // newest first for UI
 
+    // Cluster gap analysis: for each (size, window) combo, find moments when
+    // N ext-streak-ends fell within a rolling window of W minutes, then
+    // measure time between such moments.
+    const CLUSTER_CONFIGS: Array<{ size: number; windowMin: number; extLen: number }> = [
+      { size: 2, windowMin: 60,  extLen: 5 },
+      { size: 2, windowMin: 120, extLen: 5 },
+      { size: 3, windowMin: 120, extLen: 5 },
+      { size: 3, windowMin: 240, extLen: 5 },
+    ];
+    const byCluster: ClusterGapBucket[] = [];
+    const recentBySize: Record<string, ClusterGapEvent[]> = {};
+    for (const cfg of CLUSTER_CONFIGS) {
+      const extEvents = sortedRuns.filter(r => Math.abs(r.signed) >= cfg.extLen);
+      const windowMs = cfg.windowMin * 60_000;
+      // Walk through events, mark a "cluster event" at the index where
+      // the previous (size-1) events all fall within [now - windowMs, now].
+      const clusterEvents: ClusterGapEvent[] = [];
+      for (let i = cfg.size - 1; i < extEvents.length; i++) {
+        const cur = extEvents[i]!;
+        const start = i - cfg.size + 1;
+        const oldest = extEvents[start]!;
+        if (cur.endedAt - oldest.endedAt > windowMs) continue;
+        // Avoid duplicate counting: don't fire 2 consecutive cluster events
+        // on the same overlapping window. Require the previous cluster
+        // event's trigger to be older than the OLDEST event in this cluster.
+        const last = clusterEvents[clusterEvents.length - 1];
+        if (last && last.triggeredAt >= oldest.endedAt) continue;
+        const contributingEndsAt = extEvents.slice(start, i + 1).map(e => e.endedAt);
+        const gapBeforeMin = last ? (cur.endedAt - last.triggeredAt) / 60_000 : null;
+        clusterEvents.push({
+          triggeredAt: cur.endedAt,
+          contributingEndsAt,
+          gapBeforeMin,
+        });
+      }
+      // Gaps for the bucket stats.
+      const gaps = clusterEvents.map(e => e.gapBeforeMin).filter((g): g is number => g != null);
+      byCluster.push({
+        clusterSize:  cfg.size,
+        windowMin:    cfg.windowMin,
+        extLen:       cfg.extLen,
+        occurrences:  clusterEvents.length,
+        meanGapMin:   gaps.length > 0 ? gaps.reduce((a, b) => a + b, 0) / gaps.length : 0,
+        medianGapMin: gaps.length > 0 ? pctl(gaps, 0.50) : 0,
+        p10GapMin:    gaps.length > 0 ? pctl(gaps, 0.10) : 0,
+        p90GapMin:    gaps.length > 0 ? pctl(gaps, 0.90) : 0,
+        maxGapMin:    gaps.length > 0 ? Math.max(...gaps) : 0,
+      });
+      // Keep only the last 15 events newest-first for display.
+      const key = `${cfg.size}_${cfg.windowMin}`;
+      recentBySize[key] = clusterEvents.slice(-15).reverse();
+    }
+
     const suggested = suggestConfig(streakLengths, bars.length);
 
     const body: StreakStatsResponse = {
@@ -456,6 +546,7 @@ export async function getStreakStats(req: Request, res: Response): Promise<void>
       hourlyHotness,
       dayOfWeekHotness,
       streakGaps:       { byThreshold, recentEvents },
+      clusterGaps:      { byCluster, recentBySize },
       suggested,
     };
     res.json(body);
