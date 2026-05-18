@@ -1530,6 +1530,24 @@ export class PriceMonitoringWorker {
     const absStreak = Math.abs(streak);
     const direction = state.cycleDirection;
 
+    // Direction-continuity check: DCA only makes sense when the streak that
+    // we're fading is STILL going in its original direction per Binance bars.
+    // Cycle direction = our (contrarian) bet, so original streak direction =
+    // OPPOSITE of cycle direction. After the just-closed loss extended the
+    // streak by 1, Binance bars should still show that same direction.
+    //
+    // If Binance disagrees (tiny-move mismatch with Poly resolution), the
+    // body3 sum mixes opposing bars → inflated, false-positive DCA. Skip
+    // here to mirror the boundary fix (don't DCA on streak-broken setups).
+    const streakDir = streak > 0 ? 'up' : streak < 0 ? 'down' : null;
+    const expectedStreakDir = direction === 'up' ? 'down' : 'up';   // contrarian
+    if (streakDir !== expectedStreakDir) {
+      log('info', `DCA skip ${state.symbol}: streak direction mismatch — Binance shows ${streakDir ?? 'doji'}, expected ${expectedStreakDir} (Poly/Binance disagreement at tiny-move bar)`, {
+        nextWindowStart, cycleDirection: direction, binanceStreak: streak,
+      });
+      return;
+    }
+
     // Body-3 DCA gate: averaging down only when the trend's 3-bar body sum
     // still signals exhaustion. After a loss the streak has just extended
     // by 1; we recompute body3 on the new bar set.
