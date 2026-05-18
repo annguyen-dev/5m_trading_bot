@@ -648,32 +648,12 @@ export class PriceMonitoringWorker {
     const book = await state.poly.getOrderBook(tokenId);
     const price = bestAskFromBook(book);
 
-    // Alignment gate — current candle continues the streak direction.
-    //
-    // For STREAK strategy: keep the legacy hard reject (premise breaking).
-    //
-    // For ECHO strategy: only reject when current FLIPS. A current bar
-    // moving in the OPPOSITE direction is actually the ideal fade setup —
-    // it means the reversal is already starting mid-window, which is
-    // exactly what we're betting on for N+1. Body3 (live, including the
-    // in-progress bar) is the quality filter that decides whether the
-    // reversal magnitude is meaningful enough to bet on.
-    //
-    // The doji case (currentIcon=⚪) keeps the reject for both — neutral
-    // candle gives no signal either way and breaks contrarian premise.
-    if (cfg.strategy !== 'echo') {
-      if (currentIcon !== expectedIcon) {
-        return {
-          reason: `current ${currentIcon} ≠ expected ${expectedIcon}`,
-          persistentSkip: false,
-        };
-      }
-    } else if (currentIcon === '⚪') {
-      return {
-        reason: `current ${currentIcon} (doji) — no signal`,
-        persistentSkip: false,
-      };
-    }
+    // NOTE: T+4 is a PREVIEW signal (notification/UI), NOT a placement gate.
+    // Current bar direction is intentionally NOT checked here — at T+4
+    // the in-progress bar barely exists. Direction + body3 decisions are
+    // made fresh at T-3s (tryPlaceBoundary) and T+0 (Path E retry) where
+    // the data is mature. T+4 always emits when streak ≥ streak_min so
+    // user gets the notification + downstream phases have data to work with.
 
     return {
       event: {
@@ -1299,22 +1279,17 @@ export class PriceMonitoringWorker {
 
     // Gate 1: alignment of current in-progress bar.
     //
-    // STREAK strategy: hard reject if current ≠ streak direction (legacy).
-    // ECHO   strategy: only reject on doji (⚪). Current going OPPOSITE to
-    //                  streak is the ideal fade setup (reversal mid-window)
-    //                  — body3 below decides whether magnitude qualifies.
+    // Both strategies (streak + echo): only reject on doji (⚪). Current
+    // going OPPOSITE to streak is the IDEAL fade setup — reversal is
+    // starting mid-window, which is exactly what we're betting on for
+    // window N+1. Streak strategy used to hard-reject opposite (legacy)
+    // but that contradicted the user's intent: "T+4 = preview, T-3s/T+0
+    // = decision, ko gate ở T+4 chặn quyết định". Body3 / threshold do
+    // their own filtering below.
     const currentIcon = await fetchInProgressIcon(state.symbol, t4.windowStart);
     const expectedIcon = t4.streak > 0 ? '🟢' : '🔴';
     const currentAligns = currentIcon === expectedIcon;
-    if (cfg.strategy !== 'echo') {
-      if (!currentAligns) {
-        return {
-          placed: false,
-          reason: `current flipped to ${currentIcon} (streak ${expectedIcon})`,
-          adaptive,
-        };
-      }
-    } else if (currentIcon === '⚪') {
+    if (currentIcon === '⚪') {
       return {
         placed: false,
         reason: `current ${currentIcon} (doji) — no signal`,
@@ -1400,7 +1375,12 @@ export class PriceMonitoringWorker {
     // gated entry; applying the global gate too would double-filter and
     // potentially reject premium short-streak setups that intentionally
     // bypass the normal threshold.
-    if (!matchedEdgeCase) {
+    // Body3 gate is ECHO-only — streak strategy uses pure streak-count
+    // gating (auto_order_min_streak + auto_schedule). Body3 fields exist
+    // in CoinConfig (shared shape) but are conceptual to echo's quality
+    // filter; applying them to streak strategy would over-restrict the
+    // legacy contrarian setup.
+    if (cfg.strategy === 'echo' && !matchedEdgeCase) {
       const body3Min = armedMode ? cfg.armed_body3_min : cfg.idle_body3_min;
       if (body3Min > 0 && body3Sum < body3Min) {
         return {
