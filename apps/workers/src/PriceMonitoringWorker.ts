@@ -1489,15 +1489,17 @@ export class PriceMonitoringWorker {
     state: CoinState, cfg: CoinConfig,
     justClosedWindowStart: number,
     /**
-     * The just-closed window's verified outcome (per Polymarket midpoint at T-0).
-     * Required so the streak-direction sanity gate below trusts livePolyOutcome
-     * instead of falling back to Binance close-vs-open via fetchStreakWithVolume,
-     * which can disagree when the Binance candle direction differs from the
-     * Polymarket resolution AND poly_clob_markets cache hasn't been synced yet
-     * (typical window-just-closed scenario; live `/prices-history` returns
-     * 'unknown' for ~30-60s after T-0). Without this, DCA was incorrectly
-     * skipped on losses where Binance happened to call the candle the other
-     * way — verified in prod 2026-05-05 08:04:58 BTC, $5 loss with no DCA.
+     * Chart-truth direction of the just-closed bar, as verified by phaseT0.
+     * Priority: Binance close-vs-open first; Poly outcome as fallback when
+     * Binance is doji/no-data. This is "did the streak continue or not".
+     *
+     * Mismatch cases (Binance dir != Poly outcome) are filtered OUT by
+     * phaseT0 BEFORE calling here — caller resets cycle instead. So when
+     * we get here, the chart-truth has been arbitrated already.
+     *
+     * Used by the streak-direction sanity gate below as a cross-check
+     * against `fetchStreakWithVolume` (which is also Poly-first post-Change
+     * #1, so they should agree — gate is defensive).
      */
     justClosedOutcome: 'up' | 'down',
   ): Promise<void> {
@@ -1511,19 +1513,21 @@ export class PriceMonitoringWorker {
     const direction = state.cycleDirection;
 
     // Direction-continuity check: DCA only makes sense when the streak that
-    // we're fading is STILL going in its original direction per Binance bars.
-    // Cycle direction = our (contrarian) bet, so original streak direction =
-    // OPPOSITE of cycle direction. After the just-closed loss extended the
-    // streak by 1, Binance bars should still show that same direction.
+    // we're fading is STILL going in its original direction. Cycle direction
+    // = our (contrarian) bet, so original streak direction = OPPOSITE of
+    // cycle direction. After the just-closed loss extended the streak by 1,
+    // the streak should still show that same direction.
     //
-    // If Binance disagrees (tiny-move mismatch with Poly resolution), the
-    // body3 sum mixes opposing bars → inflated, false-positive DCA. Skip
-    // here to mirror the boundary fix (don't DCA on streak-broken setups).
+    // Post-Change-#1 fetchStreakWithVolume reads Poly outcomes per bar
+    // (Binance fallback when Poly NULL), so `streak` is chart-truth here.
+    // Mismatches between Binance and Poly are filtered out by phaseT0
+    // BEFORE reaching this function, so this gate is a defensive belt-and-
+    // suspenders check.
     const streakDir = streak > 0 ? 'up' : streak < 0 ? 'down' : null;
     const expectedStreakDir = direction === 'up' ? 'down' : 'up';   // contrarian
     if (streakDir !== expectedStreakDir) {
-      log('info', `DCA skip ${state.symbol}: streak direction mismatch — Binance shows ${streakDir ?? 'doji'}, expected ${expectedStreakDir} (Poly/Binance disagreement at tiny-move bar)`, {
-        nextWindowStart, cycleDirection: direction, binanceStreak: streak,
+      log('info', `DCA skip ${state.symbol}: streak direction mismatch — got ${streakDir ?? 'doji'}, expected ${expectedStreakDir}`, {
+        nextWindowStart, cycleDirection: direction, polyStreak: streak,
       });
       return;
     }
@@ -1603,19 +1607,13 @@ export class PriceMonitoringWorker {
       }
     }
 
-    // Sanity: the just-closed window's outcome must still oppose our
-    // (contrarian) bet. We're in the loss branch, so by construction
-    // justClosedOutcome !== direction — but we keep this gate as a runtime
-    // assertion in case the caller's branching ever changes.
-    //
-    // Why use `justClosedOutcome` (T-0 verified) instead of `streak > 0`:
-    // fetchStreakWithVolume's verify step can return the wrong direction
-    // for the just-closed window when Binance close-vs-open disagrees with
-    // Polymarket resolution AND the Poly cache hasn't synced yet (live API
-    // returns 'unknown' for ~30-60s after T-0). Trusting the T-0 midpoint
-    // we already computed avoids that race entirely.
+    // Sanity: the just-closed bar's chart-truth direction must still oppose
+    // our (contrarian) bet — i.e., streak continued from chart's view. The
+    // phaseT0 caller is the sole arbiter: it routes chart-broke cases to
+    // reset (no DCA call), chart-continued cases here. So by construction
+    // justClosedOutcome !== direction. Defensive runtime assertion only.
     if (justClosedOutcome === direction) {
-      log('warn', `DCA skip ${state.symbol}: just-closed outcome matches our bet (caller bug — should be loss branch only)`, {
+      log('warn', `DCA skip ${state.symbol}: just-closed dir matches our bet (caller bug — phaseT0 should have routed to reset)`, {
         nextWindowStart, justClosedOutcome, cycleDirection: direction, streak,
       });
       return;
@@ -1805,11 +1803,50 @@ export class PriceMonitoringWorker {
     //    in particular: if we SKIPPED placement at last T-3s due to whitelist,
     //    there is no incoming but the cycle should still progress based on the
     //    underlying outcome).
-    if (state.cycleActive && state.cycleDirection != null && outcome !== 'unknown') {
-      if (outcome === state.cycleDirection) {
-        log('info', `cycle reset (strategy win, no-incoming-aware) ${state.symbol}`, {
+    //
+    // Decision tree (user spec 2026-05-19):
+    //   1. Mismatch (Binance candle dir != Poly outcome, both known)
+    //        → "insignificant change" — skip DCA, reset cycle (safe).
+    //   2. Chart breaks streak (just-closed bar dir == our bet dir)
+    //        → genuine streak break — reset cycle, no DCA.
+    //   3. Chart continues streak (just-closed bar dir == streak dir = OPPOSITE our bet)
+    //        → campaign continues — fire DCA if body3 / whitelist gates pass.
+    //   4. Doji or no-data on Binance → fall back to Poly outcome:
+    //        win-side  → reset cycle
+    //        loss-side → fire DCA
+    //
+    // This unifies TP-fill, SL-fired, and Poly-resolved paths under a
+    // single chart-truth decision: the Binance candle direction is what
+    // drives DCA, NOT the monetary outcome. So:
+    //   • TP win + candle continues   → DCA (we got lucky on TP but trend continues)
+    //   • TP win + candle reverses    → reset (genuine win)
+    //   • SL fire + candle continues  → DCA (whipsaw didn't break trend)
+    //   • SL fire + candle reverses   → reset (real reversal cut us)
+    //   • Poly win + candle continues → DCA (phantom-win — was bug pre-fix)
+    //   • Poly loss + candle reverses → reset (mismatch — was bad-DCA pre-fix)
+    //
+    // Verified prod 2026-05-19 ~05:45 UTC BTC bug: cycle 12:40-12:45 won
+    // via Poly mid<0.5, but Binance bar continued UP streak → bot opened
+    // fresh BND at 12:45 (cycleActive=false) and re-faded the still-going
+    // streak → lost. With this fix: phantom-win triggers DCA instead.
+    if (state.cycleActive && state.cycleDirection != null) {
+      // Fetch just-closed Binance bar. phaseT0 runs in last 5s of the
+      // window — bar's open/high/low are final, close is ≈final (5s of
+      // trading left can only move it marginally). Accept that residual.
+      const closedBars = await fetchBars(state.symbol, windowStart, windowEnd - 1, 1);
+      const closedBar  = closedBars[closedBars.length - 1];
+      const binanceDir: 'up' | 'down' | null = closedBar
+        ? (closedBar.close > closedBar.open ? 'up'
+           : closedBar.close < closedBar.open ? 'down' : null)
+        : null;
+
+      // Mismatch detection. Both sources must be known and disagree.
+      const mismatch = binanceDir != null && outcome !== 'unknown' && binanceDir !== outcome;
+
+      if (mismatch) {
+        log('warn', `cycle reset on mismatch (Binance=${binanceDir}, Poly=${outcome}) — skip DCA, treat as insignificant ${state.symbol}`, {
+          windowStart, cycleDirection: state.cycleDirection,
           previouslyFiredCount: state.dcaFiredCount,
-          previouslyLastSize:   state.lastCycleOrderSize,
         });
         state.cycleActive        = false;
         delete state.cycleDirection;
@@ -1818,13 +1855,41 @@ export class PriceMonitoringWorker {
         state.cycleMode          = null;
         state.cycleEdgeCaseId    = null;
       } else {
-        // Loss → cycle continues. Fire DCA for the next window NOW that we
-        // know the loss is real and the streak length includes it. Whitelist
-        // gate (e.g. [4]) is checked inside; silent skip on miss.
-        // Pass the verified T-0 outcome so DCA's streak-direction gate uses
-        // Polymarket truth instead of Binance close-vs-open (which can
-        // disagree, causing wrongful DCA skips — see fn comment).
-        await this.tryPlaceDcaAtBoundary(state, cfg, windowStart, outcome);
+        // No mismatch: use whichever direction is available as chart truth.
+        // Prefer Binance (since the question is "did the chart confirm the
+        // candle continued the streak?"); if Binance is doji/null, fall
+        // back to Poly outcome.
+        const effectiveDir: 'up' | 'down' | 'unknown' =
+          binanceDir ?? (outcome === 'unknown' ? 'unknown' : outcome);
+
+        if (effectiveDir === 'unknown') {
+          // Both unknown — hold cycle as-is, decide next window.
+          log('info', `cycle hold (no chart/Poly signal) ${state.symbol}`, {
+            windowStart,
+          });
+        } else if (effectiveDir === state.cycleDirection) {
+          // Chart broke streak (bar matched our contrarian bet). Genuine win.
+          log('info', `cycle reset (chart break: binance=${binanceDir ?? 'doji'} poly=${outcome}) ${state.symbol}`, {
+            previouslyFiredCount: state.dcaFiredCount,
+            previouslyLastSize:   state.lastCycleOrderSize,
+          });
+          state.cycleActive        = false;
+          delete state.cycleDirection;
+          state.lastCycleOrderSize = null;
+          state.dcaFiredCount      = 0;
+          state.cycleMode          = null;
+          state.cycleEdgeCaseId    = null;
+        } else {
+          // Chart continued streak. Fire DCA if conditions pass. The
+          // function's internal gates (body3, whitelist, direction
+          // continuity) will silent-skip if not appropriate.
+          //
+          // For phantom-win callers (Poly outcome === cycleDirection but
+          // Binance bar continued), we pass `effectiveDir` as the verified
+          // outcome — which IS opposite cycleDirection by construction
+          // here, so DCA's outcome===direction sanity gate is satisfied.
+          await this.tryPlaceDcaAtBoundary(state, cfg, windowStart, effectiveDir);
+        }
       }
     }
 
@@ -2306,27 +2371,59 @@ async function fetchStreakWithVolume(
     });
   }
 
-  // ── Streak from Binance close-vs-open (chart-visual semantic) ──────────
-  // Bot detects arm windows / streaks based on what user sees on the chart.
-  // Polymarket's binary resolution is used SEPARATELY for outcome at T-0
-  // (livePolyOutcome / Bug 1 fix path) — that's about payout truth, not
-  // chart pattern.
+  // ── Streak from Poly outcomes (chart-truth at runtime) ─────────────────
+  // Bot bets on Polymarket's binary resolution, so the streak that matters
+  // is the one Poly resolved bar-by-bar — not what Binance close-vs-open
+  // suggests. When the two disagree on a tiny-move bar, Poly is the
+  // ground truth for our P&L.
   //
-  // Earlier design (commit 1769269) used Poly per-bar to override Binance,
-  // which produced "missing arms" when Poly disagreed on tiny-move bars
-  // (verified prod 2026-05-10 13:30 UTC: 6-bar UP streak on chart, Poly
-  // disagreed on bar 13:10 +0.014%, bot saw effective streak=3 → no arm
-  // even though chart visual was clearly 6 UP). User expectation: arm
-  // tracks chart visual.
+  // History (see CLAUDE.md gotchas):
+  //   • Pre-1769269 — Binance for streak. Bug: phantom-streak fires after
+  //     Poly already broke the streak (prod 2026-05-19 ~05:45 UTC BTC:
+  //     bar 12:40-12:45 Binance UP, Poly DOWN → next window BND DOWN bet
+  //     against streak already gone).
+  //   • 1769269       — Poly per-bar with Binance fallback. Bug: "missing
+  //     arms" because tiny mismatches truncated chart-visible streaks
+  //     (prod 2026-05-10 13:30: 6-bar UP per chart, Poly disagreed at
+  //     13:10 +0.014% → bot saw streak=3, never armed).
+  //   • b6ff6c2       — Reverted to Binance, mismatch info-only.
+  //   • 2026-05-19    — Re-adopt Poly-per-bar with refined mismatch logic:
+  //                     Poly drives streak; T-0 closure now skips DCA on
+  //                     mismatch (= insignificant change) — addresses the
+  //                     missing-arms concern by NOT acting on mismatches.
   //
-  // Mismatch detection still queries Poly cache to alert user when the
-  // bot's chart-based streak diverges from Poly's binary resolution —
-  // informational so user knows their bet might resolve differently.
+  // Falls back to Binance close-vs-open when Poly outcome is NULL — the
+  // common case for the most-recent bar before the background sweep /
+  // T-0 inline write has populated poly_clob_markets.outcome.
   const binanceOutcomes: ('up' | 'down' | 'doji')[] = bars.map(b =>
     b.close > b.open ? 'up' : b.close < b.open ? 'down' : 'doji',
   );
 
-  const newest = binanceOutcomes[binanceOutcomes.length - 1];
+  const allWindowStarts: number[] = bars.map((_, i) => startTime + i * WINDOW_MS);
+  const { rows: cachedOutcomes } = allWindowStarts.length > 0
+    ? await getPool().query<{ window_start: string; outcome: string | null }>(
+        `SELECT window_start, outcome FROM poly_clob_markets
+          WHERE symbol = $1 AND window_start = ANY($2::bigint[])`,
+        [symbol, allWindowStarts],
+      )
+    : { rows: [] as Array<{ window_start: string; outcome: string | null }> };
+  const polyMap = new Map<number, 'up' | 'down'>();
+  for (const r of cachedOutcomes) {
+    if (r.outcome === 'up' || r.outcome === 'down') {
+      polyMap.set(Number(r.window_start), r.outcome);
+    }
+  }
+
+  // Effective per-bar outcome: Poly first, Binance fallback (doji bars
+  // count as doji regardless — Poly NULL on a Binance doji means we
+  // genuinely don't know the direction).
+  const outcomes: ('up' | 'down' | 'doji')[] = bars.map((_, i) => {
+    const poly = polyMap.get(allWindowStarts[i]!);
+    if (poly) return poly;
+    return binanceOutcomes[i]!;
+  });
+
+  const newest = outcomes[outcomes.length - 1];
   if (!newest || newest === 'doji') {
     return {
       streak: 0, volumeBuckets: [], bodyHasHigh: false, bodyHasTiny: false,
@@ -2336,34 +2433,28 @@ async function fetchStreakWithVolume(
   }
 
   let n = 0;
-  for (let i = binanceOutcomes.length - 1; i >= 0; i--) {
-    if (binanceOutcomes[i] !== newest) break;   // doji breaks
+  for (let i = outcomes.length - 1; i >= 0; i--) {
+    if (outcomes[i] !== newest) break;   // doji or opposite breaks
     n++;
   }
   const streak = newest === 'up' ? n : -n;
-  const binanceStreak = streak;   // synonymous post-revert; kept in event payload
 
-  // ── Mismatch detection (info-only, doesn't affect streak) ──────────────
-  // Query Poly cache for bars in the visible streak window; flag bars where
-  // Poly direction disagrees with Binance. PMW publishes 'streak_data_mismatch'
-  // events for each (deduped) so user gets Telegram alert when their
-  // chart-based bet might resolve against them at T-0.
-  const allWindowStarts: number[] = bars.map((_, i) => startTime + i * WINDOW_MS);
-  const visibleStart = bars.length - n;
-  const visibleWindowStarts = allWindowStarts.slice(visibleStart);
-  const { rows: cachedOutcomes } = visibleWindowStarts.length > 0
-    ? await getPool().query<{ window_start: string; outcome: string | null }>(
-        `SELECT window_start, outcome FROM poly_clob_markets
-          WHERE symbol = $1 AND window_start = ANY($2::bigint[])`,
-        [symbol, visibleWindowStarts],
-      )
-    : { rows: [] as Array<{ window_start: string; outcome: string | null }> };
-  const polyMap = new Map<number, 'up' | 'down'>();
-  for (const r of cachedOutcomes) {
-    if (r.outcome === 'up' || r.outcome === 'down') {
-      polyMap.set(Number(r.window_start), r.outcome);
+  // Binance-only streak — preserved for telemetry / mismatch context.
+  // Computed independently so the alert payload can show divergence.
+  const binanceNewest = binanceOutcomes[binanceOutcomes.length - 1];
+  let binanceStreak = 0;
+  if (binanceNewest && binanceNewest !== 'doji') {
+    let bn = 0;
+    for (let i = binanceOutcomes.length - 1; i >= 0; i--) {
+      if (binanceOutcomes[i] !== binanceNewest) break;
+      bn++;
     }
+    binanceStreak = binanceNewest === 'up' ? bn : -bn;
   }
+
+  // ── Mismatch detection (info-only — Poly drives streak, this is for
+  //    alerts so user knows when Binance chart diverges from Poly truth).
+  const visibleStart = bars.length - n;
   const mismatches: StreakResult['mismatches'] = [];
   for (let i = visibleStart; i < bars.length; i++) {
     const polyOut = polyMap.get(allWindowStarts[i]!);
