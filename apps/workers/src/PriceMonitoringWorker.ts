@@ -1279,13 +1279,26 @@ export class PriceMonitoringWorker {
 
     // Gate 1: alignment of current in-progress bar.
     //
-    // Both strategies (streak + echo): only reject on doji (⚪). Current
-    // going OPPOSITE to streak is the IDEAL fade setup — reversal is
-    // starting mid-window, which is exactly what we're betting on for
-    // window N+1. Streak strategy used to hard-reject opposite (legacy)
-    // but that contradicted the user's intent: "T+4 = preview, T-3s/T+0
-    // = decision, ko gate ở T+4 chặn quyết định". Body3 / threshold do
-    // their own filtering below.
+    // Reject when:
+    //   ⚪ doji            — no direction signal
+    //   OPPOSITE streak    — chart streak is BREAKING during this bar.
+    //                        Stored t4 (from earlier T+4 of this window) saw
+    //                        a streak that's now ending. Placing a fresh BND
+    //                        for N+1 using that stale direction = fading a
+    //                        streak that no longer exists. Wait for next
+    //                        window's clean T+4 signal.
+    //
+    // Verified prod 2026-05-19 17:39:57 UTC BTC: t4 from 17:39:01 said
+    // streak=-3 DOWN; current bar 17:35-17:40 going UP at T-3s (Poly mid
+    // > 0.5, bar about to close UP and reset streak). Bot placed UP fade
+    // for window 17:40 right before bar 17:35 finalized UP — window 17:40
+    // closed DOWN, BND lost, DCA also lost. Should have skipped placement
+    // entirely; T+4 of next window would have shown the new streak.
+    //
+    // Legacy comment ("current opposite = ideal fade setup") removed: the
+    // empirical evidence is the opposite — N+1's direction is independent
+    // from a streak-breaking N, and the OLD streak's contrarian direction
+    // doesn't transfer to a new regime.
     const currentIcon = await fetchInProgressIcon(state.symbol, t4.windowStart);
     const expectedIcon = t4.streak > 0 ? '🟢' : '🔴';
     const currentAligns = currentIcon === expectedIcon;
@@ -1293,6 +1306,13 @@ export class PriceMonitoringWorker {
       return {
         placed: false,
         reason: `current ${currentIcon} (doji) — no signal`,
+        adaptive,
+      };
+    }
+    if (!currentAligns) {
+      return {
+        placed: false,
+        reason: `current ${currentIcon} opposes streak (${expectedIcon}) — streak breaking, skip fresh BND`,
         adaptive,
       };
     }
