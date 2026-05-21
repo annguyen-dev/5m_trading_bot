@@ -330,6 +330,42 @@ export class PriceMonitoringWorker {
     return 'unknown';
   }
 
+  /**
+   * In-progress candle direction (🟢/🔴/⚪). Uses the LIVE Polymarket UP-token
+   * midpoint (shareBids) as the runtime direction truth — same source the bot
+   * resolves windows by (livePolyOutcome) and counts streaks by (post-Poly
+   * streak detection). Thresholds 0.45/0.55 match livePolyOutcome so "what
+   * direction is the market thinking" is consistent across T-3s (here) and
+   * T-0 (resolution).
+   *
+   * Falls back to Binance close-vs-open ONLY when Poly is unavailable:
+   *   - no market row / no token_up
+   *   - WS hasn't streamed a bid+ask for the UP token yet
+   *   - midpoint in the dead band [0.45, 0.55] (inconclusive — let the chart
+   *     break the tie rather than emit ⚪ and lose the signal)
+   */
+  private async fetchInProgressIcon(
+    symbol: CoinSymbol, windowStart: number, windowEnd: number,
+  ): Promise<string> {
+    const { rows } = await getPool().query<{ token_up: string }>(
+      `SELECT token_up FROM poly_clob_markets
+        WHERE symbol = $1 AND window_start = $2 AND window_end = $3
+        LIMIT 1`,
+      [symbol, windowStart, windowEnd],
+    );
+    const tokenUp = rows[0]?.token_up;
+    if (tokenUp) {
+      const cache = this.shareBids.get(tokenUp);
+      if (cache && cache.bestBid != null && cache.bestAsk != null) {
+        const mid = (cache.bestBid + cache.bestAsk) / 2;
+        if (mid > 0.55) return '🟢';
+        if (mid < 0.45) return '🔴';
+        // dead band → inconclusive Poly, fall through to Binance
+      }
+    }
+    return fetchInProgressIconBinance(symbol, windowStart);
+  }
+
   /** Register a handler called on every share_tick from any subscribed token.
    *  Returns an unsubscribe function. */
   public onShareTick(handler: (tick: ShareTick) => void): () => void {
@@ -570,8 +606,8 @@ export class PriceMonitoringWorker {
     // Fetch the in-progress candle direction up-front so the echo gate can
     // count it as +1 to the closed streak when it aligns. Streak strategy
     // also uses it (later gate) — single fetch keeps the round-trip cost
-    // unchanged.
-    const currentIcon = await fetchInProgressIcon(state.symbol, windowStart);
+    // unchanged. Poly midpoint (runtime truth) with Binance fallback.
+    const currentIcon = await this.fetchInProgressIcon(state.symbol, windowStart, windowEnd);
 
     // ── Echo arm bookkeeping ──────────────────────────────────────────────
     // Echo Hunt is a HYBRID: bot always trades using the streak baseline
@@ -1299,7 +1335,7 @@ export class PriceMonitoringWorker {
     // empirical evidence is the opposite — N+1's direction is independent
     // from a streak-breaking N, and the OLD streak's contrarian direction
     // doesn't transfer to a new regime.
-    const currentIcon = await fetchInProgressIcon(state.symbol, t4.windowStart);
+    const currentIcon = await this.fetchInProgressIcon(state.symbol, t4.windowStart, t4.windowEnd);
     const expectedIcon = t4.streak > 0 ? '🟢' : '🔴';
     const currentAligns = currentIcon === expectedIcon;
     if (currentIcon === '⚪') {
@@ -3079,7 +3115,9 @@ function iconsFromStreak(streak: number): string {
  *   - Pyth TradingView typically returns closed bars only → fallback to ⚪
  * Close > open → 🟢, close < open → 🔴, equal/no-data → ⚪.
  */
-async function fetchInProgressIcon(
+/** Binance close-vs-open of the current in-progress candle. Fallback source
+ *  for the in-progress icon when Poly midpoint is unavailable/inconclusive. */
+async function fetchInProgressIconBinance(
   symbol: CoinSymbol, windowStart: number,
 ): Promise<string> {
   const bars = await fetchBars(symbol, windowStart, Date.now(), 1);
