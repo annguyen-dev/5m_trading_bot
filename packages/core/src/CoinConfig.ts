@@ -49,9 +49,12 @@ export interface EchoEdgeCase {
   label?:       string;
   /** Off = ignored by matcher (kept for editing without losing values). */
   enabled:      boolean;
-  /** Inclusive min streak (closed-bars count) for this case to match. */
+  /** Inclusive min EFFECTIVE streak for this case to match. Effective streak
+   *  = closed streak + the aligning in-progress current bar at T-3s (the streak
+   *  actually being faded). Equals backtest streakLen[i]. NB: a "3 closed DOWN
+   *  + current DOWN" setup is effectiveStreak=4 → matches streakMin/Max=4. */
   streakMin:    number;
-  /** Inclusive max streak — typically 3-4 for short-streak overrides. */
+  /** Inclusive max effective streak — typically 3-4 for short-streak overrides. */
   streakMax:    number;
   /** |body3| floor (price USD, last 3 closed bars + in-progress at T-3s)
    *  for entry. */

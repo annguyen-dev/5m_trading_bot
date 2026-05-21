@@ -1363,10 +1363,21 @@ export class PriceMonitoringWorker {
     // Edge cases (idle echo only): user-defined { streak range, body3 floor,
     // dca body3 floor } objects. The matched case's id is recorded on the
     // cycle so its dcaBody3Min applies for any subsequent DCA placement.
+    //
+    // Match on `effectiveStreak` (closed streak + aligning current bar), NOT
+    // absStreak (closed-only). The streak we're actually fading at T-3s
+    // INCLUDES the in-progress current bar (which currentAligns guarantees
+    // is continuing the streak — `!currentAligns` already returned above).
+    // This matches both the normal threshold gate (uses effectiveStreak) and
+    // the backtest semantics: analyze-edge-cases.ts keys on streakLen[i] (the
+    // closed streak ending at the just-completed bar), which equals live
+    // effectiveStreak. Using absStreak made edge case N fire at effectiveStreak
+    // N+1 — verified prod 2026-05-21 13:44:55 UTC BTC: streak=-3 (absStreak 3)
+    // effectiveStreak 4 body3 $557 matched "streak3" but should be "streak4".
     let matchedEdgeCase: EchoEdgeCase | null = null;
     if (effectiveStreak < threshold) {
       if (adapt.mode === 'default' && cfg.strategy === 'echo') {
-        matchedEdgeCase = matchEchoEdgeCase(cfg.echo_edge_cases ?? [], absStreak, body3Sum);
+        matchedEdgeCase = matchEchoEdgeCase(cfg.echo_edge_cases ?? [], effectiveStreak, body3Sum);
       }
       if (matchedEdgeCase) {
         log('info', `echo edge-case override fires ${state.symbol}`, {
@@ -1377,7 +1388,7 @@ export class PriceMonitoringWorker {
           threshold,
           body3Sum, body3Src,
         });
-        adaptive.reason = `${reason} → edge "${matchedEdgeCase.label ?? matchedEdgeCase.id}" (streak ${absStreak} body3 $${body3Sum.toFixed(0)})`;
+        adaptive.reason = `${reason} → edge "${matchedEdgeCase.label ?? matchedEdgeCase.id}" (streak ${effectiveStreak} body3 $${body3Sum.toFixed(0)})`;
       } else {
         return {
           placed: false,
@@ -2855,19 +2866,22 @@ function bucketize(vol: number, avgVol: number): VolumeBucket {
 /**
  * Generic edge-case matcher. Returns the FIRST enabled case in array order
  * where:
- *   - absStreak ∈ [streakMin, streakMax]
+ *   - effectiveStreak ∈ [streakMin, streakMax]
  *   - |body3| ≥ body3Min
  * Returns null if no match. Caller logs which case (by id/label) fired and
  * tags the cycle so the matching case's `dcaBody3Min` applies at DCA time.
+ *
+ * `effectiveStreak` = closed streak + aligning current bar (the streak being
+ * faded at T-3s). Matches backtest streakLen semantics — see caller comment.
  */
 function matchEchoEdgeCase(
   cases: readonly EchoEdgeCase[],
-  absStreak: number,
+  effectiveStreak: number,
   body3Sum: number,
 ): EchoEdgeCase | null {
   for (const ec of cases) {
     if (!ec.enabled) continue;
-    if (absStreak < ec.streakMin || absStreak > ec.streakMax) continue;
+    if (effectiveStreak < ec.streakMin || effectiveStreak > ec.streakMax) continue;
     if (body3Sum < ec.body3Min) continue;
     return ec;
   }
