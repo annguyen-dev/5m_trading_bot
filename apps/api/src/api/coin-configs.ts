@@ -50,6 +50,7 @@ const DEFAULT_CONFIG: CoinConfig = {
   echo_chain_baseline_bump:         1,
   idle_body3_min:                   0,
   armed_body3_min:                  0,
+  arm_trigger_body3_min:            0,
   dca_body3_min_idle:               0,
   dca_body3_min_armed:              0,
 };
@@ -139,6 +140,7 @@ const patchSchema = z.object({
   // per-coin defaults.
   idle_body3_min:                  z.number().min(0).max(10_000).optional(),
   armed_body3_min:                 z.number().min(0).max(10_000).optional(),
+  arm_trigger_body3_min:           z.number().min(0).max(10_000).optional(),
   dca_body3_min_idle:              z.number().min(0).max(10_000).optional(),
   dca_body3_min_armed:             z.number().min(0).max(10_000).optional(),
 }).strict();

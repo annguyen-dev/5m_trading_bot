@@ -598,6 +598,9 @@ export interface CoinConfigPatch {
   idle_body3_min:                  number;
   /** Body-3 armed gate: same but for armed mode. 0 = disabled. */
   armed_body3_min:                 number;
+  /** Body-3 arm-trigger gate: triggering streak's |body3| ≥ this to OPEN the
+   *  arm window (gates arming, not placement). 0 = disabled (count only). */
+  arm_trigger_body3_min:           number;
   /** Body-3 DCA gate when the cycle was opened in IDLE mode. 0 = disabled. */
   dca_body3_min_idle:              number;
   /** Body-3 DCA gate when the cycle was opened in ARMED mode. 0 = disabled. */

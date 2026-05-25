@@ -167,6 +167,7 @@ function CoinRow({
     || draft.echo_defensive_action           !== initial.echo_defensive_action
     || (draft.idle_body3_min            ?? 0) !== (initial.idle_body3_min            ?? 0)
     || (draft.armed_body3_min           ?? 0) !== (initial.armed_body3_min           ?? 0)
+    || (draft.arm_trigger_body3_min     ?? 0) !== (initial.arm_trigger_body3_min     ?? 0)
     || (draft.dca_body3_min_idle        ?? 0) !== (initial.dca_body3_min_idle        ?? 0)
     || (draft.dca_body3_min_armed       ?? 0) !== (initial.dca_body3_min_armed       ?? 0)
     || scheduleDirty
@@ -201,6 +202,7 @@ function CoinRow({
     // Body-3 bounds: 0 = disabled; up to 10000 to cover BTC (price-USD units).
     && (draft.idle_body3_min            ?? 0) >= 0 && (draft.idle_body3_min            ?? 0) <= 10_000
     && (draft.armed_body3_min           ?? 0) >= 0 && (draft.armed_body3_min           ?? 0) <= 10_000
+    && (draft.arm_trigger_body3_min     ?? 0) >= 0 && (draft.arm_trigger_body3_min     ?? 0) <= 10_000
     && (draft.dca_body3_min_idle        ?? 0) >= 0 && (draft.dca_body3_min_idle        ?? 0) <= 10_000
     && (draft.dca_body3_min_armed       ?? 0) >= 0 && (draft.dca_body3_min_armed       ?? 0) <= 10_000
     // Edge cases: each must have valid streak range + body3 thresholds.
@@ -244,6 +246,7 @@ function CoinRow({
         echo_defensive_action:           draft.echo_defensive_action,
         idle_body3_min:                  draft.idle_body3_min            ?? 0,
         armed_body3_min:                 draft.armed_body3_min           ?? 0,
+        arm_trigger_body3_min:           draft.arm_trigger_body3_min     ?? 0,
         dca_body3_min_idle:              draft.dca_body3_min_idle        ?? 0,
         dca_body3_min_armed:             draft.dca_body3_min_armed       ?? 0,
       });
@@ -474,6 +477,14 @@ function CoinRow({
                             min={0} max={10_000} step={25}
                             disabled={saving || !draft.enabled}
                             onChange={v => setDraft({ ...draft, armed_body3_min: v })} />
+                </label>
+                <label style={S.echoLabel}
+                       title="Body-3 ARM-TRIGGER gate: the triggering streak's |body3| must be ≥ this to OPEN an arm window (gates arming itself, not placement). Count-only arming was net-dilutive in backtest. 0 = disabled. BTC ~350.">
+                  Arm trig ≥{' '}
+                  <NumInput value={draft.arm_trigger_body3_min ?? 0}
+                            min={0} max={10_000} step={25}
+                            disabled={saving || !draft.enabled}
+                            onChange={v => setDraft({ ...draft, arm_trigger_body3_min: v })} />
                 </label>
               </div>
 

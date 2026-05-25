@@ -230,6 +230,16 @@ export interface CoinConfig {
   idle_body3_min:  number;
   /** Minimum |body3| for ARMED-mode entry. 0 = disabled. */
   armed_body3_min: number;
+  /**
+   * Minimum |body3| of the TRIGGERING streak required to OPEN an arm window.
+   * Gates the ARM decision itself (not placement) — a streak hitting
+   * `echo_trigger_streak` whose body3 is below this won't drop the threshold.
+   * Count-only arming was net-dilutive in backtest (worse than not arming on
+   * 180d/365d BTC): weak-body3 arms open choppy-regime cycles that bleed via
+   * DCA. 0 = disabled (arm on streak count alone — prior behaviour).
+   * See apps/api/scripts/analyze-arm-body3.ts (BTC best WR ≈ 350).
+   */
+  arm_trigger_body3_min: number;
   /** Minimum |body3| for DCA placement when the CYCLE was opened in IDLE mode
    *  (state.cycleMode === 'idle'). Recomputed at the NEW boundary, after the
    *  loss extended the streak. 0 = disabled. */
@@ -283,6 +293,7 @@ const DEFAULT_CONFIG: CoinConfig = {
   // (sensible BTC values: idle 400, armed 300, DCA idle 200, DCA armed 150).
   idle_body3_min:                   0,
   armed_body3_min:                  0,
+  arm_trigger_body3_min:            0,
   dca_body3_min_idle:               0,
   dca_body3_min_armed:              0,
 };
@@ -300,6 +311,9 @@ export const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DO
  *   idle  ≥ $400  → streak 5+ reversal 62.7%, trapped 13.3%
  *   armed ≥ $300  → streak 3+ reversal 55.8%, trapped 5.5%
  *   DCA   ≥ $200/$150 — looser to allow recovery on borderline cycles
+ *   arm-trigger ≥ $350 — best TOTAL win-rate across 90/180/365d sweep
+ *     (analyze-arm-body3.ts): count-only arming was net-dilutive; this gate
+ *     drops the choppy weak-body3 arms that bled via DCA.
  *
  * Other coins need their own analysis before getting non-zero defaults — the
  * absolute USD body sums scale with price (ETH ≈ $30 for similar pct move,
@@ -309,6 +323,7 @@ export const PER_COIN_OVERRIDES: Partial<Record<CoinSymbol, Partial<CoinConfig>>
   BTC: {
     idle_body3_min:              400,
     armed_body3_min:             300,
+    arm_trigger_body3_min:       350,
     dca_body3_min_idle:          200,
     dca_body3_min_armed:         150,
   },

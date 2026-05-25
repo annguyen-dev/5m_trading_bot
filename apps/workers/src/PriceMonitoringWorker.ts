@@ -617,7 +617,13 @@ export class PriceMonitoringWorker {
     // This block only updates the arm timestamp + publishes state — the
     // actual threshold switch happens in `effectiveAutoMinStreak`.
     if (cfg.strategy === 'echo') {
-      if (absStreak >= cfg.echo_trigger_streak) {
+      // Arm only when the triggering streak is ALSO strong enough by body3.
+      // Count-only arming was net-dilutive in backtest (worse than not arming
+      // on 180d/365d BTC, analyze-arm-body3.ts): weak-body3 arms open
+      // choppy-regime cycles that bleed via DCA. 0 = disabled (count only).
+      const armBody3Ok = cfg.arm_trigger_body3_min <= 0
+        || body3Sum >= cfg.arm_trigger_body3_min;
+      if (absStreak >= cfg.echo_trigger_streak && armBody3Ok) {
         // Set to windowEnd, NOT Date.now(). Armed mode kicks in from the
         // NEXT window onwards — the current bar that just armed the bot
         // is itself the contrarian setup, so user's baseline_streak still
@@ -2746,7 +2752,16 @@ async function backfillEchoState(state: CoinState): Promise<void> {
     const wasBelowTrigger = runLen < triggerThreshold;
     if (dir === runDir) runLen++;
     else                { runDir = dir; runLen = 1; }
-    if (runLen >= triggerThreshold) {
+    // body3 of the 3 most-recent closed bars (matches runtime body3Sum at T+4).
+    // Gate arming on it so restart-restored arm state agrees with live
+    // (line ~620): a streak hitting trigger with weak body3 doesn't arm.
+    const trigBody3 = i >= 2
+      ? Math.abs(b.close - b.open)
+        + Math.abs(bars[i - 1]!.close - bars[i - 1]!.open)
+        + Math.abs(bars[i - 2]!.close - bars[i - 2]!.open)
+      : 0;
+    const armBody3Ok = cfg.arm_trigger_body3_min <= 0 || trigBody3 >= cfg.arm_trigger_body3_min;
+    if (runLen >= triggerThreshold && armBody3Ok) {
       lastTriggerAt = closeTime;
       // Arm event at the moment the run FIRST hits trigger (prior bar was below).
       if (wasBelowTrigger) armEventTimes.push(closeTime);
