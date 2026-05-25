@@ -479,7 +479,7 @@ function CoinRow({
                             onChange={v => setDraft({ ...draft, armed_body3_min: v })} />
                 </label>
                 <label style={S.echoLabel}
-                       title="Body-3 ARM-TRIGGER gate: the triggering streak's |body3| must be ≥ this to OPEN an arm window (gates arming itself, not placement). Count-only arming was net-dilutive in backtest. 0 = disabled. BTC ~350.">
+                       title="Body-3 ARM-TRIGGER gate: the triggering streak's |body3| must be ≥ this to OPEN an arm window (gates arming itself, not placement). Count-only arming was net-dilutive in backtest. 0 = disabled. BTC ~100 (keeps the high-WR 100-200 band, drops toxic <100 arms).">
                   Arm trig ≥{' '}
                   <NumInput value={draft.arm_trigger_body3_min ?? 0}
                             min={0} max={10_000} step={25}

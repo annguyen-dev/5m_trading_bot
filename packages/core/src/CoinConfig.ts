@@ -237,7 +237,10 @@ export interface CoinConfig {
    * Count-only arming was net-dilutive in backtest (worse than not arming on
    * 180d/365d BTC): weak-body3 arms open choppy-regime cycles that bleed via
    * DCA. 0 = disabled (arm on streak count alone — prior behaviour).
-   * See apps/api/scripts/analyze-arm-body3.ts (BTC best WR ≈ 350).
+   * See apps/api/scripts/analyze-arm-body3.ts. BTC=100: keeps the high-WR
+   * $100-200 band (~70%) and drops only the toxic <$100 arms (0-17% WR).
+   * (A ~350 floor maxes TOTAL WR + cuts drawdown on trending regimes but
+   * throws away that best band — a more defensive, lower-profit choice.)
    */
   arm_trigger_body3_min: number;
   /** Minimum |body3| for DCA placement when the CYCLE was opened in IDLE mode
@@ -311,9 +314,10 @@ export const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DO
  *   idle  ≥ $400  → streak 5+ reversal 62.7%, trapped 13.3%
  *   armed ≥ $300  → streak 3+ reversal 55.8%, trapped 5.5%
  *   DCA   ≥ $200/$150 — looser to allow recovery on borderline cycles
- *   arm-trigger ≥ $350 — best TOTAL win-rate across 90/180/365d sweep
- *     (analyze-arm-body3.ts): count-only arming was net-dilutive; this gate
- *     drops the choppy weak-body3 arms that bled via DCA.
+ *   arm-trigger ≥ $100 — keeps the high-WR $100-200 band (~70% reversal) and
+ *     drops only the toxic <$100 arms (0-17% WR). Count-only arming was
+ *     net-dilutive (analyze-arm-body3.ts). A ~350 floor maxes TOTAL WR +
+ *     cuts drawdown on trending regimes but sacrifices the best band.
  *
  * Other coins need their own analysis before getting non-zero defaults — the
  * absolute USD body sums scale with price (ETH ≈ $30 for similar pct move,
@@ -323,7 +327,7 @@ export const PER_COIN_OVERRIDES: Partial<Record<CoinSymbol, Partial<CoinConfig>>
   BTC: {
     idle_body3_min:              400,
     armed_body3_min:             300,
-    arm_trigger_body3_min:       350,
+    arm_trigger_body3_min:       100,
     dca_body3_min_idle:          200,
     dca_body3_min_armed:         150,
   },
