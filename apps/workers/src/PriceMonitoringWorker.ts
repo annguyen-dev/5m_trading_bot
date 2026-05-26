@@ -1402,42 +1402,39 @@ export class PriceMonitoringWorker {
     }
 
     // Gate 2: effective streak ≥ threshold, OR a configured edge case matches.
-    // Edge cases (idle echo only): user-defined { streak range, body3 floor,
-    // dca body3 floor } objects. The matched case's id is recorded on the
-    // cycle so its dcaBody3Min applies for any subsequent DCA placement.
+    // Edge cases are UNIVERSAL rules — they fire whenever (streak in range
+    // AND body3 ≥ body3Min) regardless of mode (armed/idle) or how streak
+    // compares to threshold. When matched, the edge's body3Min replaces the
+    // global idle/armed_body3_min gate (Gate 2b below). Refactored 2026-05-26
+    // from "below-threshold override only" semantics because user-created
+    // edges for streaks ≥ baseline (e.g. streak7) were dead code, which the
+    // FE / config UX didn't reflect — confusing and lost the streak7 sweet
+    // spot at body3≥300 (~60% reversal, prod 2026-05-26 07:14 UTC missed).
     //
     // Match on `effectiveStreak` (closed streak + aligning current bar), NOT
-    // absStreak (closed-only). The streak we're actually fading at T-3s
-    // INCLUDES the in-progress current bar (which currentAligns guarantees
-    // is continuing the streak — `!currentAligns` already returned above).
-    // This matches both the normal threshold gate (uses effectiveStreak) and
-    // the backtest semantics: analyze-edge-cases.ts keys on streakLen[i] (the
-    // closed streak ending at the just-completed bar), which equals live
-    // effectiveStreak. Using absStreak made edge case N fire at effectiveStreak
-    // N+1 — verified prod 2026-05-21 13:44:55 UTC BTC: streak=-3 (absStreak 3)
-    // effectiveStreak 4 body3 $557 matched "streak3" but should be "streak4".
+    // absStreak (closed-only). See `analyze-edge-cases.ts` and prod 2026-05-21
+    // 13:44:55 UTC fix that aligned this with backtest semantics.
     let matchedEdgeCase: EchoEdgeCase | null = null;
-    if (effectiveStreak < threshold) {
-      if (adapt.mode === 'default' && cfg.strategy === 'echo') {
-        matchedEdgeCase = matchEchoEdgeCase(cfg.echo_edge_cases ?? [], effectiveStreak, body3Sum);
-      }
-      if (matchedEdgeCase) {
-        log('info', `echo edge-case override fires ${state.symbol}`, {
-          edgeCaseId:    matchedEdgeCase.id,
-          edgeCaseLabel: matchedEdgeCase.label,
-          streak:        t4.streak,
-          effectiveStreak,
-          threshold,
-          body3Sum, body3Src,
-        });
-        adaptive.reason = `${reason} → edge "${matchedEdgeCase.label ?? matchedEdgeCase.id}" (streak ${effectiveStreak} body3 $${body3Sum.toFixed(0)})`;
-      } else {
-        return {
-          placed: false,
-          reason: `effective streak ${effectiveStreak} (closed ${absStreak}+1 current) < auto_min ${threshold} [${reason}]`,
-          adaptive,
-        };
-      }
+    if (cfg.strategy === 'echo') {
+      matchedEdgeCase = matchEchoEdgeCase(cfg.echo_edge_cases ?? [], effectiveStreak, body3Sum);
+    }
+    if (matchedEdgeCase) {
+      log('info', `echo edge-case fires ${state.symbol}`, {
+        edgeCaseId:    matchedEdgeCase.id,
+        edgeCaseLabel: matchedEdgeCase.label,
+        streak:        t4.streak,
+        effectiveStreak,
+        threshold,
+        armed:         adapt.mode === 'aggressive',
+        body3Sum, body3Src,
+      });
+      adaptive.reason = `${reason} → edge "${matchedEdgeCase.label ?? matchedEdgeCase.id}" (streak ${effectiveStreak} body3 $${body3Sum.toFixed(0)})`;
+    } else if (effectiveStreak < threshold) {
+      return {
+        placed: false,
+        reason: `effective streak ${effectiveStreak} (closed ${absStreak}+1 current) < auto_min ${threshold} [${reason}]`,
+        adaptive,
+      };
     }
 
     // Gate 2b: body-3 minimum (idle vs armed). Quality filter on top of the
