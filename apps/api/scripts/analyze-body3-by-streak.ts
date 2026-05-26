@@ -24,7 +24,7 @@ import { fileURLToPath } from 'url';
 interface Args { days: number; out: string }
 function parseArgs(): Args {
   const here = path.dirname(fileURLToPath(import.meta.url));
-  const a: Args = { days: 365, out: path.join(here, 'analyze-body3-by-streak.md') };
+  const a: Args = { days: 365, out: path.join(here, 'results', 'analyze-body3-by-streak.md') };
   for (const arg of process.argv.slice(2)) {
     const eq = arg.indexOf('='); if (eq < 0) continue;
     const k = arg.slice(2, eq), v = arg.slice(eq + 1);

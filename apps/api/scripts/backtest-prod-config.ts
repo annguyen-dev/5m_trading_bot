@@ -100,7 +100,7 @@ function loadConfig(file: string | undefined): BtcCfg {
 interface Args { days: number[]; entry: number; out: string; configFile?: string; edgesUniversal: boolean }
 function parseArgs(): Args {
   const here = path.dirname(fileURLToPath(import.meta.url));
-  const a: Args = { days: [90, 180, 365], entry: 0.55, out: path.join(here, 'backtest-prod-config.md'), edgesUniversal: false };
+  const a: Args = { days: [90, 180, 365], entry: 0.55, out: path.join(here, 'results', 'backtest-prod-config.md'), edgesUniversal: false };
   for (const arg of process.argv.slice(2)) {
     if (arg === '--edges-universal') { a.edgesUniversal = true; continue; }
     const eq = arg.indexOf('='); if (eq < 0) continue;

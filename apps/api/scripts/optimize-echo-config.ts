@@ -140,7 +140,7 @@ function stat(list: Trade[]) {
 
 async function main(): Promise<void> {
   const here = path.dirname(fileURLToPath(import.meta.url));
-  let configFile: string | undefined, entry = 0.55, out = path.join(here, 'optimize-echo-config.md'), top = 20, minPerDay = 5, maxPerDay = 8;
+  let configFile: string | undefined, entry = 0.55, out = path.join(here, 'results', 'optimize-echo-config.md'), top = 20, minPerDay = 5, maxPerDay = 8;
   for (const arg of process.argv.slice(2)) {
     const eq = arg.indexOf('='); if (eq < 0) continue;
     const k = arg.slice(2, eq), v = arg.slice(eq + 1);
