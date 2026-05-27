@@ -164,6 +164,11 @@ interface CoinState {
    * and for armed-mode cycles. Reset to null on cycle close.
    */
   cycleEdgeCaseId:    string | null;
+  /** CLOB orderID of the cycle's open boundary order. Set by tryPlaceBoundary
+   *  on successful recordOrder; cleared on cycle close. Needed for phaseRecheck
+   *  to call CLOB cancel before window close when conditions invalidate.
+   *  Null for streak-strategy cycles (no recheck path). */
+  cycleOrderId?:      string | null;
   /**
    * Echo defensive layer: ms timestamp of the most recent extreme streak
    * event (run end with |streak| ≥ `echo_defensive_streak_threshold`). When
@@ -1153,11 +1158,12 @@ export class PriceMonitoringWorker {
 
   /**
    * Pre-close recheck (currently 1h only). Fires at windowEnd - meta.recheckOffsetMs.
-   * Re-reads streak + body3, compares to the cycle's bet direction. If the
-   * current candle has flipped opposite to the bet (streak broke), cancel
-   * any open boundary order. Stub for now — full cancel-via-CLOB integration
-   * is a follow-up; logs the recheck outcome so we can verify timing
-   * before wiring the cancel.
+   * Re-reads current bar direction, compares to the cycle's bet direction. If
+   * the current candle has flipped opposite to the bet (streak broke late in
+   * the window), cancel the open boundary order via CLOB so we don't sit
+   * exposed through close.
+   *
+   * Only meaningful when cycleActive AND cycleOrderId is set. No-op otherwise.
    */
   private async phaseRecheck(
     state: CoinState, cfg: CoinConfig, windowStart: number, windowEnd: number,
@@ -1174,16 +1180,47 @@ export class PriceMonitoringWorker {
     const expectedIcon = t4.streak > 0 ? '🟢' : '🔴';
     const currentIcon  = await this.fetchInProgressIcon(state.symbol, windowStart, windowEnd);
     const aligns       = currentIcon === expectedIcon;
+    const willCancel = !aligns && state.cycleActive && state.cycleOrderId != null;
     log('info', `phaseRecheck ${state.symbol}`, {
       windowStart, windowEnd,
       cachedT4Streak: t4.streak, cachedDirection: t4.direction,
       currentIcon, expectedIcon, aligns,
       cycleActive: state.cycleActive, cycleDirection: state.cycleDirection,
-      action: aligns ? 'no-action (still aligned)' : 'TODO-cancel (direction flipped)',
+      cycleOrderId: state.cycleOrderId ?? null,
+      action: willCancel ? 'CANCEL — direction flipped, kill open order'
+            : aligns      ? 'no-action (still aligned)'
+            :               'no-action (no active cycle / no orderId)',
     });
-    // TODO: when aligns=false and cycleActive=true with an open boundary order,
-    // call PolymarketClobExecutor.cancelOrder(orderId). Need to track orderId
-    // on cycle state first (it's currently in poly_orders table, not in-memory).
+    if (willCancel) {
+      const orderId = state.cycleOrderId!;
+      const exec = getClobExecutor();
+      if (!exec) {
+        log('warn', `phaseRecheck wanted to cancel but no CLOB executor (dev mode?) ${state.symbol}`, { orderId });
+        return;
+      }
+      try {
+        await exec.cancelOrder(orderId);
+        log('info', `phaseRecheck cancelled order ${state.symbol}`, {
+          orderId, windowStart, cycleDirection: state.cycleDirection,
+          currentIcon, expectedIcon,
+        });
+        // Reset cycle — bet is no longer in play; T+0 outcome resolution
+        // should see no active cycle, no DCA path triggered.
+        state.cycleActive        = false;
+        delete state.cycleDirection;
+        state.lastCycleOrderSize = null;
+        state.dcaFiredCount      = 0;
+        state.cycleMode          = null;
+        state.cycleEdgeCaseId    = null;
+        state.cycleOrderId       = null;
+      } catch (err) {
+        log('warn', `phaseRecheck cancel failed ${state.symbol}`, {
+          orderId, error: err instanceof Error ? err.message : String(err),
+        });
+        // Leave cycle as-is — order may have filled between our check and the
+        // cancel attempt; T+0 resolution will handle the actual outcome.
+      }
+    }
   }
 
   private async phaseT4(
@@ -1619,10 +1656,12 @@ export class PriceMonitoringWorker {
         ? (adapt.mode === 'aggressive' ? 'armed' : 'idle')
         : null;
       state.cycleEdgeCaseId    = matchedEdgeCase?.id ?? null;
+      state.cycleOrderId       = r.id;
       log('info', `Boundary placed (cycle start) ${state.symbol}`, {
         streakAbs: absStreak, direction, size: orderSize,
         cycleMode: state.cycleMode,
         edgeCaseId: state.cycleEdgeCaseId,
+        orderId: r.id,
       });
 
       return {
@@ -2028,6 +2067,7 @@ export class PriceMonitoringWorker {
         state.dcaFiredCount      = 0;
         state.cycleMode          = null;
         state.cycleEdgeCaseId    = null;
+        state.cycleOrderId       = null;
       } else {
         // No mismatch: use whichever direction is available as chart truth.
         // Prefer Binance (since the question is "did the chart confirm the
@@ -2053,6 +2093,7 @@ export class PriceMonitoringWorker {
           state.dcaFiredCount      = 0;
           state.cycleMode          = null;
           state.cycleEdgeCaseId    = null;
+        state.cycleOrderId       = null;
         } else {
           // Chart continued streak. Fire DCA if conditions pass. The
           // function's internal gates (body3, whitelist, direction

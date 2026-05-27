@@ -98,9 +98,11 @@ function loadConfig(file: string | undefined): BtcCfg {
 }
 
 type EdgeMode = 'legacy' | 'universal' | 'fallback';
+type Interval = '5m' | '1h';
 interface Args {
   days: number[]; entry: number; out: string; configFile?: string;
   edgeMode: EdgeMode; armOnEdge: boolean;
+  interval: Interval;
   // arm-trigger filters (sim-only flags, NOT live code yet).
   armStreakMax?: number;                // skip arm if streak > this
   armBody3Max?: number;                 // skip arm if body3 > this (caps momentum bars)
@@ -109,7 +111,7 @@ interface Args {
 }
 function parseArgs(): Args {
   const here = path.dirname(fileURLToPath(import.meta.url));
-  const a: Args = { days: [90, 180, 365], entry: 0.55, out: path.join(here, 'results', 'backtest-prod-config.md'), edgeMode: 'legacy', armOnEdge: false };
+  const a: Args = { days: [90, 180, 365], entry: 0.55, out: path.join(here, 'results', 'backtest-prod-config.md'), edgeMode: 'legacy', armOnEdge: false, interval: '5m' };
   for (const arg of process.argv.slice(2)) {
     if (arg === '--edges-universal') { a.edgeMode = 'universal'; continue; }
     if (arg === '--edges-fallback')  { a.edgeMode = 'fallback';  continue; }
@@ -130,17 +132,21 @@ function parseArgs(): Args {
       const [lo, hi] = v.split(',').map(Number);
       a.armPriorVolRange = [lo ?? 0, hi ?? 1e9];
     }
+    else if (k === 'interval') {
+      if (v !== '5m' && v !== '1h') { console.error(`--interval must be 5m or 1h`); process.exit(1); }
+      a.interval = v;
+    }
     else { console.error(`unknown arg: --${k}`); process.exit(1); }
   }
   return a;
 }
 
 interface Bar { ts: number; open: number; close: number; dir: 1|-1|0 }
-async function fetchKlines(days: number): Promise<Bar[]> {
+async function fetchKlines(days: number, interval: Interval): Promise<Bar[]> {
   const endMs = Date.now(), startMs = endMs - days * 86400_000;
   const all: Bar[] = []; let cursor = startMs, pages = 0;
   while (cursor < endMs) {
-    const url = `https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&startTime=${cursor}&endTime=${endMs}&limit=1000`;
+    const url = `https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=${interval}&startTime=${cursor}&endTime=${endMs}&limit=1000`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Binance ${res.status}`);
     const rows = (await res.json()) as unknown[][];
@@ -323,8 +329,9 @@ async function run(): Promise<void> {
   const cfg = loadConfig(a.configFile);
   const maxDays = Math.max(...a.days);
   console.error(`Fetching ${maxDays}d of BTCUSDT 5m bars…`);
-  const bars = await fetchKlines(maxDays);
-  console.error(`Got ${bars.length} bars (${(bars.length/288).toFixed(1)} days)\n`);
+  const bars = await fetchKlines(maxDays, a.interval);
+  const barsPerDay = a.interval === '5m' ? 288 : 24;
+  console.error(`Got ${bars.length} bars @${a.interval} (${(bars.length/barsPerDay).toFixed(1)} days)\n`);
 
   const streakLen = new Array<number>(bars.length).fill(0);
   for (let i = 0; i < bars.length; i++) {
