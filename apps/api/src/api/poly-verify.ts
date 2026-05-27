@@ -7,11 +7,9 @@
  * PriceMonitoringWorker enables them.
  */
 import type { Request, Response } from 'express';
-import { ALL_COINS } from '@trading-bot/core/CoinConfig';
-import { SLUG_PREFIX } from '@trading-bot/core/PolymarketService';
+import { ALL_COINS, COIN_META } from '@trading-bot/core/CoinConfig';
 
 const GAMMA_BASE  = 'https://gamma-api.polymarket.com';
-const WINDOW_SECS = 300;
 
 interface VerifyResult {
   symbol:     string;
@@ -26,10 +24,12 @@ interface VerifyResult {
 /** GET /api/poly/verify-slugs */
 export async function verifyCoinSlugs(_req: Request, res: Response): Promise<void> {
   const nowSec = Math.floor(Date.now() / 1000);
-  const windowStart = Math.floor(nowSec / WINDOW_SECS) * WINDOW_SECS;
 
   const results: VerifyResult[] = await Promise.all(ALL_COINS.map(async sym => {
-    const slug = `${SLUG_PREFIX[sym]}${windowStart}`;
+    const meta = COIN_META[sym];
+    const windowSecs = meta.windowMs / 1000;
+    const windowStart = Math.floor(nowSec / windowSecs) * windowSecs;
+    const slug = meta.slugForWindow(windowStart);
     try {
       const resp = await fetch(`${GAMMA_BASE}/events?slug=${slug}`);
       if (!resp.ok) return { symbol: sym, slug, found: false, status: resp.status };
@@ -50,9 +50,11 @@ export async function verifyCoinSlugs(_req: Request, res: Response): Promise<voi
     }
   }));
 
+  // windowStart now varies per-coin (5m: 300s boundary; 1h: 3600s); report the 5m one for backward-compat.
+  const fiveMinStart = Math.floor(nowSec / 300) * 300;
   res.json({
-    windowStart,
-    windowStartUtc: new Date(windowStart * 1000).toISOString(),
+    windowStart:    fiveMinStart,
+    windowStartUtc: new Date(fiveMinStart * 1000).toISOString(),
     results,
   });
 }

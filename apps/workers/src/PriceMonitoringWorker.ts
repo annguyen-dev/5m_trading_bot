@@ -25,7 +25,7 @@ import type {
 } from '@trading-bot/core/SignalBus';
 import { PolymarketService, type PolyClobMarket, type ShareTick } from '@trading-bot/core/PolymarketService';
 import {
-  getEnabledCoins, getCoinConfig,
+  getEnabledCoins, getCoinConfig, COIN_META,
   type CoinSymbol, type CoinConfig, type EchoEdgeCase,
 } from '@trading-bot/core/CoinConfig';
 import { recordOrder, hasAutoOrderFor } from '@trading-bot/core/orderPlacement';
@@ -494,14 +494,17 @@ export class PriceMonitoringWorker {
     if (!this.running) return;
     await this.syncCoins();
     const now = Date.now();
-    const windowStart = Math.floor(now / WINDOW_MS) * WINDOW_MS;
-    const windowEnd   = windowStart + WINDOW_MS;
-    const msFromStart = now - windowStart;
 
     for (const state of this.coins.values()) {
       try {
         const cfg = await getCoinConfig(state.symbol);
         if (!cfg.enabled) continue;
+
+        // Per-coin window (5m or 1h depending on COIN_META).
+        const meta = COIN_META[state.symbol];
+        const windowStart = Math.floor(now / meta.windowMs) * meta.windowMs;
+        const windowEnd   = windowStart + meta.windowMs;
+        const msFromStart = now - windowStart;
 
         // Re-backfill `lastExtremeStreakAt` + `defensiveGapStats` if user
         // changed `echo_defensive_streak_threshold` or toggled defensive on
@@ -511,14 +514,19 @@ export class PriceMonitoringWorker {
         // Clean old dedup keys (window bucket changed)
         this.pruneEmitted(state, windowStart);
 
-        if (msFromStart < T_PLUS_0_END_MS) {
-          await this.phaseT0Plus(state, cfg, windowStart, windowEnd);
-        } else if (msFromStart >= T_PLUS_4_MS && msFromStart < T_MINUS_0_MS) {
-          // T+4 retry slot extends right up to T-0. Successful T+4 schedules
-          // a one-shot setTimeout for phaseTMinus3 at windowEnd - 3s.
-          await this.phaseT4(state, cfg, windowStart, windowEnd);
-        } else if (msFromStart >= T_MINUS_0_MS) {
-          await this.phaseT0(state, cfg, windowStart, windowEnd);
+        // 5m phase dispatch (existing, well-tested). For non-5m coins (e.g.
+        // BTC_1H), 1h phase dispatch is TODO — skip silently for now so the
+        // entry sits idle until that lands.
+        if (meta.binanceInterval === '5m') {
+          if (msFromStart < T_PLUS_0_END_MS) {
+            await this.phaseT0Plus(state, cfg, windowStart, windowEnd);
+          } else if (msFromStart >= T_PLUS_4_MS && msFromStart < T_MINUS_0_MS) {
+            // T+4 retry slot extends right up to T-0. Successful T+4 schedules
+            // a one-shot setTimeout for phaseTMinus3 at windowEnd - 3s.
+            await this.phaseT4(state, cfg, windowStart, windowEnd);
+          } else if (msFromStart >= T_MINUS_0_MS) {
+            await this.phaseT0(state, cfg, windowStart, windowEnd);
+          }
         }
 
         // Heartbeat publish — every tick checks if echo_state needs to

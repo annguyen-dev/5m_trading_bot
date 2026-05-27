@@ -23,7 +23,8 @@ import { EventEmitter } from 'events';
 import WebSocket from 'ws';
 import { getPool } from '@trading-bot/db';
 import { log } from './observability/logger.js';
-import type { CoinSymbol } from './CoinConfig.js';
+import type { CoinSymbol, CoinMeta } from './CoinConfig.js';
+import { COIN_META } from './CoinConfig.js';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -40,11 +41,13 @@ export interface PolyClobMarket {
 }
 
 /**
- * Slug prefix per coin on Polymarket's Gamma API. Discovered by inspecting
- * their public URL patterns. If a coin's 5m market doesn't exist yet, the
- * fetch just returns null and we move on.
+ * Slug prefix per coin on Polymarket's Gamma API (5m markets only).
+ * For coins with non-prefix slug patterns (e.g. BTC_1H uses date-based slugs)
+ * see `COIN_META[symbol].slugForWindow` in CoinConfig.ts — the canonical source.
+ * Kept here for backward-compat with consumers that import this directly.
+ * @deprecated Use `COIN_META[symbol].slugForWindow(unixSec)` instead.
  */
-export const SLUG_PREFIX: Record<CoinSymbol, string> = {
+export const SLUG_PREFIX: Partial<Record<CoinSymbol, string>> = {
   BTC:  'btc-updown-5m-',
   ETH:  'eth-updown-5m-',
   SOL:  'sol-updown-5m-',
@@ -72,7 +75,6 @@ const GAMMA_BASE = 'https://gamma-api.polymarket.com';
 const CLOB_BASE  = 'https://clob.polymarket.com';
 const WS_URL     = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
 
-const WINDOW_SECS       = 300;
 const WS_RECONNECT_MS   = 250;
 const DISCOVERY_POLL_MS = 60_000;   // re-scan upcoming markets every 60s
 const FLUSH_INTERVAL_MS = 1000;     // batch DB writes at most every 1s
@@ -100,7 +102,8 @@ export class PolymarketService extends EventEmitter {
   private ws: WebSocket | null = null;
   private running = false;
   public readonly symbol: CoinSymbol;
-  private readonly slugPrefix: string;
+  private readonly meta: CoinMeta;
+  private readonly windowSecs: number;
 
   // Active markets we're tracking (keyed by conditionId)
   private activeMarkets = new Map<string, PolyClobMarket>();
@@ -110,7 +113,8 @@ export class PolymarketService extends EventEmitter {
   constructor(symbol: CoinSymbol = 'BTC') {
     super();
     this.symbol = symbol;
-    this.slugPrefix = SLUG_PREFIX[symbol];
+    this.meta = COIN_META[symbol];
+    this.windowSecs = this.meta.windowMs / 1000;
   }
 
   // Dedup cache for top-of-book: tokenId → last {bid, ask}
@@ -145,20 +149,20 @@ export class PolymarketService extends EventEmitter {
 
   // ── Public helpers ───────────────────────────────────────────────────────
 
-  /** 5m market for this coin whose window contains `unixSec`. Null if not found. */
+  /** Market for this coin whose window starts at the boundary containing `unixSec`. */
   async findMarketAt(unixSec: number): Promise<PolyClobMarket | null> {
-    const windowStart = Math.floor(unixSec / WINDOW_SECS) * WINDOW_SECS;
-    return this.fetchBySlug(`${this.slugPrefix}${windowStart}`);
+    const windowStart = Math.floor(unixSec / this.windowSecs) * this.windowSecs;
+    return this.fetchBySlug(this.meta.slugForWindow(windowStart), windowStart);
   }
 
-  /** Next `count` 5m markets for this coin starting from the current window. */
+  /** Next `count` markets for this coin starting from the current window. */
   async findUpcoming(count: number): Promise<PolyClobMarket[]> {
-    const startSec = Math.floor(Date.now() / 1000 / WINDOW_SECS) * WINDOW_SECS;
-    const slugs = Array.from(
-      { length: count },
-      (_, i) => `${this.slugPrefix}${startSec + i * WINDOW_SECS}`,
-    );
-    const results = await Promise.all(slugs.map(s => this.fetchBySlug(s)));
+    const startSec = Math.floor(Date.now() / 1000 / this.windowSecs) * this.windowSecs;
+    const fetches = Array.from({ length: count }, (_, i) => {
+      const ws = startSec + i * this.windowSecs;
+      return this.fetchBySlug(this.meta.slugForWindow(ws), ws);
+    });
+    const results = await Promise.all(fetches);
     return results.filter((m): m is PolyClobMarket => m !== null);
   }
 
@@ -182,7 +186,7 @@ export class PolymarketService extends EventEmitter {
 
   // ── Market discovery ─────────────────────────────────────────────────────
 
-  private async fetchBySlug(slug: string): Promise<PolyClobMarket | null> {
+  private async fetchBySlug(slug: string, windowStartSec: number): Promise<PolyClobMarket | null> {
     try {
       const resp = await fetch(`${GAMMA_BASE}/events?slug=${slug}`);
       if (!resp.ok) return null;
@@ -204,13 +208,14 @@ export class PolymarketService extends EventEmitter {
       const tokenUp   = upIdx >= 0 ? tokens[upIdx]! : tokens[0];
       const tokenDown = dnIdx >= 0 ? tokens[dnIdx]! : tokens[1];
 
-      // Derive window_start from slug (unix seconds) — more reliable than
-      // event.startDate, which is market-creation time (~24h earlier).
-      const wsSec = Number(slug.slice(this.slugPrefix.length));
-      const fallbackDate = event.startDate ?? event.endDate ?? '';
-      const windowStartMs = Number.isFinite(wsSec) && wsSec > 0
-        ? wsSec * 1000
-        : fallbackDate ? new Date(fallbackDate).getTime() : 0;
+      // windowStartMs comes from the caller (5m: slug suffix unix secs; 1h:
+      // computed UTC boundary). More reliable than event.startDate which is
+      // market-creation time (~24h earlier).
+      const windowStartMs = windowStartSec > 0
+        ? windowStartSec * 1000
+        : (event.startDate ?? event.endDate)
+          ? new Date(event.startDate ?? event.endDate ?? '').getTime()
+          : 0;
       const windowEndMs = event.endDate ? new Date(event.endDate).getTime() : 0;
 
       const market: PolyClobMarket = {

@@ -8,7 +8,80 @@
  */
 import { getPool } from '@trading-bot/db';
 
-export type CoinSymbol  = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE' | 'HYPE' | 'BNB';
+export type CoinSymbol  = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE' | 'HYPE' | 'BNB' | 'BTC_1H';
+
+/**
+ * Per-coin metadata for timeframe / Polymarket integration / phase scheduling.
+ * Static (compile-time) because it ties together kline interval, slug pattern,
+ * and phase timings that all need to agree.
+ *
+ * Phase timings (units = ms; in code) are RELATIVE to window boundaries:
+ *   preview   = windowStart + previewOffsetMs     (emit T+? signal)
+ *   decision  = windowEnd   - decisionOffsetMs    (try place boundary order)
+ *   recheck   = windowEnd   - recheckOffsetMs     (final confirm / cancel; null = no recheck)
+ *
+ * 5m default: T+4s preview, T-3s decision, no recheck (window too short).
+ * 1h default: T+40min preview, T-10min decision, T-30s recheck (1h window has
+ * room for conditions to shift between place and close).
+ */
+export interface CoinMeta {
+  windowMs:           number;
+  binanceInterval:    '5m' | '1h';
+  previewOffsetMs:    number;
+  decisionOffsetMs:   number;
+  recheckOffsetMs:    number | null;
+  /** Build the Polymarket event slug for the window whose START is unixSec. */
+  slugForWindow:      (unixSec: number) => string;
+}
+
+const SLUG_PREFIX_5M: Record<string, string> = {
+  BTC: 'btc-updown-5m-', ETH: 'eth-updown-5m-', SOL: 'sol-updown-5m-',
+  XRP: 'xrp-updown-5m-', DOGE: 'doge-updown-5m-', HYPE: 'hype-updown-5m-',
+  BNB: 'bnb-updown-5m-',
+};
+const make5mMeta = (sym: string): CoinMeta => ({
+  windowMs: 300_000, binanceInterval: '5m',
+  previewOffsetMs: 4_000, decisionOffsetMs: 3_000, recheckOffsetMs: null,
+  slugForWindow: (unixSec) => `${SLUG_PREFIX_5M[sym]}${unixSec}`,
+});
+
+/** Slug for BTC 1h Polymarket markets. Format observed (gamma-api):
+ *  `bitcoin-up-or-down-{month}-{day}-{year}-{hour}{am|pm}-et`
+ *  Examples: `bitcoin-up-or-down-may-27-2026-6am-et`,
+ *            `bitcoin-up-or-down-may-27-2026-12pm-et`.
+ *  Date/hour are in ET (America/New_York, DST-aware). The hour is the START
+ *  of the 1h candle (e.g. 6am-et = candle 06:00→07:00 ET). */
+function formatBtc1hSlug(unixSec: number): string {
+  const d = new Date(unixSec * 1000);
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', month: 'long', day: 'numeric',
+    year: 'numeric', hour: 'numeric', hour12: true,
+  }).formatToParts(d);
+  const month = parts.find(p => p.type === 'month')!.value.toLowerCase();
+  const day   = parts.find(p => p.type === 'day')!.value;
+  const year  = parts.find(p => p.type === 'year')!.value;
+  const hour  = parts.find(p => p.type === 'hour')!.value;
+  const ampm  = parts.find(p => p.type === 'dayPeriod')!.value.toLowerCase();
+  return `bitcoin-up-or-down-${month}-${day}-${year}-${hour}${ampm}-et`;
+}
+
+export const COIN_META: Record<CoinSymbol, CoinMeta> = {
+  BTC:  make5mMeta('BTC'),
+  ETH:  make5mMeta('ETH'),
+  SOL:  make5mMeta('SOL'),
+  XRP:  make5mMeta('XRP'),
+  DOGE: make5mMeta('DOGE'),
+  HYPE: make5mMeta('HYPE'),
+  BNB:  make5mMeta('BNB'),
+  BTC_1H: {
+    windowMs:         3_600_000,    // 1 hour
+    binanceInterval:  '1h',
+    previewOffsetMs:  40 * 60_000,  // T+40min — emit preview signal + Telegram
+    decisionOffsetMs: 10 * 60_000,  // T-10min — place boundary order
+    recheckOffsetMs:  30_000,       // T-30s   — recheck + cancel if conditions flipped
+    slugForWindow:    formatBtc1hSlug,
+  },
+};
 export type CoinMode    = 'signal_only' | 'signal_and_order';
 /**
  * Available strategies:
@@ -323,7 +396,7 @@ const DEFAULT_CONFIG: CoinConfig = {
   dca_body3_min_armed:              0,
 };
 
-export const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB'];
+export const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB', 'BTC_1H'];
 
 /**
  * Per-coin overrides applied on top of DEFAULT_CONFIG. Used for fields where
@@ -354,6 +427,24 @@ export const PER_COIN_OVERRIDES: Partial<Record<CoinSymbol, Partial<CoinConfig>>
     arm_trigger_streak_max:      8,
     dca_body3_min_idle:          200,
     dca_body3_min_armed:         150,
+  },
+  // BTC_1H — 1h timeframe variant. Phase logic NOT yet implemented in worker
+  // (added 2026-05-27, see PriceMonitoringWorker.tick: non-5m coins skip
+  // phase dispatch). Body3 thresholds undefined here — 1h bars have a very
+  // different USD scale than 5m bars (typical 1h |body| can be $1000+), so
+  // values must be recalibrated via fresh 1h backtest before enabling.
+  // Until then, leave enabled=false (DEFAULT_CONFIG inherits).
+  BTC_1H: {
+    strategy:                    'echo',
+    size_usdc:                   5,
+    limit_price_cents:           69,
+    tp_cents:                    95,
+    sl_cents:                    10,
+    streak_min:                  2,
+    echo_trigger_streak:         3,    // 1h streak=3 ≈ 3-hour run (rare); placeholder
+    echo_window_minutes:         360,  // 6h arm window — placeholder
+    echo_signal_min_streak:      2,
+    echo_baseline_streak:        4,
   },
 };
 
