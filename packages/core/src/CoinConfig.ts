@@ -39,9 +39,14 @@ const SLUG_PREFIX_5M: Record<string, string> = {
   XRP: 'xrp-updown-5m-', DOGE: 'doge-updown-5m-', HYPE: 'hype-updown-5m-',
   BNB: 'bnb-updown-5m-',
 };
+// 5m preview opens at T+4 MINUTES (= windowEnd - 1min, not T+4 seconds — the
+// CLAUDE.md doc was misleading; pre-refactor const T_PLUS_4_MS was 240_000ms
+// = 4 minutes from window start). At T+4min the bar has enough data for a
+// reliable streak/body3 read; the slot retries every tick until placement
+// setTimeout fires at T-3s.
 const make5mMeta = (sym: string): CoinMeta => ({
   windowMs: 300_000, binanceInterval: '5m',
-  previewOffsetMs: 4_000, decisionOffsetMs: 3_000, recheckOffsetMs: null,
+  previewOffsetMs: 240_000, decisionOffsetMs: 3_000, recheckOffsetMs: null,
   slugForWindow: (unixSec) => `${SLUG_PREFIX_5M[sym]}${unixSec}`,
 });
 

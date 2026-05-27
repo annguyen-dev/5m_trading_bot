@@ -34,7 +34,7 @@ import { withRetry } from '@trading-bot/core/retry';
 import { getPool } from '@trading-bot/db';
 
 const TICK_MS    = 5_000;
-const WINDOW_MS  = 300_000;
+// (WINDOW_MS removed — per-coin via COIN_META[symbol].windowMs.)
 /** Heartbeat for echo_state republish — bounds API-restart recovery latency.
  *  When API restarts its in-memory engine.echoStates Map is empty; the next
  *  echo_state event from worker will repopulate it. With transition-only
@@ -75,11 +75,9 @@ const SYNC_OUTCOMES_MAX_AGE_MS             = 24 * 60 * 60_000;
 //   T-0     → window N close: if active order, report PnL & maybe DCA;
 //             if no active order + current reversed, cancel N+1 outgoing.
 const T_PLUS_0_END_MS = 5_000;   // T+0 phase = first tick of window
-const T_PLUS_4_MS     = 240_000; // T+4m — start of T+4 retry slot
-const T_MINUS_0_MS    = 295_000; // T+4:55 — wide enough that a 5s tick always lands inside
+// (T+4 retry slot start / T-0 phase start now come from COIN_META — see tick().)
 
-/** Milliseconds before window close to fire the scheduled placement. */
-const PLACEMENT_LEAD_MS = 3_000;
+// (PLACEMENT_LEAD_MS removed — now COIN_META[symbol].decisionOffsetMs per coin.)
 
 /** Binance kline symbol per coin. HYPE is absent here on purpose — it's not
  *  reliably listed on Binance spot, so we route it to Pyth below. */
@@ -209,10 +207,18 @@ interface CoinState {
   recentStreakAbs: number[];
   /**
    * One-shot timer scheduled by phaseT4 to fire phaseTMinus3 at exactly
-   * windowEnd - PLACEMENT_LEAD_MS. Cleared on worker stop and on each new
-   * T+4 emission (only the latest cached signal fires).
+   * windowEnd - COIN_META.decisionOffsetMs (5m: 3s, 1h: 10min). Cleared on
+   * worker stop and on each new T+4 emission (only the latest cached signal fires).
    */
   pendingPlacementTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * One-shot timer scheduled by phaseT4 (alongside the placement timer) to
+   * fire phaseRecheck at windowEnd - COIN_META.recheckOffsetMs. Only set when
+   * the coin's meta defines recheckOffsetMs (1h: 30s; 5m: null = never).
+   * Purpose: confirm bet still makes sense just before close; cancel open
+   * order if conditions flipped (e.g. streak direction reversed mid-window).
+   */
+  pendingRecheckTimer?: ReturnType<typeof setTimeout>;
   /**
    * Echo strategy: ms timestamp of the most recent run end where |streak| ≥
    * `cfg.echo_trigger_streak`. Drives the arm window — bot only signals/places
@@ -418,6 +424,10 @@ export class PriceMonitoringWorker {
         clearTimeout(st.pendingPlacementTimer);
         delete st.pendingPlacementTimer;
       }
+      if (st.pendingRecheckTimer) {
+        clearTimeout(st.pendingRecheckTimer);
+        delete st.pendingRecheckTimer;
+      }
       try { await st.poly.stop(); } catch { /* ignore */ }
     }
     this.coins.clear();
@@ -514,19 +524,21 @@ export class PriceMonitoringWorker {
         // Clean old dedup keys (window bucket changed)
         this.pruneEmitted(state, windowStart);
 
-        // 5m phase dispatch (existing, well-tested). For non-5m coins (e.g.
-        // BTC_1H), 1h phase dispatch is TODO — skip silently for now so the
-        // entry sits idle until that lands.
-        if (meta.binanceInterval === '5m') {
-          if (msFromStart < T_PLUS_0_END_MS) {
-            await this.phaseT0Plus(state, cfg, windowStart, windowEnd);
-          } else if (msFromStart >= T_PLUS_4_MS && msFromStart < T_MINUS_0_MS) {
-            // T+4 retry slot extends right up to T-0. Successful T+4 schedules
-            // a one-shot setTimeout for phaseTMinus3 at windowEnd - 3s.
-            await this.phaseT4(state, cfg, windowStart, windowEnd);
-          } else if (msFromStart >= T_MINUS_0_MS) {
-            await this.phaseT0(state, cfg, windowStart, windowEnd);
-          }
+        // Phase dispatch — same shape for 5m and 1h, timings come from
+        // COIN_META. 5m: preview at T+4min, decision setTimeout at T-3s, no
+        // recheck. 1h: preview at T+40min, decision setTimeout at T-10min,
+        // recheck setTimeout at T-30s. Initial "T+0 phase" (first 5s) and
+        // "T-0 phase" (last 5s) are universal.
+        const previewStartMs = meta.previewOffsetMs;
+        const t0LastMs       = meta.windowMs - T_PLUS_0_END_MS;
+        if (msFromStart < T_PLUS_0_END_MS) {
+          await this.phaseT0Plus(state, cfg, windowStart, windowEnd);
+        } else if (msFromStart >= previewStartMs && msFromStart < t0LastMs) {
+          // Preview retry slot — every tick re-evaluates until a clean T+4
+          // signal emits + setTimeouts get scheduled for decision/recheck.
+          await this.phaseT4(state, cfg, windowStart, windowEnd);
+        } else if (msFromStart >= t0LastMs) {
+          await this.phaseT0(state, cfg, windowStart, windowEnd);
         }
 
         // Heartbeat publish — every tick checks if echo_state needs to
@@ -658,7 +670,7 @@ export class PriceMonitoringWorker {
         // timestamps per 5-min bucket so retries within same window don't
         // inflate the count.
         const now = Date.now();
-        const bucketMs = 5 * 60_000;
+        const bucketMs = COIN_META[state.symbol].windowMs;
         const lastArmTs = state.recentArmTimestamps[state.recentArmTimestamps.length - 1];
         if (lastArmTs == null || (now - lastArmTs) >= bucketMs) {
           state.recentArmTimestamps.push(now);
@@ -1074,30 +1086,104 @@ export class PriceMonitoringWorker {
   }
 
   /**
-   * Schedule the precise T-3s placement firing. Idempotent — clears any
-   * previous timer for this coin so only the latest T+4 emission's timer
-   * is live (re-emitting via late-eval paths replaces the schedule).
+   * Schedule the precise placement firing — windowEnd - meta.decisionOffsetMs.
+   * Idempotent: clears any previous timer for this coin so only the latest
+   * T+4 emission's timer is live (re-emitting via late-eval paths replaces
+   * the schedule).
    *
-   * If T+4 fired so late that T-3s is already past, fires immediately —
-   * `phaseTMinus3` itself dedups via `state.emitted`.
+   * If T+4 fired so late that the decision time is already past, fires
+   * immediately — `phaseTMinus3` itself dedups via `state.emitted`.
+   *
+   * Also schedules the recheck timer when coin meta defines recheckOffsetMs.
+   * 5m coins (recheckOffsetMs=null) skip the recheck — the 5s gap between
+   * T-3s placement and T-0 close leaves no useful recheck window.
    */
   private schedulePlacement(
     state: CoinState, cfg: CoinConfig, windowStart: number, windowEnd: number,
   ): void {
+    const meta = COIN_META[state.symbol];
     if (state.pendingPlacementTimer) clearTimeout(state.pendingPlacementTimer);
-    const fireAt = windowEnd - PLACEMENT_LEAD_MS;
+    const fireAt = windowEnd - meta.decisionOffsetMs;
     const delay  = fireAt - Date.now();
     if (delay <= 0) {
-      // Already past T-3s — fire immediately (still has time before window close).
+      // Already past decision time — fire immediately.
       void this.phaseTMinus3(state, cfg, windowStart, windowEnd);
+    } else {
+      const timer = setTimeout(() => {
+        delete state.pendingPlacementTimer;
+        void this.phaseTMinus3(state, cfg, windowStart, windowEnd);
+      }, delay);
+      timer.unref();    // don't keep the event loop alive on shutdown
+      state.pendingPlacementTimer = timer;
+    }
+    // Schedule recheck if defined for this coin (1h: T-30s).
+    if (meta.recheckOffsetMs != null) this.scheduleRecheck(state, cfg, windowStart, windowEnd);
+  }
+
+  /**
+   * Schedule the recheck firing — windowEnd - meta.recheckOffsetMs. Idempotent.
+   * Only meaningful for coins with recheckOffsetMs != null (currently BTC_1H).
+   *
+   * The recheck re-evaluates direction/body3 right before close: if the bar's
+   * direction has flipped against the placed bet (streak broke late), the
+   * open boundary order is cancelled. Avoids leaving a stale fade order
+   * sitting in the book through a regime flip — only relevant on long
+   * windows where price action can shift meaningfully between placement
+   * (T-decisionOffsetMs) and close (T-0).
+   */
+  private scheduleRecheck(
+    state: CoinState, cfg: CoinConfig, windowStart: number, windowEnd: number,
+  ): void {
+    const meta = COIN_META[state.symbol];
+    if (meta.recheckOffsetMs == null) return;
+    if (state.pendingRecheckTimer) clearTimeout(state.pendingRecheckTimer);
+    const fireAt = windowEnd - meta.recheckOffsetMs;
+    const delay  = fireAt - Date.now();
+    if (delay <= 0) {
+      void this.phaseRecheck(state, cfg, windowStart, windowEnd);
       return;
     }
     const timer = setTimeout(() => {
-      delete state.pendingPlacementTimer;
-      void this.phaseTMinus3(state, cfg, windowStart, windowEnd);
+      delete state.pendingRecheckTimer;
+      void this.phaseRecheck(state, cfg, windowStart, windowEnd);
     }, delay);
-    timer.unref();    // don't keep the event loop alive on shutdown
-    state.pendingPlacementTimer = timer;
+    timer.unref();
+    state.pendingRecheckTimer = timer;
+  }
+
+  /**
+   * Pre-close recheck (currently 1h only). Fires at windowEnd - meta.recheckOffsetMs.
+   * Re-reads streak + body3, compares to the cycle's bet direction. If the
+   * current candle has flipped opposite to the bet (streak broke), cancel
+   * any open boundary order. Stub for now — full cancel-via-CLOB integration
+   * is a follow-up; logs the recheck outcome so we can verify timing
+   * before wiring the cancel.
+   */
+  private async phaseRecheck(
+    state: CoinState, cfg: CoinConfig, windowStart: number, windowEnd: number,
+  ): Promise<void> {
+    const key = `${windowStart}:recheck`;
+    if (state.emitted.has(key)) return;
+    state.emitted.add(key);
+    const t4 = state.lastT4;
+    if (!t4 || t4.windowStart !== windowStart) {
+      log('info', `phaseRecheck noop ${state.symbol} (no T+4 signal for window)`,
+        { windowStart });
+      return;
+    }
+    const expectedIcon = t4.streak > 0 ? '🟢' : '🔴';
+    const currentIcon  = await this.fetchInProgressIcon(state.symbol, windowStart, windowEnd);
+    const aligns       = currentIcon === expectedIcon;
+    log('info', `phaseRecheck ${state.symbol}`, {
+      windowStart, windowEnd,
+      cachedT4Streak: t4.streak, cachedDirection: t4.direction,
+      currentIcon, expectedIcon, aligns,
+      cycleActive: state.cycleActive, cycleDirection: state.cycleDirection,
+      action: aligns ? 'no-action (still aligned)' : 'TODO-cancel (direction flipped)',
+    });
+    // TODO: when aligns=false and cycleActive=true with an open boundary order,
+    // call PolymarketClobExecutor.cancelOrder(orderId). Need to track orderId
+    // on cycle state first (it's currently in poly_orders table, not in-memory).
   }
 
   private async phaseT4(
@@ -1409,7 +1495,7 @@ export class PriceMonitoringWorker {
     if (currentAligns) {
       const liveBars = await fetchBars(
         state.symbol,
-        t4.windowStart - 2 * WINDOW_MS,
+        t4.windowStart - 2 * COIN_META[state.symbol].windowMs,
         Date.now(),
         3,
       );
@@ -1480,7 +1566,7 @@ export class PriceMonitoringWorker {
     }
 
     // Gate 3: N+1 market exists
-    const nextWindowStartMs = t4.windowStart + WINDOW_MS;
+    const nextWindowStartMs = t4.windowStart + COIN_META[state.symbol].windowMs;
     const market = await state.poly.findMarketAt(Math.floor(nextWindowStartMs / 1000));
     if (!market) return { placed: false, reason: 'no N+1 market', adaptive };
 
@@ -1593,7 +1679,7 @@ export class PriceMonitoringWorker {
   ): Promise<void> {
     if (!state.cycleActive || state.cycleDirection == null) return;
 
-    const nextWindowStart = justClosedWindowStart + WINDOW_MS;
+    const nextWindowStart = justClosedWindowStart + COIN_META[state.symbol].windowMs;
 
     // Compute streak as of nextWindowStart — includes the just-closed loss.
     const { streak, body3Sum } = await fetchStreakWithVolume(state.symbol, nextWindowStart);
@@ -1765,7 +1851,7 @@ export class PriceMonitoringWorker {
       });
 
       // Surface to bus so UI/Telegram see the placement under the new window.
-      const nextWindowEnd = nextWindowStart + WINDOW_MS;
+      const nextWindowEnd = nextWindowStart + COIN_META[state.symbol].windowMs;
       await this.bus.publish<SignalTMinus3Event>({
         type: 'T-3s', coin: state.symbol,
         windowStart: nextWindowStart, windowEnd: nextWindowEnd,
@@ -2016,7 +2102,7 @@ export class PriceMonitoringWorker {
       let cancelled: (OrderRef & { pnlUsdc: number; exitPrice: number }) | undefined;
       if (streakBroken) {
         const nextMarket = await state.poly.findMarketAt(
-          Math.floor((windowStart + WINDOW_MS) / 1000),
+          Math.floor((windowStart + COIN_META[state.symbol].windowMs) / 1000),
         );
         if (nextMarket) {
           cancelled = (await this.cancelPendingAutoOrderForMarket(
@@ -2047,7 +2133,7 @@ export class PriceMonitoringWorker {
     if (streakBroken) {
       // Path D: cancel outgoing N+1 if exists
       const nextMarket = await state.poly.findMarketAt(
-        Math.floor((windowStart + WINDOW_MS) / 1000),
+        Math.floor((windowStart + COIN_META[state.symbol].windowMs) / 1000),
       );
       if (nextMarket) {
         const cancelled = await this.cancelPendingAutoOrderForMarket(
@@ -2435,8 +2521,9 @@ async function fetchStreakWithVolume(
   symbol: CoinSymbol, windowStart: number,
 ): Promise<StreakResult> {
   const BASELINE_BARS = 48;
+  const winMs = COIN_META[symbol].windowMs;
   const endTime = windowStart - 1;
-  const startTime = windowStart - BASELINE_BARS * WINDOW_MS;
+  const startTime = windowStart - BASELINE_BARS * winMs;
   const bars = await fetchBars(symbol, startTime, endTime, BASELINE_BARS + 2);
   if (!bars.length) {
     log('warn', 'fetchStreakWithVolume: no bars (signal may be missed)', {
@@ -2450,9 +2537,9 @@ async function fetchStreakWithVolume(
     };
   }
 
-  // Stale data check: most recent bar's open should be ~5min before windowStart.
-  const latestBarOpen = startTime + (bars.length - 1) * WINDOW_MS;
-  if ((windowStart - latestBarOpen) > 2 * WINDOW_MS) {
+  // Stale data check: most recent bar's open should be ~1 window before windowStart.
+  const latestBarOpen = startTime + (bars.length - 1) * winMs;
+  if ((windowStart - latestBarOpen) > 2 * winMs) {
     log('warn', 'fetchStreakWithVolume: stale latest bar (data feed lag?)', {
       symbol, windowStart, latestBarOpen,
       lagMs: windowStart - latestBarOpen,
@@ -2487,7 +2574,7 @@ async function fetchStreakWithVolume(
     b.close > b.open ? 'up' : b.close < b.open ? 'down' : 'doji',
   );
 
-  const allWindowStarts: number[] = bars.map((_, i) => startTime + i * WINDOW_MS);
+  const allWindowStarts: number[] = bars.map((_, i) => startTime + i * winMs);
   const { rows: cachedOutcomes } = allWindowStarts.length > 0
     ? await getPool().query<{ window_start: string; outcome: string | null }>(
         `SELECT window_start, outcome FROM poly_clob_markets
@@ -2552,7 +2639,7 @@ async function fetchStreakWithVolume(
       const movePct = bar.open > 0 ? ((bar.close - bar.open) / bar.open) * 100 : 0;
       mismatches.push({
         windowStart: allWindowStarts[i]!,
-        windowEnd:   allWindowStarts[i]! + WINDOW_MS,
+        windowEnd:   allWindowStarts[i]! + winMs,
         binanceDirection: binOut,
         polyDirection:    polyOut,
         binanceMovePct: movePct,
@@ -2737,7 +2824,7 @@ async function backfillEchoState(state: CoinState): Promise<void> {
   const now      = Date.now();
   const lookback = BACKFILL_DAYS * 24 * 60 * 60 * 1000;
   const CHUNK_BARS = 1000;
-  const CHUNK_MS   = CHUNK_BARS * 5 * 60 * 1000;
+  const CHUNK_MS   = CHUNK_BARS * COIN_META[state.symbol].windowMs;
   const bars: Bar[] = [];
   for (let cursor = now - lookback; cursor < now; cursor += CHUNK_MS) {
     const chunkEnd = Math.min(cursor + CHUNK_MS, now);
@@ -2761,7 +2848,7 @@ async function backfillEchoState(state: CoinState): Promise<void> {
   let i = 0;
   for (const b of bars) {
     const dir = b.close > b.open ? 1 : b.close < b.open ? -1 : 0;
-    const closeTime = now - lookback + (i + 1) * (5 * 60 * 1000);
+    const closeTime = now - lookback + (i + 1) * COIN_META[state.symbol].windowMs;
     if (dir === 0) { runDir = 0; runLen = 0; i++; continue; }
     const wasBelowExtreme = defensiveThreshold !== null && runLen < defensiveThreshold;
     const wasBelowTrigger = runLen < triggerThreshold;
@@ -2966,17 +3053,18 @@ async function fetchBars(
   const pythSym = PYTH_SYMBOL[symbol];
   if (pythSym) return fetchPythBars(pythSym, startTimeMs, endTimeMs);
   const binanceSym = BINANCE_SYMBOL[symbol];
-  if (binanceSym) return fetchBinanceBars(binanceSym, startTimeMs, endTimeMs, limit);
+  const interval = COIN_META[symbol].binanceInterval;
+  if (binanceSym) return fetchBinanceBars(binanceSym, interval, startTimeMs, endTimeMs, limit);
   return [];
 }
 
 async function fetchBinanceBars(
-  binanceSym: string, startTimeMs: number, endTimeMs: number, limit: number,
+  binanceSym: string, interval: '5m' | '1h', startTimeMs: number, endTimeMs: number, limit: number,
 ): Promise<Bar[]> {
   try {
-    return await withRetry(`Binance klines ${binanceSym}`, async () => {
+    return await withRetry(`Binance klines ${binanceSym}@${interval}`, async () => {
       const url = `https://api.binance.com/api/v3/klines`
-        + `?symbol=${binanceSym}&interval=5m`
+        + `?symbol=${binanceSym}&interval=${interval}`
         + `&startTime=${startTimeMs}&endTime=${endTimeMs}&limit=${limit}`;
       const resp = await fetch(url);
       if (!resp.ok) throw new Error(`Binance ${resp.status} ${resp.statusText}`);
