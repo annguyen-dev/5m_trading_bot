@@ -127,6 +127,7 @@ const patchSchema = z.object({
     streakMin:   z.number().int().min(2).max(20),
     streakMax:   z.number().int().min(2).max(20),
     body3Min:    z.number().min(0).max(10_000),
+    body3Max:    z.number().min(0).max(10_000).optional(),
     dcaBody3Min: z.number().min(0).max(10_000),
   })).max(16).optional(),
   echo_dca_scale:         z.array(z.number().min(1).max(20)).max(10).optional(),
@@ -141,6 +142,8 @@ const patchSchema = z.object({
   idle_body3_min:                  z.number().min(0).max(10_000).optional(),
   armed_body3_min:                 z.number().min(0).max(10_000).optional(),
   arm_trigger_body3_min:           z.number().min(0).max(10_000).optional(),
+  arm_trigger_body3_max:           z.number().min(0).max(10_000).optional(),
+  arm_trigger_streak_max:          z.number().int().min(2).max(20).optional(),
   dca_body3_min_idle:              z.number().min(0).max(10_000).optional(),
   dca_body3_min_armed:             z.number().min(0).max(10_000).optional(),
 }).strict();

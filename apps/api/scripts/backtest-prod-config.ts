@@ -26,7 +26,7 @@ import { writeFileSync, readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-interface EdgeCase { label: string; enabled: boolean; streakMin: number; streakMax: number; body3Min: number; dcaBody3Min: number }
+interface EdgeCase { label: string; enabled: boolean; streakMin: number; streakMax: number; body3Min: number; body3Max?: number; dcaBody3Min: number }
 interface BtcCfg {
   fetched_at: string; source: string;
   enabled: boolean; strategy: string; mode: string;
@@ -97,18 +97,39 @@ function loadConfig(file: string | undefined): BtcCfg {
   return cfg;
 }
 
-interface Args { days: number[]; entry: number; out: string; configFile?: string; edgesUniversal: boolean }
+type EdgeMode = 'legacy' | 'universal' | 'fallback';
+interface Args {
+  days: number[]; entry: number; out: string; configFile?: string;
+  edgeMode: EdgeMode; armOnEdge: boolean;
+  // arm-trigger filters (sim-only flags, NOT live code yet).
+  armStreakMax?: number;                // skip arm if streak > this
+  armBody3Max?: number;                 // skip arm if body3 > this (caps momentum bars)
+  armPriorVolSkip?: [number, number];   // skip arm if prior 1h vol in [lo, hi]
+  armPriorVolRange?: [number, number];  // arm ONLY if prior 1h vol in [lo, hi]
+}
 function parseArgs(): Args {
   const here = path.dirname(fileURLToPath(import.meta.url));
-  const a: Args = { days: [90, 180, 365], entry: 0.55, out: path.join(here, 'results', 'backtest-prod-config.md'), edgesUniversal: false };
+  const a: Args = { days: [90, 180, 365], entry: 0.55, out: path.join(here, 'results', 'backtest-prod-config.md'), edgeMode: 'legacy', armOnEdge: false };
   for (const arg of process.argv.slice(2)) {
-    if (arg === '--edges-universal') { a.edgesUniversal = true; continue; }
+    if (arg === '--edges-universal') { a.edgeMode = 'universal'; continue; }
+    if (arg === '--edges-fallback')  { a.edgeMode = 'fallback';  continue; }
+    if (arg === '--arm-on-edge')     { a.armOnEdge = true; continue; }
     const eq = arg.indexOf('='); if (eq < 0) continue;
     const k = arg.slice(2, eq), v = arg.slice(eq + 1);
     if (k === 'days')  a.days = v.split(',').map(Number);
     else if (k === 'entry') a.entry = Number(v);
     else if (k === 'out')   a.out = path.isAbsolute(v) ? v : path.join(here, v);
     else if (k === 'config-file') a.configFile = path.isAbsolute(v) ? v : path.join(here, v);
+    else if (k === 'arm-streak-max') a.armStreakMax = Number(v);
+    else if (k === 'arm-body3-max')  a.armBody3Max = Number(v);
+    else if (k === 'arm-skip-vol') {
+      const [lo, hi] = v.split(',').map(Number);
+      a.armPriorVolSkip = [lo ?? 0, hi ?? 1e9];
+    }
+    else if (k === 'arm-vol-range') {
+      const [lo, hi] = v.split(',').map(Number);
+      a.armPriorVolRange = [lo ?? 0, hi ?? 1e9];
+    }
     else { console.error(`unknown arg: --${k}`); process.exit(1); }
   }
   return a;
@@ -142,12 +163,20 @@ interface Trade { ts: number; mode: Mode; edgeLabel?: string; dcaRound: number; 
 
 /** Full prod-faithful echo walk. Records trades whose bet bar ts >= recordFrom
  *  (state warms up from before that). */
-function simulate(bars: Bar[], streakLen: number[], entry: number, recordFrom: number, c: BtcCfg, edgesUniversal: boolean): Trade[] {
+function simulate(
+  bars: Bar[], streakLen: number[], entry: number, recordFrom: number,
+  c: BtcCfg, edgeMode: EdgeMode, armOnEdge: boolean,
+  armStreakMax: number | undefined, armBody3Max: number | undefined,
+  armPriorVolSkip: [number, number] | undefined,
+  armPriorVolRange: [number, number] | undefined,
+): Trade[] {
   const armDurMs = c.echo_window_minutes * 60_000;
   const dcaScaleIdle = c.echo_dca_scale_idle.length ? c.echo_dca_scale_idle : c.echo_dca_scale;
   const trades: Trade[] = [];
   let armUntilTs = 0;
   let j = 3;
+  // Diagnostic: arm triggers by streak (counts only bars at ts >= recordFrom).
+  const armTrigByStreak = new Map<number, number>();
   while (j + 1 < bars.length) {
     const s = streakLen[j-1]!;
     const regime = bars[j-1]!.dir;
@@ -158,35 +187,78 @@ function simulate(bars: Bar[], streakLen: number[], entry: number, recordFrom: n
 
     // armed decided from PRIOR triggers (arm applies from NEXT window).
     const armed = bars[j]!.ts < armUntilTs;
-    // register this bar's arm trigger (gated by arm_trigger_body3_min).
-    if (s >= c.echo_trigger_streak && body3 >= c.arm_trigger_body3_min) {
+    // Discovery filters (CLI-only flags, NOT in live worker code yet):
+    //   --arm-streak-max=N    → skip arm if streak > N (avoids over-extension trap)
+    //   --arm-body3-max=N     → skip arm if body3 > N (caps extreme-momentum bars)
+    //   --arm-skip-vol=lo,hi  → skip arm if prior 1h vol IN [lo,hi]
+    //   --arm-vol-range=lo,hi → arm ONLY if prior 1h vol IN [lo,hi]
+    let triggerOk = s >= c.echo_trigger_streak && body3 >= c.arm_trigger_body3_min;
+    if (triggerOk && armStreakMax != null && s > armStreakMax) triggerOk = false;
+    if (triggerOk && armBody3Max  != null && body3 > armBody3Max) triggerOk = false;
+    if (triggerOk && (armPriorVolSkip || armPriorVolRange)) {
+      let pv = 0;
+      const lo = Math.max(0, j - 13);
+      for (let k = lo; k < j - 1; k++) pv += Math.abs(bars[k]!.close - bars[k]!.open);
+      if (armPriorVolSkip  && pv >= armPriorVolSkip[0]  && pv < armPriorVolSkip[1])  triggerOk = false;
+      if (armPriorVolRange && (pv < armPriorVolRange[0] || pv >= armPriorVolRange[1])) triggerOk = false;
+    }
+    if (triggerOk) {
       armUntilTs = Math.max(armUntilTs, bars[j-1]!.ts + armDurMs);
+      if (bars[j-1]!.ts >= recordFrom) {
+        armTrigByStreak.set(s, (armTrigByStreak.get(s) ?? 0) + 1);
+      }
     }
 
     let mode: Mode | null = null;
     let edgeLabel: string | undefined;
     let entryBody = 0, dcaBody = 0, dcaScale: readonly number[] = [];
-    // Universal-edge semantics: try edge match FIRST regardless of armed/threshold.
-    if (edgesUniversal) {
+
+    const tryEdge = (): boolean => {
       for (const ec of c.echo_edge_cases) {
         if (!ec.enabled || s < ec.streakMin || s > ec.streakMax || body3 < ec.body3Min) continue;
+        if (ec.body3Max != null && body3 > ec.body3Max) continue;
         mode = 'edge'; edgeLabel = ec.label; entryBody = 0; dcaBody = ec.dcaBody3Min;
         dcaScale = armed ? c.echo_dca_scale : dcaScaleIdle;
-        break;
+        return true;
       }
-    }
+      return false;
+    };
+
+    // universal: edge FIRST (takes precedence over normal when both match).
+    if (edgeMode === 'universal') tryEdge();
+
+    // normal gates.
     if (!mode && armed && s >= c.echo_signal_min_streak) {
       mode = 'armed'; entryBody = c.armed_body3_min; dcaBody = c.dca_body3_min_armed; dcaScale = c.echo_dca_scale;
     } else if (!mode && !armed && s >= c.echo_baseline_streak) {
       mode = 'idle'; entryBody = c.idle_body3_min; dcaBody = c.dca_body3_min_idle; dcaScale = dcaScaleIdle;
-    } else if (!mode && !armed && !edgesUniversal) {
-      // Legacy semantics: edges only when idle + streak < baseline.
-      for (const ec of c.echo_edge_cases) {
-        if (!ec.enabled || s < ec.streakMin || s > ec.streakMax || body3 < ec.body3Min) continue;
-        mode = 'edge'; edgeLabel = ec.label; entryBody = 0; dcaBody = ec.dcaBody3Min; dcaScale = dcaScaleIdle;
-        break;
+    } else if (!mode && !armed && edgeMode === 'legacy') {
+      // legacy: edges only when idle + streak < baseline.
+      tryEdge();
+    }
+
+    // fallback: if normal didn't pass body3 either, try edge as rescue.
+    if (mode && mode !== 'edge' && body3 < entryBody && edgeMode === 'fallback') {
+      mode = null; entryBody = 0;
+      tryEdge();
+    } else if (!mode && edgeMode === 'fallback') {
+      // streak gate failed in armed/idle → still try edge.
+      tryEdge();
+    }
+
+    // arm-on-edge: edge fire ALSO arms (in addition to the streak>=trigger rule above).
+    // Captures the case streak3/streak4 edges fire but streak<5 means the normal arm
+    // trigger wouldn't fire — under this flag, the edge fire itself counts as a trigger.
+    if (armOnEdge && mode === 'edge') {
+      const streakPathArmed = (s >= c.echo_trigger_streak && body3 >= c.arm_trigger_body3_min);
+      const newArm = bars[j-1]!.ts + armDurMs;
+      if (newArm > armUntilTs) armUntilTs = newArm;
+      if (!streakPathArmed && bars[j-1]!.ts >= recordFrom) {
+        // separately track edge-only arms (negate the key to distinguish in the report)
+        armTrigByStreak.set(-s, (armTrigByStreak.get(-s) ?? 0) + 1);
       }
     }
+
     if (!mode) { j++; continue; }
     if (mode !== 'edge' && body3 < entryBody) { j++; continue; }
 
@@ -224,6 +296,16 @@ function simulate(bars: Bar[], streakLen: number[], entry: number, recordFrom: n
     }
     j = curJ + 1;
   }
+  if (armTrigByStreak.size > 0) {
+    const streakPath = [...armTrigByStreak.entries()].filter(([s])=>s>0);
+    const edgePath   = [...armTrigByStreak.entries()].filter(([s])=>s<0);
+    const sTot = streakPath.reduce((a,[,n])=>a+n,0);
+    const eTot = edgePath.reduce((a,[,n])=>a+n,0);
+    const sStr = streakPath.sort((a,b)=>a[0]-b[0]).map(([s,n])=>`s=${s}:${n}`).join(' ');
+    const eStr = edgePath.sort((a,b)=>b[0]-a[0]).map(([s,n])=>`s=${-s}:${n}`).join(' ');
+    process.stderr.write(`  arm via streak-path (s>=${c.echo_trigger_streak},body3>=${c.arm_trigger_body3_min}): ${sTot} · ${sStr}\n`);
+    if (eTot > 0) process.stderr.write(`  arm via EDGE-path (extra ${armOnEdge?'enabled':'?'}): ${eTot} · ${eStr}\n`);
+  }
   return trades;
 }
 
@@ -254,7 +336,8 @@ async function run(): Promise<void> {
   const now = Date.now();
   const periods = a.days.sort((x, y) => x - y).map(d => {
     const cutoff = now - d * 86400_000;
-    const tr = simulate(bars, streakLen, a.entry, cutoff, cfg, a.edgesUniversal);
+    const tr = simulate(bars, streakLen, a.entry, cutoff, cfg, a.edgeMode, a.armOnEdge,
+      a.armStreakMax, a.armBody3Max, a.armPriorVolSkip, a.armPriorVolRange);
     const inPeriod = bars.filter(b => b.ts >= cutoff).length;
     const byMode = (m: Mode, dca: 'base'|'dca') =>
       stats(tr.filter(t => t.mode === m && (dca === 'base' ? t.dcaRound === 0 : t.dcaRound >= 1)));

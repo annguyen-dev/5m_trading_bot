@@ -59,6 +59,14 @@ export interface EchoEdgeCase {
   /** |body3| floor (price USD, last 3 closed bars + in-progress at T-3s)
    *  for entry. */
   body3Min:     number;
+  /** Optional upper bound on body3 for this case to match. Used to skip the
+   *  "high-momentum continuation" regime where the streak is still in trend
+   *  rather than exhaustion. Empirically (BTC 365d): at streak=5 with body3
+   *  >$700, P(reversal)=46.5% (trap); momentum runs ~2 more bars before
+   *  exhausting at streak=7 (62-82% reversal). Capping streak5 edge body3
+   *  ≤700 makes the bot wait for the streak7 edge instead. Streak3/4 don't
+   *  show this trap pattern (body3>700 still ≥55% reversal). */
+  body3Max?:    number;
   /** |body3| floor for DCA placement when this case opened the cycle.
    *  Typically lower than body3Min (averaging-down accepts weaker signal). */
   dcaBody3Min:  number;
@@ -243,6 +251,20 @@ export interface CoinConfig {
    * throws away that best band — a more defensive, lower-profit choice.)
    */
   arm_trigger_body3_min: number;
+  /** Optional max |body3| for arm trigger. Skip arming when body3 > this —
+   *  these bars are momentum-continuation (streak still trending, not
+   *  exhausted). Empirical (BTC 365d, momentum lifetime analysis): at
+   *  streak=5 + body3>$700, P(reversal next bar)=46.5%; reversal lift only
+   *  shows up at streak=7 (62-82%). Capping arm body3≤700 makes the bot
+   *  wait through the momentum continuation and arm only on the eventual
+   *  exhaustion. 0 / undefined = no cap (prior behaviour).
+   *  See apps/api/scripts/analyze-momentum-lifetime.ts. */
+  arm_trigger_body3_max?: number;
+  /** Optional max streak for arm trigger. Skip arming when streak > this —
+   *  empirically (BTC 365d) streak ≥9 has P(rev)=47% (over-extension trap,
+   *  trend continues). Backtest shows streak_max=8 lift PnL +$29/yr and
+   *  cuts DD on top of armT=350. 0 / undefined = no cap. */
+  arm_trigger_streak_max?: number;
   /** Minimum |body3| for DCA placement when the CYCLE was opened in IDLE mode
    *  (state.cycleMode === 'idle'). Recomputed at the NEW boundary, after the
    *  loss extended the streak. 0 = disabled. */
@@ -327,7 +349,9 @@ export const PER_COIN_OVERRIDES: Partial<Record<CoinSymbol, Partial<CoinConfig>>
   BTC: {
     idle_body3_min:              400,
     armed_body3_min:             300,
-    arm_trigger_body3_min:       100,
+    arm_trigger_body3_min:       350,
+    arm_trigger_body3_max:       700,
+    arm_trigger_streak_max:      8,
     dca_body3_min_idle:          200,
     dca_body3_min_armed:         150,
   },
