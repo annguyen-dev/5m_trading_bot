@@ -29,6 +29,7 @@ import {
   getTelegramChannels, channelMatches,
   type TelegramChannel, type TelegramInfoType,
 } from './telegramChannels.js';
+import { COIN_META, type CoinSymbol } from './CoinConfig.js';
 
 const CACHE_TTL_MS = 30_000;
 
@@ -160,51 +161,80 @@ export class TelegramService {
 // ── Formatters (HTML parse mode — simpler than MarkdownV2 escaping) ────────
 
 const WINDOW_MS = 5 * 60_000;
+const VN_OFFSET_MS = 7 * 60 * 60_000;   // UTC+7 (Vietnam) for display
 
-/** Format a window time range as "HH:MM-HH:MM" (local time). */
+/** Format a window time range as "HH:MM-HH:MM" in UTC+7 (Vietnam). */
 function fmtWindow(start: number, end: number): string {
   const hhmm = (ms: number) => {
-    const d = new Date(ms);
-    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    const d = new Date(ms + VN_OFFSET_MS);   // shift then read UTC parts (tz-agnostic)
+    return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
   };
   return `${hhmm(start)}-${hhmm(end)}`;
+}
+
+/** Display label per coin: "BTC_5m", "ETH_5m", "BTC_1h" (timeframe from COIN_META). */
+function coinLabel(coin: CoinSymbol | string): string {
+  const meta = COIN_META[coin as CoinSymbol];
+  const tf = meta ? meta.binanceInterval : '5m';
+  const base = String(coin).replace(/_1H$/i, '');
+  return `${base}_${tf}`;
+}
+
+/** Streak chain string: past icons + a separator + current in-progress icon. */
+function streakChain(pastIcons: string, currentIcon: string): string {
+  return `${pastIcons}${currentIcon ? ` ${currentIcon}` : ''}`;
 }
 
 function formatT4(ev: SignalT4Event): string {
   const dirIcon  = ev.direction === 'up' ? '🟢' : '🔴';
   const dirLabel = ev.direction.toUpperCase();
   const priceStr = ev.price != null ? `${(ev.price * 100).toFixed(1)}¢` : '?';
-  const modeTag  = ev.mode === 'signal_and_order' ? '<i>will auto-order</i>' : '<i>signal-only</i>';
-  const volStr   = ev.streakVolumeBuckets?.length
-    ? `vol: ${ev.streakVolumeBuckets.join(' ')}`
-    : '';
+  const modeTag  = ev.mode === 'signal_and_order' ? 'will auto-order' : 'signal-only';
+  const body3Str = ev.body3Sum != null ? `$${ev.body3Sum.toFixed(0)}` : '?';
+  // Layout (streak chain first), per user request:
+  //   BTC_5m: 🔴🔴🔴 🔴   ← T+4 PREVIEW
+  //   window: 04:55-05:00, streak: -3, body3: $502
+  //   signal: 🟢 UP @ 30¢ · $6 · will auto-order
   return [
-    `<b>${ev.coin}</b> · <b>T+4</b> · <code>${fmtWindow(ev.windowStart, ev.windowEnd)}</code> · streak ${fmtStreak(ev.streak)}`,
-    `past: ${ev.pastStreakIcons}  current: ${ev.currentIcon}`,
-    volStr,
-    `signal: ${dirIcon} <b>${dirLabel}</b> @ ${priceStr} · $${ev.sizeUsdc}`,
-    `limit ${ev.limitCents}¢ · ${modeTag}`,
-  ].filter(Boolean).join('\n');
+    `<b>${coinLabel(ev.coin)}</b>: ${streakChain(ev.pastStreakIcons, ev.currentIcon)}   <i>T+4 preview</i>`,
+    `window: <code>${fmtWindow(ev.windowStart, ev.windowEnd)}</code>, streak: <b>${ev.streak}</b>, body3: ${body3Str}`,
+    `signal: ${dirIcon} <b>${dirLabel}</b> @ ${priceStr} · $${ev.sizeUsdc} · <i>${modeTag}</i>`,
+  ].join('\n');
 }
 
 function formatTMinus3(ev: SignalTMinus3Event): string {
-  const base   = `<b>${ev.coin}</b> · <b>T-3s</b> · <code>${fmtWindow(ev.windowStart, ev.windowEnd)}</code>`;
-  const dcaTag = ev.signalPath === 'dca' ? ' · 🔄 <b>DCA</b>' : '';
-  const lateTag = ev.lateRetry ? ' · ⏰ <i>T-0 retry</i>' : '';
-  const adaptiveLine = ev.adaptive && (ev.adaptive.mode !== 'default' || ev.adaptive.threshold !== ev.adaptive.base)
-    ? `\n📊 auto_min=<b>${ev.adaptive.threshold}</b> (base ${ev.adaptive.base}, <i>${ev.adaptive.mode}</i>) — ${escapeHtml(ev.adaptive.reason)}`
-    : '';
+  const win      = fmtWindow(ev.windowStart, ev.windowEnd);
+  const type     = ev.signalPath === 'dca' ? 'dca' : 'boundary';
+  const lateTag  = ev.lateRetry ? ' · ⏰ <i>T-0 retry</i>' : '';
+  const body3Str = ev.body3Sum != null ? `$${ev.body3Sum.toFixed(0)}` : '?';
+  const matchCase = ev.matchCase ?? (ev.adaptive ? ev.adaptive.mode.replace('aggressive','armed').replace('default','idle').replace('conservative','idle-chain') : '?');
+
   switch (ev.action) {
-    case 'order_placed':
-      return [
-        `${base}${dcaTag}${lateTag}`,
-        `✅ <b>ORDER PLACED</b>: ${(ev.direction ?? '?').toUpperCase()} @ ${ev.price != null ? (ev.price * 100).toFixed(1) + '¢' : '?'} · $${ev.sizeUsdc ?? '?'}`,
-        ev.orderId ? `id: <code>${escapeHtml(ev.orderId.slice(0, 8))}…</code>` : '',
-      ].filter(Boolean).join('\n') + adaptiveLine;
+    case 'order_placed': {
+      const dirIcon = ev.direction === 'up' ? '🟢' : ev.direction === 'down' ? '🔴' : '⚪';
+      const priceStr = ev.price != null ? `${(ev.price * 100).toFixed(1)}¢` : '?';
+      // Layout per user request — streak chain first, then context lines.
+      //   BTC_5m: 🔴🔴🔴 🔴   ✅ FIRE
+      //   window: 04:55-05:00, streak: -4, body3: $502
+      //   match case: streak4   |   type: boundary
+      //   ✅ 🟢 UP @ 30¢ · $6 · id ab12cd…
+      const lines = [
+        `<b>${coinLabel(ev.coin)}</b>: ${streakChain(ev.pastStreakIcons ?? '', ev.currentIcon ?? '')}   ✅ <b>FIRE</b>${lateTag}`,
+        `window: <code>${win}</code>, streak: <b>${ev.streak ?? '?'}</b>, body3: ${body3Str}`,
+        `match case: <b>${escapeHtml(matchCase)}</b>   |   type: <b>${type}</b>`,
+        `${dirIcon} <b>${(ev.direction ?? '?').toUpperCase()}</b> @ ${priceStr} · $${ev.sizeUsdc ?? '?'}`
+          + (ev.orderId ? ` · id <code>${escapeHtml(ev.orderId.slice(0, 8))}…</code>` : ''),
+      ];
+      return lines.join('\n');
+    }
     case 'order_skipped':
-      return `${base}${dcaTag}\n⚠ <b>skipped</b>: ${escapeHtml(ev.reason ?? '(no reason)')}${adaptiveLine}`;
+      return [
+        `<b>${coinLabel(ev.coin)}</b>: ${streakChain(ev.pastStreakIcons ?? '', ev.currentIcon ?? '')}   ⚠ <b>SKIP</b>`,
+        `window: <code>${win}</code>, streak: <b>${ev.streak ?? '?'}</b>, body3: ${body3Str}  ·  type: ${type}`,
+        `reason: ${escapeHtml(ev.reason ?? '(no reason)')}`,
+      ].join('\n');
     case 'signal_only_mode':
-      return `${base}\nℹ signal-only mode, no order placed`;
+      return `<b>${coinLabel(ev.coin)}</b> · <code>${win}</code>\nℹ signal-only mode, no order placed`;
   }
 }
 
@@ -216,7 +246,7 @@ function formatT0Plus(ev: SignalT0PlusEvent): string {
   const o = ev.order;
   const dcaTag = o.signalPath === 'dca' ? ' · 🔄 DCA' : '';
   return [
-    `<b>${ev.coin}</b> · <b>T+0</b> · <code>${fmtWindow(ev.windowStart, ev.windowEnd)}</code> · 🎯 active order${dcaTag}`,
+    `<b>${coinLabel(ev.coin)}</b> · <b>T+0</b> · <code>${fmtWindow(ev.windowStart, ev.windowEnd)}</code> · 🎯 active order${dcaTag}`,
     `${o.direction.toUpperCase()} @ ${(o.entryPrice * 100).toFixed(1)}¢ · $${o.sizeUsdc} · `
       + `id <code>${escapeHtml(o.orderId.slice(0, 8))}…</code>`,
   ].join('\n');
@@ -235,7 +265,7 @@ function formatT0(ev: SignalT0Event): string {
     const pnlStr = `PnL ${o.pnlUsdc >= 0 ? '+' : ''}$${o.pnlUsdc.toFixed(2)}`;
     const dcaTag = o.signalPath === 'dca' ? ' · 🔄 DCA' : '';
     lines.push(
-      `<b>${ev.coin}</b> · <b>T-0</b> · <code>${winLabel}</code> · ${outIcon} ${ev.outcome.toUpperCase()} · ${pnlStr}${dcaTag}`,
+      `<b>${coinLabel(ev.coin)}</b> · <b>T-0</b> · <code>${winLabel}</code> · ${outIcon} ${ev.outcome.toUpperCase()} · ${pnlStr}${dcaTag}`,
       `entry ${(o.entryPrice * 100).toFixed(1)}¢ → exit ${(o.exitPrice * 100).toFixed(1)}¢ · `
         + `<code>${escapeHtml(o.orderId.slice(0, 8))}…</code>`,
     );
@@ -259,14 +289,14 @@ function formatT0(ev: SignalT0Event): string {
   } else if (ev.cancelled) {
     const c = ev.cancelled;
     lines.push(
-      `<b>${ev.coin}</b> · <b>T-0</b> · <code>${winLabel}</code> · ${outIcon} ${ev.outcome.toUpperCase()}`,
+      `<b>${coinLabel(ev.coin)}</b> · <b>T-0</b> · <code>${winLabel}</code> · ${outIcon} ${ev.outcome.toUpperCase()}`,
       `🚫 <b>CANCELLED</b> N+1 order (<code>${nextWin}</code>, current reversed): `
         + `exit ${(c.exitPrice * 100).toFixed(1)}¢ · `
         + `PnL ${c.pnlUsdc >= 0 ? '+' : ''}$${c.pnlUsdc.toFixed(2)}`,
     );
   } else {
     lines.push(
-      `<b>${ev.coin}</b> · <b>T-0</b> · <code>${winLabel}</code> · ${outIcon} ${ev.outcome.toUpperCase()}`,
+      `<b>${coinLabel(ev.coin)}</b> · <b>T-0</b> · <code>${winLabel}</code> · ${outIcon} ${ev.outcome.toUpperCase()}`,
     );
   }
   return lines.join('\n');
@@ -283,7 +313,7 @@ function formatStreakMismatch(ev: SignalStreakDataMismatchEvent): string {
   const binIcon  = ev.binanceDirection === 'up' ? '🟢' : '🔴';
   const polyIcon = ev.polyDirection    === 'up' ? '🟢' : '🔴';
   return [
-    `⚠ <b>${ev.coin}</b> · Binance/Poly mismatch · <code>${winLabel}</code>`,
+    `⚠ <b>${coinLabel(ev.coin)}</b> · Binance/Poly mismatch · <code>${winLabel}</code>`,
     `Binance: ${binIcon} ${ev.binanceDirection.toUpperCase()} (close-open ${moveSign}${ev.binanceMovePct.toFixed(3)}%)`
       + (tinyMove ? ' <i>tiny move</i>' : ''),
     `Polymarket: ${polyIcon} ${ev.polyDirection.toUpperCase()}`,

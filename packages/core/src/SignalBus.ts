@@ -98,6 +98,16 @@ export interface SignalTMinus3Event {
   reason?:       string;     // e.g. "ask 60¢ > limit 54¢"
   /** 'boundary' = normal contrarian entry; 'dca' = previous_size × dca_multiplier after a prior loss. */
   signalPath?:   'boundary' | 'dca';
+  /** Signed streak at the placement decision (from the cached T+4). */
+  streak?:       number;
+  /** Streak-window icons (🟢/🔴), oldest→newest, from the cached T+4. */
+  pastStreakIcons?: string;
+  /** In-progress candle icon at decision time. */
+  currentIcon?:  string;
+  /** body3 sum (price USD) used by the body gate at the placement decision. */
+  body3Sum?:     number;
+  /** Which gate matched: 'idle' | 'armed' | edge-case label (e.g. 'streak4'). */
+  matchCase?:    string;
   /** True if this placement was retried at T-0 of N (after T-3s failed gates). */
   lateRetry?:    boolean;
   /**

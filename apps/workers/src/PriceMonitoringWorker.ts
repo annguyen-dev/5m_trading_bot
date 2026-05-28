@@ -1323,6 +1323,12 @@ export class PriceMonitoringWorker {
         ...(result.price    != null ? { price:    result.price }    : {}),
         ...(result.sizeUsdc != null ? { sizeUsdc: result.sizeUsdc } : {}),
         signalPath: 'boundary',
+        // Context for the Telegram card: streak chain, body3, matched gate.
+        streak:          t4.streak,
+        pastStreakIcons: t4.pastStreakIcons,
+        currentIcon:     t4.currentIcon,
+        ...(t4.body3Sum != null ? { body3Sum: t4.body3Sum } : {}),
+        ...(result.matchCase ? { matchCase: result.matchCase } : {}),
         ...(result.adaptive ? { adaptive: result.adaptive } : {}),
         emittedAt: Date.now(),
       });
@@ -1371,6 +1377,8 @@ export class PriceMonitoringWorker {
     price?:    number;
     sizeUsdc?: number;
     signalPath?: 'boundary' | 'dca';
+    /** Which gate matched the entry: edge-case label, or 'armed' / 'idle'. */
+    matchCase?: string;
     adaptive?: {
       base:      number;
       threshold: number;
@@ -1673,6 +1681,9 @@ export class PriceMonitoringWorker {
         price:     ask,
         sizeUsdc:  orderSize,
         signalPath,
+        matchCase: matchedEdgeCase ? (matchedEdgeCase.label ?? matchedEdgeCase.id)
+                 : armedMode        ? 'armed'
+                 :                    'idle',
         adaptive,
       };
     } catch (err) {
