@@ -2098,15 +2098,45 @@ export class PriceMonitoringWorker {
           state.cycleEdgeCaseId    = null;
         state.cycleOrderId       = null;
         } else {
-          // Chart continued streak. Fire DCA if conditions pass. The
-          // function's internal gates (body3, whitelist, direction
-          // continuity) will silent-skip if not appropriate.
+          // Chart continued streak. Fire DCA if conditions pass — UNLESS the
+          // echo DCA budget is exhausted/disabled, in which case RESET the
+          // cycle so the NEXT window can take a fresh gated entry (idle
+          // baseline / edge case) instead of holding a spent cycle through
+          // subsequent windows.
           //
-          // For phantom-win callers (Poly outcome === cycleDirection but
-          // Binance bar continued), we pass `effectiveDir` as the verified
-          // outcome — which IS opposite cycleDirection by construction
-          // here, so DCA's outcome===direction sanity gate is satisfied.
-          await this.tryPlaceDcaAtBoundary(state, cfg, windowStart, effectiveDir);
+          // Why reset on exhaustion (user-requested 2026-05-28): a held,
+          // DCA-exhausted cycle blocks fresh entries. On 2026-05-27 21:55 UTC
+          // a streak4 cycle (entry + 1 DCA, both lost) stayed active through
+          // the streak6 window, blocking a fresh fade there. Resetting frees
+          // the bot. Also aligns live with the backtest sim, which re-enters
+          // on the bar after a DCA chain (j = curJ+1). NOTE: the fresh entry
+          // still passes ALL gates — Gate 1 (current-bar alignment) rejects
+          // when the streak is breaking, so we only re-enter on a genuinely
+          // continuing streak that meets baseline/edge + body3.
+          const dcaScale = (state.cycleMode === 'idle' && (cfg.echo_dca_scale_idle ?? []).length > 0)
+            ? (cfg.echo_dca_scale_idle ?? [])
+            : (cfg.echo_dca_scale ?? []);
+          const dcaExhausted = cfg.strategy === 'echo'
+            && (dcaScale.length === 0 || state.dcaFiredCount >= dcaScale.length);
+          if (dcaExhausted) {
+            log('info', `cycle reset (echo DCA exhausted, streak continued) — free for fresh entry ${state.symbol}`, {
+              windowStart, cycleDirection: state.cycleDirection,
+              dcaFiredCount: state.dcaFiredCount, scaleLen: dcaScale.length,
+            });
+            state.cycleActive        = false;
+            delete state.cycleDirection;
+            state.lastCycleOrderSize = null;
+            state.dcaFiredCount      = 0;
+            state.cycleMode          = null;
+            state.cycleEdgeCaseId    = null;
+            state.cycleOrderId       = null;
+          } else {
+            // For phantom-win callers (Poly outcome === cycleDirection but
+            // Binance bar continued), we pass `effectiveDir` as the verified
+            // outcome — which IS opposite cycleDirection by construction
+            // here, so DCA's outcome===direction sanity gate is satisfied.
+            await this.tryPlaceDcaAtBoundary(state, cfg, windowStart, effectiveDir);
+          }
         }
       }
     }
