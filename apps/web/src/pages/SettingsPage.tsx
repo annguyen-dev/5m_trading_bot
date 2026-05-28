@@ -184,10 +184,10 @@ function CoinRow({
   // Echo params validate independently — even when strategy=streak we keep them
   // in valid range so toggling to echo doesn't suddenly require fixing values.
   const echoValid =
-       draft.echo_trigger_streak    >= 1 && draft.echo_trigger_streak    <= 20
-    && draft.echo_window_minutes    >= 1 && draft.echo_window_minutes    <= 240
-    && draft.echo_signal_min_streak >= 1 && draft.echo_signal_min_streak <= 20
-    && draft.echo_baseline_streak   >= 1 && draft.echo_baseline_streak   <= 20
+       draft.echo_trigger_streak    >= 1 && draft.echo_trigger_streak    <= 99
+    && draft.echo_window_minutes    >= 1 && draft.echo_window_minutes    <= 1440
+    && draft.echo_signal_min_streak >= 1 && draft.echo_signal_min_streak <= 99
+    && draft.echo_baseline_streak   >= 1 && draft.echo_baseline_streak   <= 99
     && draft.echo_signal_min_streak <= draft.echo_baseline_streak
     && (draft.echo_dca_scale ?? []).every(s => Number.isFinite(s) && s >= 1 && s <= 20);
 
@@ -427,15 +427,15 @@ function CoinRow({
                        title="Idle baseline threshold — bot uses this when NOT armed (between trigger events).">
                   Baseline ≥{' '}
                   <NumInput value={draft.echo_baseline_streak}
-                            min={draft.echo_signal_min_streak} max={20}
+                            min={draft.echo_signal_min_streak} max={99}
                             disabled={saving || !draft.enabled}
                             onChange={v => setDraft({ ...draft, echo_baseline_streak: v })} />
                 </label>
                 <label style={S.echoLabel}
-                       title="Streak length that, when it ENDS, opens the arm window.">
+                       title="Streak length that, when it ENDS, opens the arm window. Use 99 to effectively disable arming (no streak will reach it).">
                   Trigger ≥{' '}
                   <NumInput value={draft.echo_trigger_streak}
-                            min={3} max={20}
+                            min={3} max={99}
                             disabled={saving || !draft.enabled}
                             onChange={v => setDraft({ ...draft, echo_trigger_streak: v })} />
                 </label>
@@ -448,10 +448,10 @@ function CoinRow({
                             onChange={v => setDraft({ ...draft, echo_signal_min_streak: v })} />
                 </label>
                 <label style={S.echoLabel}
-                       title="How long the arm window stays open after a trigger streak ends.">
+                       title="How long the arm window stays open after a trigger streak ends. Max 1440min (24h) for 1h coins.">
                   Arm window (min){' '}
                   <NumInput value={draft.echo_window_minutes}
-                            min={5} max={240}
+                            min={5} max={1440}
                             disabled={saving || !draft.enabled}
                             onChange={v => setDraft({ ...draft, echo_window_minutes: v })} />
                 </label>

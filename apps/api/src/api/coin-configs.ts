@@ -115,10 +115,13 @@ const patchSchema = z.object({
   dca_streak_whitelist:  z.array(z.number().int().min(2).max(20)).max(20).optional(),
   // Echo Hunt params (only relevant when strategy='echo'). Loose ranges —
   // the FE enforces logical relationships (signal ≤ trigger ≤ disable).
-  echo_trigger_streak:    z.number().int().min(1).max(20).optional(),
-  echo_window_minutes:    z.number().int().min(1).max(240).optional(),
-  echo_signal_min_streak: z.number().int().min(1).max(20).optional(),
-  echo_baseline_streak:   z.number().int().min(1).max(20).optional(),
+  // Bounds upper bumped 20→99 and 240→1440 to support 1h coins where user
+  // may set sentinel values like 99 (= never trigger / disable a path) and
+  // arm windows up to 24h. Real values for 5m typically stay in single digits.
+  echo_trigger_streak:    z.number().int().min(1).max(99).optional(),
+  echo_window_minutes:    z.number().int().min(1).max(1440).optional(),
+  echo_signal_min_streak: z.number().int().min(1).max(99).optional(),
+  echo_baseline_streak:   z.number().int().min(1).max(99).optional(),
   echo_require_high_body: z.boolean().optional(),
   echo_edge_cases:        z.array(z.object({
     id:          z.string().min(1).max(64),
