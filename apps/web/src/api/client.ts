@@ -447,6 +447,10 @@ export interface EchoEdgeCase {
   streakMin:    number;
   streakMax:    number;
   body3Min:     number;
+  /** Upper bound on body3 to filter out the momentum-continuation trap
+   *  zone (e.g. streak=5 body3>$700 on 5m has 46% reversal vs sweet spot
+   *  $400-700 at 61%). Empty / undefined = no cap. */
+  body3Max?:    number;
   dcaBody3Min:  number;
 }
 
@@ -601,6 +605,13 @@ export interface CoinConfigPatch {
   /** Body-3 arm-trigger gate: triggering streak's |body3| ≥ this to OPEN the
    *  arm window (gates arming, not placement). 0 = disabled (count only). */
   arm_trigger_body3_min:           number;
+  /** Body-3 arm-trigger UPPER cap: skip arming when body3 > this (momentum
+   *  continuation trap). Empirical (BTC 5m 365d): streak=5 body3>$700 →
+   *  reversal 46.5%, momentum exhausts at streak=7. Empty/0 = no cap. */
+  arm_trigger_body3_max?:          number;
+  /** Skip arming when streak > this (over-extension trap). Empirical (BTC 5m
+   *  365d): streak≥9 reverses only 47%. Empty/0 = no cap. */
+  arm_trigger_streak_max?:         number;
   /** Body-3 DCA gate when the cycle was opened in IDLE mode. 0 = disabled. */
   dca_body3_min_idle:              number;
   /** Body-3 DCA gate when the cycle was opened in ARMED mode. 0 = disabled. */

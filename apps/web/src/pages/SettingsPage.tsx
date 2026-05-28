@@ -168,6 +168,8 @@ function CoinRow({
     || (draft.idle_body3_min            ?? 0) !== (initial.idle_body3_min            ?? 0)
     || (draft.armed_body3_min           ?? 0) !== (initial.armed_body3_min           ?? 0)
     || (draft.arm_trigger_body3_min     ?? 0) !== (initial.arm_trigger_body3_min     ?? 0)
+    || (draft.arm_trigger_body3_max     ?? 0) !== (initial.arm_trigger_body3_max     ?? 0)
+    || (draft.arm_trigger_streak_max    ?? 0) !== (initial.arm_trigger_streak_max    ?? 0)
     || (draft.dca_body3_min_idle        ?? 0) !== (initial.dca_body3_min_idle        ?? 0)
     || (draft.dca_body3_min_armed       ?? 0) !== (initial.dca_body3_min_armed       ?? 0)
     || scheduleDirty
@@ -203,6 +205,8 @@ function CoinRow({
     && (draft.idle_body3_min            ?? 0) >= 0 && (draft.idle_body3_min            ?? 0) <= 10_000
     && (draft.armed_body3_min           ?? 0) >= 0 && (draft.armed_body3_min           ?? 0) <= 10_000
     && (draft.arm_trigger_body3_min     ?? 0) >= 0 && (draft.arm_trigger_body3_min     ?? 0) <= 10_000
+    && (draft.arm_trigger_body3_max     ?? 0) >= 0 && (draft.arm_trigger_body3_max     ?? 0) <= 10_000
+    && (draft.arm_trigger_streak_max    ?? 0) >= 0 && (draft.arm_trigger_streak_max    ?? 0) <= 20
     && (draft.dca_body3_min_idle        ?? 0) >= 0 && (draft.dca_body3_min_idle        ?? 0) <= 10_000
     && (draft.dca_body3_min_armed       ?? 0) >= 0 && (draft.dca_body3_min_armed       ?? 0) <= 10_000
     // Edge cases: each must have valid streak range + body3 thresholds.
@@ -210,6 +214,7 @@ function CoinRow({
          ec.streakMin >= 2 && ec.streakMin <= 20
       && ec.streakMax >= ec.streakMin && ec.streakMax <= 20
       && ec.body3Min    >= 0 && ec.body3Min    <= 10_000
+      && (ec.body3Max == null || (ec.body3Max >= ec.body3Min && ec.body3Max <= 10_000))
       && ec.dcaBody3Min >= 0 && ec.dcaBody3Min <= 10_000
     )
     && scheduleValid
@@ -247,6 +252,8 @@ function CoinRow({
         idle_body3_min:                  draft.idle_body3_min            ?? 0,
         armed_body3_min:                 draft.armed_body3_min           ?? 0,
         arm_trigger_body3_min:           draft.arm_trigger_body3_min     ?? 0,
+        ...(draft.arm_trigger_body3_max  != null && draft.arm_trigger_body3_max  > 0 ? { arm_trigger_body3_max:  draft.arm_trigger_body3_max  } : {}),
+        ...(draft.arm_trigger_streak_max != null && draft.arm_trigger_streak_max > 0 ? { arm_trigger_streak_max: draft.arm_trigger_streak_max } : {}),
         dca_body3_min_idle:              draft.dca_body3_min_idle        ?? 0,
         dca_body3_min_armed:             draft.dca_body3_min_armed       ?? 0,
       });
@@ -485,6 +492,22 @@ function CoinRow({
                             min={0} max={10_000} step={25}
                             disabled={saving || !draft.enabled}
                             onChange={v => setDraft({ ...draft, arm_trigger_body3_min: v })} />
+                </label>
+                <label style={S.echoLabel}
+                       title="Body-3 ARM-TRIGGER UPPER cap: skip arm when body3 > this (momentum-continuation trap). Empirical (BTC 5m 365d): streak=5 with body3>$700 → reversal 46.5% (loses); momentum exhausts at streak=7. Capping forces the bot to wait for the streak7 edge instead. Empty = no cap.">
+                  Arm trig ≤{' '}
+                  <NumInput value={draft.arm_trigger_body3_max ?? 0}
+                            min={0} max={10_000} step={25}
+                            disabled={saving || !draft.enabled}
+                            onChange={v => setDraft({ ...draft, arm_trigger_body3_max: v > 0 ? v : undefined })} />
+                </label>
+                <label style={S.echoLabel}
+                       title="Skip arm when streak > this (over-extension trap). Empirical (BTC 5m 365d): streak≥9 reverses only 47% — momentum continues, fade loses. 0 = no cap.">
+                  Arm streak ≤{' '}
+                  <NumInput value={draft.arm_trigger_streak_max ?? 0}
+                            min={0} max={20} step={1}
+                            disabled={saving || !draft.enabled}
+                            onChange={v => setDraft({ ...draft, arm_trigger_streak_max: v > 0 ? v : undefined })} />
                 </label>
               </div>
 
@@ -982,6 +1005,8 @@ function EdgeCaseEditor({
               <th style={{ textAlign: 'right', padding: '2px 6px' }}>streak min</th>
               <th style={{ textAlign: 'right', padding: '2px 6px' }}>streak max</th>
               <th style={{ textAlign: 'right', padding: '2px 6px' }}>body3 min ($)</th>
+              <th style={{ textAlign: 'right', padding: '2px 6px' }}
+                  title="Upper cap on body3 (trap filter). 0 = no cap.">body3 max ($)</th>
               <th style={{ textAlign: 'right', padding: '2px 6px' }}>DCA body3 min ($)</th>
               <th style={{ padding: '2px 6px' }}></th>
             </tr>
@@ -1023,6 +1048,13 @@ function EdgeCaseEditor({
                             min={0} max={10_000} step={25}
                             disabled={disabled}
                             onChange={v => update(ec.id, { body3Min: v })} />
+                </td>
+                <td style={{ padding: '2px 6px', textAlign: 'right' }}
+                    title="Upper cap on body3 (trap filter). Empty = no cap. Use when discovery shows a high-body3 zone reverses worse than mid-body3 (e.g. BTC 5m streak=5 body3>700 = 46% trap).">
+                  <NumInput value={ec.body3Max ?? 0}
+                            min={0} max={10_000} step={25}
+                            disabled={disabled}
+                            onChange={v => update(ec.id, { body3Max: v > 0 ? v : undefined })} />
                 </td>
                 <td style={{ padding: '2px 6px', textAlign: 'right' }}>
                   <NumInput value={ec.dcaBody3Min}
