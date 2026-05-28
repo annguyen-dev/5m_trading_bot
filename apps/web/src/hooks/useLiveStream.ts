@@ -100,7 +100,7 @@ export interface LiveStreamStats {
 
 // ── Multi-coin worker events (PriceMonitoringWorker → SignalBus → SSE) ─────
 
-export type CoinSymbol = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE' | 'HYPE' | 'BNB';
+export type CoinSymbol = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE' | 'HYPE' | 'BNB' | 'BTC_1H';
 export type VolumeBucket = 'low' | 'mid' | 'high' | 'extreme' | 'unknown';
 
 export interface OrderRef {
