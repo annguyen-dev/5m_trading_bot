@@ -2119,7 +2119,7 @@ export class PriceMonitoringWorker {
           const dcaExhausted = cfg.strategy === 'echo'
             && (dcaScale.length === 0 || state.dcaFiredCount >= dcaScale.length);
           if (dcaExhausted) {
-            log('info', `cycle reset (echo DCA exhausted, streak continued) — free for fresh entry ${state.symbol}`, {
+            log('info', `cycle reset (echo DCA exhausted, streak continued) — trying fresh boundary for N+1 ${state.symbol}`, {
               windowStart, cycleDirection: state.cycleDirection,
               dcaFiredCount: state.dcaFiredCount, scaleLen: dcaScale.length,
             });
@@ -2130,6 +2130,23 @@ export class PriceMonitoringWorker {
             state.cycleMode          = null;
             state.cycleEdgeCaseId    = null;
             state.cycleOrderId       = null;
+            // Re-enter as a FRESH cycle for the window that just opened (N+1)
+            // if the still-continuing streak independently meets idle baseline
+            // / an edge case + body3. tryPlaceBoundary targets t4.windowStart+1
+            // window, so the just-closed window's cached T+4 places for N+1.
+            // (User-requested 2026-05-28: a DCA-exhausted cycle should NOT
+            // forfeit a qualifying fresh setup. Verified missed WIN on
+            // 2026-05-27 21:55 UTC: effectiveStreak=6, body3=$502≥500, window
+            // closed UP → fade UP would have won, but cycle was active.)
+            // Idempotent via boundaryPlacementInFlight + hasAutoOrderFor.
+            if (state.lastT4 && state.lastT4.windowStart === windowStart) {
+              const fresh = await this.tryPlaceBoundary(state, cfg, state.lastT4);
+              if (fresh.placed) {
+                log('info', `fresh boundary placed after DCA exhaustion ${state.symbol}`, {
+                  windowStart, orderId: fresh.orderId, reason: fresh.adaptive?.reason,
+                });
+              }
+            }
           } else {
             // For phantom-win callers (Poly outcome === cycleDirection but
             // Binance bar continued), we pass `effectiveDir` as the verified
