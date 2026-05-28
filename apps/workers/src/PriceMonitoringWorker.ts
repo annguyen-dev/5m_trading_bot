@@ -82,12 +82,15 @@ const T_PLUS_0_END_MS = 5_000;   // T+0 phase = first tick of window
 /** Binance kline symbol per coin. HYPE is absent here on purpose — it's not
  *  reliably listed on Binance spot, so we route it to Pyth below. */
 const BINANCE_SYMBOL: Partial<Record<CoinSymbol, string>> = {
-  BTC:  'BTCUSDT',
-  ETH:  'ETHUSDT',
-  SOL:  'SOLUSDT',
-  XRP:  'XRPUSDT',
-  DOGE: 'DOGEUSDT',
-  BNB:  'BNBUSDT',
+  BTC:    'BTCUSDT',
+  ETH:    'ETHUSDT',
+  SOL:    'SOLUSDT',
+  XRP:    'XRPUSDT',
+  DOGE:   'DOGEUSDT',
+  BNB:    'BNBUSDT',
+  // BTC_1H shares the same Binance spot pair as BTC; only the kline interval
+  // differs (COIN_META[BTC_1H].binanceInterval='1h' vs BTC's '5m').
+  BTC_1H: 'BTCUSDT',
 };
 
 /** Pyth TradingView ticker per coin (fallback for coins not on Binance). */
