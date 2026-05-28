@@ -25,7 +25,7 @@ import { useLiveStream, type LiveMarket, type LiveShare,
          type VolumeBucket,
          type LiveStreamState } from '../hooks/useLiveStream.js';
 
-const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB'];
+const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB', 'BTC_1H'];
 
 const RANGES: PolyRange[] = ['5m', '15m', '1h', '1d', '3d'];
 
