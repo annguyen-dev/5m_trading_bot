@@ -215,6 +215,7 @@ function CoinRow({
       && ec.streakMax >= ec.streakMin && ec.streakMax <= 20
       && ec.body3Min    >= 0 && ec.body3Min    <= 10_000
       && (ec.body3Max == null || (ec.body3Max >= ec.body3Min && ec.body3Max <= 10_000))
+      && (ec.body3OverAvgMin == null || (ec.body3OverAvgMin >= 0 && ec.body3OverAvgMin <= 10))
       && ec.dcaBody3Min >= 0 && ec.dcaBody3Min <= 10_000
     )
     && scheduleValid
@@ -1007,6 +1008,8 @@ function EdgeCaseEditor({
               <th style={{ textAlign: 'right', padding: '2px 6px' }}>body3 min ($)</th>
               <th style={{ textAlign: 'right', padding: '2px 6px' }}
                   title="Upper cap on body3 (trap filter). 0 = no cap.">body3 max ($)</th>
+              <th style={{ textAlign: 'right', padding: '2px 6px' }}
+                  title="Regime-relative gate: body3 / (avgBody×3) ≥ this. When >0, REPLACES the dollar body3 min/max — self-adapts to volatility. Recommended: streak=3 → 1.2, streak=6/7 → 1.0. 0 = use dollar gate.">body3/avg ≥</th>
               <th style={{ textAlign: 'right', padding: '2px 6px' }}>DCA body3 min ($)</th>
               <th style={{ padding: '2px 6px' }}></th>
             </tr>
@@ -1055,6 +1058,13 @@ function EdgeCaseEditor({
                             min={0} max={10_000} step={25}
                             disabled={disabled}
                             onChange={v => update(ec.id, { body3Max: v > 0 ? v : undefined })} />
+                </td>
+                <td style={{ padding: '2px 6px', textAlign: 'right' }}
+                    title="Regime-relative gate: body3 / (avgBody×3) ≥ this. When >0, REPLACES the dollar body3 min/max — self-adapts to volatility. Recommended: streak=3 → 1.2, streak=6/7 → 1.0. 0 = use dollar gate.">
+                  <NumInput value={ec.body3OverAvgMin ?? 0}
+                            min={0} max={10} step={0.1}
+                            disabled={disabled}
+                            onChange={v => update(ec.id, { body3OverAvgMin: v > 0 ? v : undefined })} />
                 </td>
                 <td style={{ padding: '2px 6px', textAlign: 'right' }}>
                   <NumInput value={ec.dcaBody3Min}

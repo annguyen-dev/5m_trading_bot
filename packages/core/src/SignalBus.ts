@@ -80,6 +80,13 @@ export interface SignalT4Event {
    * armed_body3_min). 0 if fewer than 3 bars loaded.
    */
   body3Sum?:     number;
+  /**
+   * Mean |close − open| over the 48-bar baseline (price USD) — local "normal
+   * body", a volatility proxy. Lets the entry gate normalize body3 into a
+   * regime-relative ratio (body3 / (avgBody × 3)) via EchoEdgeCase.body3OverAvgMin
+   * instead of a fixed dollar floor. 0 if no bars loaded.
+   */
+  avgBody?:      number;
   limitCents:    number;
   emittedAt:     number;
 }

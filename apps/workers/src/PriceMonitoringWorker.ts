@@ -593,7 +593,7 @@ export class PriceMonitoringWorker {
   ): Promise<{ event?: SignalT4Event; reason?: string; persistentSkip: boolean }> {
     const streakResult = await fetchStreakWithVolume(state.symbol, windowStart);
     const { streak, volumeBuckets, bodyHasHigh, bodyHasTiny, meanBodyRatio,
-            bodyHasVeryExtreme, mismatches, binanceStreak, body3Sum } = streakResult;
+            bodyHasVeryExtreme, mismatches, binanceStreak, body3Sum, avgBody } = streakResult;
     const absStreak    = Math.abs(streak);
 
     // Surface Binance/Poly disagreements that affected streak interpretation.
@@ -751,6 +751,7 @@ export class PriceMonitoringWorker {
         meanBodyRatio,
         bodyHasVeryExtreme,
         body3Sum,
+        avgBody,
         limitCents:    cfg.limit_price_cents,
         emittedAt:     Date.now(),
       },
@@ -1552,6 +1553,10 @@ export class PriceMonitoringWorker {
         body3Src = 'live';
       }
     }
+    // avgBody (48-bar baseline) from T+4 — volatility moves slowly so the
+    // ~4min-stale value is fine. Drives the optional regime-relative ratio
+    // gate (EchoEdgeCase.body3OverAvgMin). 0 → ratio gate falls back to dollar.
+    const avgBody = t4.avgBody ?? 0;
 
     // Gate 2: effective streak ≥ threshold, OR a configured edge case matches.
     // Edge cases are UNIVERSAL rules — they fire whenever (streak in range
@@ -1568,9 +1573,11 @@ export class PriceMonitoringWorker {
     // 13:44:55 UTC fix that aligned this with backtest semantics.
     let matchedEdgeCase: EchoEdgeCase | null = null;
     if (cfg.strategy === 'echo') {
-      matchedEdgeCase = matchEchoEdgeCase(cfg.echo_edge_cases ?? [], effectiveStreak, body3Sum);
+      matchedEdgeCase = matchEchoEdgeCase(cfg.echo_edge_cases ?? [], effectiveStreak, body3Sum, avgBody);
     }
     if (matchedEdgeCase) {
+      const ratioGate = matchedEdgeCase.body3OverAvgMin != null && matchedEdgeCase.body3OverAvgMin > 0 && avgBody > 0;
+      const ratioVal = avgBody > 0 ? body3Sum / (avgBody * 3) : 0;
       log('info', `echo edge-case fires ${state.symbol}`, {
         edgeCaseId:    matchedEdgeCase.id,
         edgeCaseLabel: matchedEdgeCase.label,
@@ -1578,9 +1585,12 @@ export class PriceMonitoringWorker {
         effectiveStreak,
         threshold,
         armed:         adapt.mode === 'aggressive',
-        body3Sum, body3Src,
+        body3Sum, body3Src, avgBody,
+        gate:          ratioGate ? `ratio ${ratioVal.toFixed(2)} ≥ ${matchedEdgeCase.body3OverAvgMin}` : `dollar $${body3Sum.toFixed(0)} ≥ $${matchedEdgeCase.body3Min}`,
       });
-      adaptive.reason = `${reason} → edge "${matchedEdgeCase.label ?? matchedEdgeCase.id}" (streak ${effectiveStreak} body3 $${body3Sum.toFixed(0)})`;
+      adaptive.reason = ratioGate
+        ? `${reason} → edge "${matchedEdgeCase.label ?? matchedEdgeCase.id}" (streak ${effectiveStreak} body3/avg ${ratioVal.toFixed(2)})`
+        : `${reason} → edge "${matchedEdgeCase.label ?? matchedEdgeCase.id}" (streak ${effectiveStreak} body3 $${body3Sum.toFixed(0)})`;
     } else if (effectiveStreak < threshold) {
       return {
         placed: false,
@@ -2605,6 +2615,17 @@ interface StreakResult {
    * "filter disabled" behavior).
    */
   body3Sum: number;
+  /**
+   * Mean |close − open| over the 48-bar baseline (price USD). The local
+   * "normal body" — a volatility proxy. Lets the entry gate normalize body3
+   * into a regime-relative ratio (body3 / (avgBody × 3)) instead of an
+   * absolute dollar threshold, so the same config tracks BTC across vol
+   * regimes. Empirically (BTC 90d) the ratio is a far stronger fade filter
+   * than fixed dollars because it separates "exhaustion spike on a calm
+   * backdrop" (good fade) from "normal move in an active market" (bad fade).
+   * 0 when no bars loaded (ratio gate skipped).
+   */
+  avgBody: number;
 }
 
 /**
@@ -2635,7 +2656,7 @@ async function fetchStreakWithVolume(
     return {
       streak: 0, volumeBuckets: [], bodyHasHigh: false, bodyHasTiny: false,
       meanBodyRatio: 0, bodyHasVeryExtreme: false,
-      mismatches: [], binanceStreak: 0, body3Sum: 0,
+      mismatches: [], binanceStreak: 0, body3Sum: 0, avgBody: 0,
     };
   }
 
@@ -2705,7 +2726,7 @@ async function fetchStreakWithVolume(
     return {
       streak: 0, volumeBuckets: [], bodyHasHigh: false, bodyHasTiny: false,
       meanBodyRatio: 0, bodyHasVeryExtreme: false,
-      mismatches: [], binanceStreak: 0, body3Sum: 0,
+      mismatches: [], binanceStreak: 0, body3Sum: 0, avgBody: 0,
     };
   }
 
@@ -2780,7 +2801,7 @@ async function fetchStreakWithVolume(
 
   return {
     streak, volumeBuckets, bodyHasHigh, bodyHasTiny, meanBodyRatio, bodyHasVeryExtreme,
-    mismatches, binanceStreak, body3Sum,
+    mismatches, binanceStreak, body3Sum, avgBody,
   };
 }
 
@@ -3124,23 +3145,36 @@ function bucketize(vol: number, avgVol: number): VolumeBucket {
  * Generic edge-case matcher. Returns the FIRST enabled case in array order
  * where:
  *   - effectiveStreak ∈ [streakMin, streakMax]
- *   - |body3| ≥ body3Min
+ *   - body gate passes:
+ *       • if `body3OverAvgMin` set (>0): body3 / (avgBody × 3) ≥ body3OverAvgMin
+ *         (regime-relative — preferred, self-adapts to volatility)
+ *       • else: |body3| ≥ body3Min (and ≤ body3Max if set) — absolute dollars
  * Returns null if no match. Caller logs which case (by id/label) fired and
  * tags the cycle so the matching case's `dcaBody3Min` applies at DCA time.
  *
  * `effectiveStreak` = closed streak + aligning current bar (the streak being
  * faded at T-3s). Matches backtest streakLen semantics — see caller comment.
+ * `avgBody` = 48-bar baseline mean |close-open| (0 → ratio gate skipped, falls
+ * back to dollar gate so a stale/empty avgBody never blocks via ratio).
  */
 function matchEchoEdgeCase(
   cases: readonly EchoEdgeCase[],
   effectiveStreak: number,
   body3Sum: number,
+  avgBody: number,
 ): EchoEdgeCase | null {
   for (const ec of cases) {
     if (!ec.enabled) continue;
     if (effectiveStreak < ec.streakMin || effectiveStreak > ec.streakMax) continue;
-    if (body3Sum < ec.body3Min) continue;
-    if (ec.body3Max != null && body3Sum > ec.body3Max) continue;
+    if (ec.body3OverAvgMin != null && ec.body3OverAvgMin > 0 && avgBody > 0) {
+      // Regime-relative gate (preferred). Replaces dollar body3Min/Max.
+      const ratio = body3Sum / (avgBody * 3);
+      if (ratio < ec.body3OverAvgMin) continue;
+    } else {
+      // Absolute-dollar gate (legacy / fallback when avgBody unavailable).
+      if (body3Sum < ec.body3Min) continue;
+      if (ec.body3Max != null && body3Sum > ec.body3Max) continue;
+    }
     return ec;
   }
   return null;

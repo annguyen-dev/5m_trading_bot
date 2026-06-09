@@ -135,8 +135,25 @@ export interface EchoEdgeCase {
   /** Inclusive max effective streak — typically 3-4 for short-streak overrides. */
   streakMax:    number;
   /** |body3| floor (price USD, last 3 closed bars + in-progress at T-3s)
-   *  for entry. */
+   *  for entry. Absolute-dollar gate. */
   body3Min:     number;
+  /**
+   * Optional REGIME-RELATIVE entry gate: body3 / (avgBody × 3) ≥ this, where
+   * avgBody = mean |close-open| over the 48-bar baseline. When set (> 0), this
+   * REPLACES the dollar `body3Min` gate for this case. Self-adapts across
+   * volatility regimes — the same threshold means "move N× the local normal"
+   * whether BTC is calm or active.
+   *
+   * Empirically (BTC 90d, out-of-sample validated) the ratio is a far stronger
+   * fade filter than fixed dollars: it separates an "exhaustion spike on a
+   * calm backdrop" (good fade) from a "normal-sized move in an active market"
+   * (bad fade) — which a fixed dollar threshold conflates. Avg-body window 48
+   * (4h) is the stable sweet spot (shorter = noisy, longer = overfits/lags).
+   * Recommended: streak=3 → 1.2, streak=6/7 → 1.0.
+   *
+   * 0 / undefined = use the dollar `body3Min` gate instead (backward compat).
+   */
+  body3OverAvgMin?: number;
   /** Optional upper bound on body3 for this case to match. Used to skip the
    *  "high-momentum continuation" regime where the streak is still in trend
    *  rather than exhaustion. Empirically (BTC 365d): at streak=5 with body3

@@ -451,6 +451,10 @@ export interface EchoEdgeCase {
    *  zone (e.g. streak=5 body3>$700 on 5m has 46% reversal vs sweet spot
    *  $400-700 at 61%). Empty / undefined = no cap. */
   body3Max?:    number;
+  /** Regime-relative entry gate: body3 / (avgBody×3) ≥ this. When set (>0),
+   *  replaces the dollar body3Min/Max gate — self-adapts to volatility.
+   *  Recommended: streak=3 → 1.2, streak=6/7 → 1.0. 0/undefined = dollar gate. */
+  body3OverAvgMin?: number;
   dcaBody3Min:  number;
 }
 
