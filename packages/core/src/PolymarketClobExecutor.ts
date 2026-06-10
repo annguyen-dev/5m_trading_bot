@@ -15,11 +15,15 @@
  *   POLY_PRIVATE_KEY     hex string starting with 0x (EOA signing key)
  *   POLY_FUNDER_ADDRESS  optional — proxy/safe address that holds USDC.
  *                        Required for anything other than raw-EOA setups.
- *   POLY_SIGNATURE_TYPE  optional — 'eoa' | 'proxy' | 'safe' (default: 'safe'
- *                        when POLY_FUNDER_ADDRESS is set, 'eoa' otherwise).
- *                        Use 'safe' for MetaMask-connected Polymarket wallets
- *                        (Gnosis Safe proxy). Use 'proxy' for email/magic-link
- *                        accounts. 'eoa' only if USDC is on the EOA directly.
+ *   POLY_SIGNATURE_TYPE  optional — 'eoa' | 'proxy' | 'safe' | '1271' (default:
+ *                        'safe' when POLY_FUNDER_ADDRESS is set, 'eoa' otherwise).
+ *                        Use '1271' for NEW Polymarket API deposit wallets
+ *                        (EIP-1271 smart-wallet sig — Polymarket's 2026 default
+ *                        for new accounts; balance/allowance only resolve under
+ *                        this type, verified prod 0xf9858 funder). Use 'proxy'
+ *                        for older email/magic-link accounts, 'safe' for
+ *                        MetaMask (Gnosis Safe), 'eoa' if USDC is on the EOA.
+ *                        Existing proxy/safe users are unaffected — keep theirs.
  *
  * Chain: Polygon mainnet (137) only. Polymarket CLOB is not on testnet.
  */
@@ -46,6 +50,7 @@ function resolveSignatureType(raw: string | undefined, funderSet: boolean): Sign
   if (key === 'eoa')   return SignatureTypeV2.EOA;
   if (key === 'proxy') return SignatureTypeV2.POLY_PROXY;
   if (key === 'safe')  return SignatureTypeV2.POLY_GNOSIS_SAFE;
+  if (key === '1271' || key === 'poly_1271') return SignatureTypeV2.POLY_1271;
   // Default: MetaMask-connected Polymarket wallets are Gnosis Safes, so
   // if a funder is set we assume Safe. Bare EOA setups fall back to EOA.
   return funderSet ? SignatureTypeV2.POLY_GNOSIS_SAFE : SignatureTypeV2.EOA;

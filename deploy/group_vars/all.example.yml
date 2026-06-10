@@ -30,7 +30,7 @@ telegram_channel_id: ""            # legacy fallback — leave empty if using ch
 # Polymarket (live trading). Leave blank for simulate-only.
 poly_private_key:      ""           # 0x-prefixed hex
 poly_funder_address:   ""           # 0x-prefixed hex, the proxy/safe holding USDC
-poly_signature_type:   proxy        # 'proxy' | 'safe' | 'eoa'
+poly_signature_type:   proxy        # 'proxy' | 'safe' | 'eoa' | '1271' (1271 = new API deposit wallets)
 
 # Binance price feeds (read-only; safe to leave empty for public endpoints).
 exchange_id:     binance
