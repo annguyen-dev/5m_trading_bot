@@ -2125,6 +2125,20 @@ const CoinCard = React.memo(function CoinCard({
               {t4.direction === 'up' ? '🟢 UP' : '🔴 DOWN'}
             </span>
           </div>
+          {t4.body3Sum != null && (
+            <div style={CS.dim}>
+              body3 ${t4.body3Sum.toFixed(0)}
+              {t4.avgBody != null && t4.avgBody > 0 && (
+                <>
+                  {' · '}avg ${t4.avgBody.toFixed(0)}
+                  {' · '}
+                  <span style={{ color: '#d29922', fontWeight: 600 }}>
+                    ratio {(t4.body3Sum / (t4.avgBody * 3)).toFixed(2)}×
+                  </span>
+                </>
+              )}
+            </div>
+          )}
           <div style={CS.dim}>
             {t4.price != null ? `${(t4.price * 100).toFixed(0)}¢` : '—'}
             {' · '}${t4.sizeUsdc}

@@ -113,6 +113,9 @@ export interface SignalTMinus3Event {
   currentIcon?:  string;
   /** body3 sum (price USD) used by the body gate at the placement decision. */
   body3Sum?:     number;
+  /** 48-bar avg |body| at decision time. ratio = body3Sum/(avgBody×3) is the
+   *  regime-relative gate the bot fades on. */
+  avgBody?:      number;
   /** Which gate matched: 'idle' | 'armed' | edge-case label (e.g. 'streak4'). */
   matchCase?:    string;
   /** True if this placement was retried at T-0 of N (after T-3s failed gates). */

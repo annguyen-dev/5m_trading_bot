@@ -190,23 +190,35 @@ function formatT4(ev: SignalT4Event): string {
   const dirLabel = ev.direction.toUpperCase();
   const priceStr = ev.price != null ? `${(ev.price * 100).toFixed(1)}¢` : '?';
   const modeTag  = ev.mode === 'signal_and_order' ? 'will auto-order' : 'signal-only';
-  const body3Str = ev.body3Sum != null ? `$${ev.body3Sum.toFixed(0)}` : '?';
   // Layout (streak chain first), per user request:
   //   BTC_5m: 🔴🔴🔴 🔴   ← T+4 PREVIEW
-  //   window: 04:55-05:00, streak: -3, body3: $502
+  //   window: 04:55-05:00, streak: -3
+  //   body3 $502 · avg $140 · ratio 1.20×
   //   signal: 🟢 UP @ 30¢ · $6 · will auto-order
   return [
     `<b>${coinLabel(ev.coin)}</b>: ${streakChain(ev.pastStreakIcons, ev.currentIcon)}   <i>T+4 preview</i>`,
-    `window: <code>${fmtWindow(ev.windowStart, ev.windowEnd)}</code>, streak: <b>${ev.streak}</b>, body3: ${body3Str}`,
+    `window: <code>${fmtWindow(ev.windowStart, ev.windowEnd)}</code>, streak: <b>${ev.streak}</b>`,
+    body3Line(ev.body3Sum, ev.avgBody),
     `signal: ${dirIcon} <b>${dirLabel}</b> @ ${priceStr} · $${ev.sizeUsdc} · <i>${modeTag}</i>`,
   ].join('\n');
+}
+
+/** body3 + avgBody + regime-relative ratio line. ratio = body3 / (avgBody×3) —
+ *  the gate the bot fades on. Shows '?' when data missing. */
+function body3Line(body3Sum: number | undefined, avgBody: number | undefined): string {
+  if (body3Sum == null) return 'body3: ?';
+  const b3 = `$${body3Sum.toFixed(0)}`;
+  if (avgBody != null && avgBody > 0) {
+    const ratio = body3Sum / (avgBody * 3);
+    return `body3 ${b3} · avg $${avgBody.toFixed(0)} · ratio <b>${ratio.toFixed(2)}×</b>`;
+  }
+  return `body3 ${b3}`;
 }
 
 function formatTMinus3(ev: SignalTMinus3Event): string {
   const win      = fmtWindow(ev.windowStart, ev.windowEnd);
   const type     = ev.signalPath === 'dca' ? 'dca' : 'boundary';
   const lateTag  = ev.lateRetry ? ' · ⏰ <i>T-0 retry</i>' : '';
-  const body3Str = ev.body3Sum != null ? `$${ev.body3Sum.toFixed(0)}` : '?';
   const matchCase = ev.matchCase ?? (ev.adaptive ? ev.adaptive.mode.replace('aggressive','armed').replace('default','idle').replace('conservative','idle-chain') : '?');
 
   switch (ev.action) {
@@ -215,12 +227,14 @@ function formatTMinus3(ev: SignalTMinus3Event): string {
       const priceStr = ev.price != null ? `${(ev.price * 100).toFixed(1)}¢` : '?';
       // Layout per user request — streak chain first, then context lines.
       //   BTC_5m: 🔴🔴🔴 🔴   ✅ FIRE
-      //   window: 04:55-05:00, streak: -4, body3: $502
+      //   window: 04:55-05:00, streak: -4
+      //   body3 $502 · avg $140 · ratio 1.20×
       //   match case: streak4   |   type: boundary
       //   ✅ 🟢 UP @ 30¢ · $6 · id ab12cd…
       const lines = [
         `<b>${coinLabel(ev.coin)}</b>: ${streakChain(ev.pastStreakIcons ?? '', ev.currentIcon ?? '')}   ✅ <b>FIRE</b>${lateTag}`,
-        `window: <code>${win}</code>, streak: <b>${ev.streak ?? '?'}</b>, body3: ${body3Str}`,
+        `window: <code>${win}</code>, streak: <b>${ev.streak ?? '?'}</b>`,
+        body3Line(ev.body3Sum, ev.avgBody),
         `match case: <b>${escapeHtml(matchCase)}</b>   |   type: <b>${type}</b>`,
         `${dirIcon} <b>${(ev.direction ?? '?').toUpperCase()}</b> @ ${priceStr} · $${ev.sizeUsdc ?? '?'}`
           + (ev.orderId ? ` · id <code>${escapeHtml(ev.orderId.slice(0, 8))}…</code>` : ''),
@@ -230,7 +244,8 @@ function formatTMinus3(ev: SignalTMinus3Event): string {
     case 'order_skipped':
       return [
         `<b>${coinLabel(ev.coin)}</b>: ${streakChain(ev.pastStreakIcons ?? '', ev.currentIcon ?? '')}   ⚠ <b>SKIP</b>`,
-        `window: <code>${win}</code>, streak: <b>${ev.streak ?? '?'}</b>, body3: ${body3Str}  ·  type: ${type}`,
+        `window: <code>${win}</code>, streak: <b>${ev.streak ?? '?'}</b>  ·  type: ${type}`,
+        body3Line(ev.body3Sum, ev.avgBody),
         `reason: ${escapeHtml(ev.reason ?? '(no reason)')}`,
       ].join('\n');
     case 'signal_only_mode':

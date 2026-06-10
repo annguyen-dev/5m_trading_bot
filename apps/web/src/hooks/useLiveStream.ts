@@ -135,6 +135,10 @@ export interface CoinT4Event {
   currentIcon:         string;
   /** Volume bucket per streak candle, oldest → newest. */
   streakVolumeBuckets: VolumeBucket[];
+  /** Sum of |close-open| over last 3 closed bars (price USD). */
+  body3Sum?:           number;
+  /** 48-bar avg |body|. ratio = body3Sum/(avgBody×3) = the regime gate. */
+  avgBody?:            number;
   limitCents:          number;
   emittedAt:           number;
 }

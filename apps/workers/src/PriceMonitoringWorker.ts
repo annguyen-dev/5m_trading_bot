@@ -1342,6 +1342,7 @@ export class PriceMonitoringWorker {
         pastStreakIcons: t4.pastStreakIcons,
         currentIcon:     t4.currentIcon,
         ...(t4.body3Sum != null ? { body3Sum: t4.body3Sum } : {}),
+        ...(t4.avgBody != null ? { avgBody: t4.avgBody } : {}),
         ...(result.matchCase ? { matchCase: result.matchCase } : {}),
         ...(result.adaptive ? { adaptive: result.adaptive } : {}),
         emittedAt: Date.now(),
@@ -1353,6 +1354,12 @@ export class PriceMonitoringWorker {
         action: 'order_skipped',
         reason: result.reason ?? '(unknown)',
         signalPath: 'boundary',
+        // Context for the skip card (body3/avg/ratio so user sees why gate failed).
+        streak:          t4.streak,
+        pastStreakIcons: t4.pastStreakIcons,
+        currentIcon:     t4.currentIcon,
+        ...(t4.body3Sum != null ? { body3Sum: t4.body3Sum } : {}),
+        ...(t4.avgBody != null ? { avgBody: t4.avgBody } : {}),
         ...(result.adaptive ? { adaptive: result.adaptive } : {}),
         emittedAt: Date.now(),
       });
