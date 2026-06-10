@@ -135,6 +135,10 @@ const patchSchema = z.object({
     streakMax:   z.number().int().min(2).max(20),
     body3Min:    z.number().min(0).max(10_000),
     body3Max:    z.number().min(0).max(10_000).optional(),
+    // Regime-relative gate: body3/(avgBody×3) ≥ this. WITHOUT this field in the
+    // schema, zod silently STRIPS it on every PUT (the inner object isn't
+    // strict) — which nukes the entire ratio strategy on the next config save.
+    body3OverAvgMin: z.number().min(0).max(10).optional(),
     dcaBody3Min: z.number().min(0).max(10_000),
   })).max(16).optional(),
   echo_dca_scale:         z.array(z.number().min(1).max(20)).max(10).optional(),
