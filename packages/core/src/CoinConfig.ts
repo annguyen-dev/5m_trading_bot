@@ -201,6 +201,24 @@ export interface CoinConfig {
   limit_price_cents:    number;
   tp_cents:             number;
   sl_cents:             number;
+
+  // ── Trend-break kill-switch (echo) ────────────────────────────────────────
+  // Fade strategies bleed in sustained trends (streaks keep extending). When
+  // the rolling realized fade WR drops below the floor, pause new boundary
+  // placements for a cooldown of would-be entries — self-clears when WR
+  // recovers. Backtest (BTC 5m 180d): pause at WR<0.45 over last 30 cut maxDD
+  // 21% while keeping PnL (the one robust kill-switch — streak-extension and
+  // tighter WR floors hurt). The real protection against a regime flip — a
+  // long window picks the edge, this caps the tail.
+  /** Master toggle. Default false. */
+  echo_killswitch_enabled: boolean;
+  /** Rolling window of realized fades to measure WR over. Default 30. */
+  echo_killswitch_window:  number;
+  /** Pause when rolling WR < this (0-1). Default 0.45 (clearly-losing; 0.50
+   *  pauses too eagerly and hurt in backtest). */
+  echo_killswitch_wr_min:  number;
+  /** Would-be boundary placements to skip once engaged. Default 10. */
+  echo_killswitch_cooldown: number;
   /** DCA size = previous_loser_size × dca_multiplier. Default 1.5. */
   dca_multiplier:       number;
   /**
@@ -399,6 +417,11 @@ const DEFAULT_CONFIG: CoinConfig = {
   echo_defensive_streak_threshold:  7,
   echo_defensive_overdue_minutes:   1440,
   echo_defensive_action:            'disable_armed',
+  // Trend-break kill-switch (off by default; opt-in per coin).
+  echo_killswitch_enabled:          false,
+  echo_killswitch_window:           30,
+  echo_killswitch_wr_min:           0.45,
+  echo_killswitch_cooldown:         10,
   // Chain predictive defensive defaults (off by default; opt-in per coin).
   // Defaults derived from BTC 60d data:
   //   chain event = ≥2 arms in 60min (gap median 13.8h, p75 26.6h)

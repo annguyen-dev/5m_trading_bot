@@ -214,6 +214,17 @@ interface CoinState {
    */
   recentStreakAbs: number[];
   /**
+   * Rolling realized fade outcomes (true=win) for the trend-break kill-switch.
+   * Pushed each time an incoming auto order resolves at T-0. When the window
+   * fills (echo_killswitch_window) AND WR < echo_killswitch_wr_min, boundary
+   * placement pauses for echo_killswitch_cooldown would-be entries. Backtest
+   * (BTC 5m 180d): pausing at WR<45% over last 30 cut maxDD 21% while keeping
+   * PnL. Protects against sustained trends where fades bleed. In-memory only.
+   */
+  recentFadeWins: boolean[];
+  /** Remaining would-be boundary placements to skip while kill-switch paused. */
+  killswitchCooldown: number;
+  /**
    * One-shot timer scheduled by phaseT4 to fire phaseTMinus3 at exactly
    * windowEnd - COIN_META.decisionOffsetMs (5m: 3s, 1h: 10min). Cleared on
    * worker stop and on each new T+4 emission (only the latest cached signal fires).
@@ -477,6 +488,8 @@ export class PriceMonitoringWorker {
       backfillDefensiveThreshold: null,
       backfillInFlight:   false,
       recentStreakAbs: [],
+      recentFadeWins: [],
+      killswitchCooldown: 0,
       lastEchoTriggerAt: null,
       recentArmTimestamps: [],
       lastChainEventAt: null,
@@ -1472,6 +1485,39 @@ export class PriceMonitoringWorker {
       };
     }
 
+    // Gate 0.5: trend-break kill-switch. When the rolling realized fade WR
+    // drops below the floor (= a sustained trend is bleeding our fades), pause
+    // new boundaries for a cooldown of would-be entries. Self-clears once the
+    // cooldown elapses and WR recovers above the floor on the next eval.
+    // Backtest (BTC 5m 180d): pause at WR<0.45 over last 30 cut maxDD 21%,
+    // kept PnL. Disabled by default (echo_killswitch_enabled).
+    if (cfg.echo_killswitch_enabled) {
+      const win = cfg.echo_killswitch_window > 0 ? cfg.echo_killswitch_window : 30;
+      if (state.killswitchCooldown > 0) {
+        state.killswitchCooldown -= 1;
+        return {
+          placed: false,
+          reason: `kill-switch paused (${state.killswitchCooldown} left) — recent fade WR below ${(cfg.echo_killswitch_wr_min*100).toFixed(0)}%`,
+          adaptive,
+        };
+      }
+      if (state.recentFadeWins.length >= win) {
+        const recent = state.recentFadeWins.slice(-win);
+        const wr = recent.filter(Boolean).length / recent.length;
+        if (wr < cfg.echo_killswitch_wr_min) {
+          state.killswitchCooldown = Math.max(0, cfg.echo_killswitch_cooldown);
+          log('warn', `kill-switch ENGAGED ${state.symbol}: fade WR ${(wr*100).toFixed(0)}% < ${(cfg.echo_killswitch_wr_min*100).toFixed(0)}% over last ${win} — pause ${state.killswitchCooldown}`, {
+            recentWins: recent.filter(Boolean).length, window: win,
+          });
+          return {
+            placed: false,
+            reason: `kill-switch engaged — fade WR ${(wr*100).toFixed(0)}% < ${(cfg.echo_killswitch_wr_min*100).toFixed(0)}% (trend regime)`,
+            adaptive,
+          };
+        }
+      }
+    }
+
     // Gate 1: alignment of current in-progress bar.
     //
     // Reject when:
@@ -2198,6 +2244,17 @@ export class PriceMonitoringWorker {
         outcome === 'unknown'                ? 'unknown'
         : outcome === incoming.direction      ? 'win'
         :                                       'loss';
+
+      // Trend-break kill-switch: record this fade's realized outcome into the
+      // rolling window. Trimmed to the configured window in tryPlaceBoundary's
+      // gate (read side). Only count resolved (non-unknown) outcomes.
+      if (strategyOutcome !== 'unknown') {
+        state.recentFadeWins.push(strategyOutcome === 'win');
+        const ksWin = cfg.echo_killswitch_window > 0 ? cfg.echo_killswitch_window : 30;
+        if (state.recentFadeWins.length > ksWin) {
+          state.recentFadeWins.splice(0, state.recentFadeWins.length - ksWin);
+        }
+      }
 
       // (Cycle state already updated at the top of phaseT0 — applies whether
       // or not there's an incoming order. Here we just surface SL-whipsaw
