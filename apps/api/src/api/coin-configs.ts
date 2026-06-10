@@ -147,6 +147,20 @@ const patchSchema = z.object({
   echo_defensive_streak_threshold: z.number().int().min(3).max(20).optional(),
   echo_defensive_overdue_minutes:  z.number().int().min(10).max(43200).optional(),  // 10min..30d
   echo_defensive_action:           z.enum(['disable_armed', 'skip_all']).optional(),
+  // Trend-break kill-switch — pause fades when rolling realized WR drops. These
+  // (and echo_chain_* below) MUST be here: the outer schema is .strict(), so a
+  // PUT carrying a field absent from this list is rejected 400 wholesale.
+  echo_killswitch_enabled:         z.boolean().optional(),
+  echo_killswitch_window:          z.number().int().min(1).max(500).optional(),
+  echo_killswitch_wr_min:          z.number().min(0).max(1).optional(),
+  echo_killswitch_cooldown:        z.number().int().min(0).max(100).optional(),
+  // Chain soft-defensive (echo_chain_*).
+  echo_chain_enabled:              z.boolean().optional(),
+  echo_chain_event_arm_count:      z.number().int().min(1).max(20).optional(),
+  echo_chain_event_window_min:     z.number().int().min(1).max(1440).optional(),
+  echo_chain_overdue_min:          z.number().int().min(1).max(43200).optional(),
+  echo_chain_signal_bump:          z.number().int().min(0).max(20).optional(),
+  echo_chain_baseline_bump:        z.number().int().min(0).max(20).optional(),
   // Body-3 gates (price USD). 0 = disabled. Wide bound to cover any coin
   // (BTC body3 can hit thousands; ETH/SOL smaller). FE chooses sensible
   // per-coin defaults.
