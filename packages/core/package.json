@@ -53,7 +53,7 @@
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/api-logs": "^0.57.0",
-    "@polymarket/clob-client-v2": "^1.0.2",
+    "@polymarket/clob-client-v2": "^1.0.6",
     "@trading-bot/db": "workspace:*",
     "@trading-bot/shared": "workspace:*",
     "ethers": "^5.8.0",

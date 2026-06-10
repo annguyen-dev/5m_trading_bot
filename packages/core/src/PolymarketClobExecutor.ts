@@ -124,7 +124,7 @@ export class PolymarketClobExecutor {
     this.client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL })
       .then(ba => {
         log('info', 'CLOB USDC balance/allowance', {
-          balance: ba.balance, allowance: ba.allowance,
+          balance: ba.balance, allowances: ba.allowances,
         });
       })
       .catch(err => {
