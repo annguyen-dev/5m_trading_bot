@@ -1349,7 +1349,7 @@ export class PriceMonitoringWorker {
         streak:          t4.streak,
         pastStreakIcons: t4.pastStreakIcons,
         currentIcon:     t4.currentIcon,
-        ...(t4.body3Sum != null ? { body3Sum: t4.body3Sum } : {}),
+        ...((result.body3Sum ?? t4.body3Sum) != null ? { body3Sum: result.body3Sum ?? t4.body3Sum } : {}),
         ...(t4.avgBody != null ? { avgBody: t4.avgBody } : {}),
         ...(result.matchCase ? { matchCase: result.matchCase } : {}),
         ...(result.adaptive ? { adaptive: result.adaptive } : {}),
@@ -1366,7 +1366,7 @@ export class PriceMonitoringWorker {
         streak:          t4.streak,
         pastStreakIcons: t4.pastStreakIcons,
         currentIcon:     t4.currentIcon,
-        ...(t4.body3Sum != null ? { body3Sum: t4.body3Sum } : {}),
+        ...((result.body3Sum ?? t4.body3Sum) != null ? { body3Sum: result.body3Sum ?? t4.body3Sum } : {}),
         ...(t4.avgBody != null ? { avgBody: t4.avgBody } : {}),
         ...(result.adaptive ? { adaptive: result.adaptive } : {}),
         emittedAt: Date.now(),
@@ -1408,6 +1408,10 @@ export class PriceMonitoringWorker {
     signalPath?: 'boundary' | 'dca';
     /** Which gate matched the entry: edge-case label, or 'armed' / 'idle'. */
     matchCase?: string;
+    /** body3 the DECISION actually used (live streak-aligned when currentAligns;
+     *  differs from the T+4 preview's `t4.body3Sum` for low streaks). Published
+     *  on the T-3s card so the user sees the real ratio the gate evaluated. */
+    body3Sum?: number;
     adaptive?: {
       base:      number;
       threshold: number;
@@ -1661,7 +1665,7 @@ export class PriceMonitoringWorker {
       return {
         placed: false,
         reason: `effective streak ${effectiveStreak} (closed ${absStreak}+1 current) < auto_min ${threshold} [${reason}]`,
-        adaptive,
+        adaptive, body3Sum,
       };
     }
 
@@ -1684,7 +1688,7 @@ export class PriceMonitoringWorker {
         return {
           placed: false,
           reason: `body3 $${body3Sum.toFixed(0)} (${body3Src}, currentAligns=${currentAligns}) < ${armedMode ? 'armed' : 'idle'}_body3_min $${body3Min}`,
-          adaptive,
+          adaptive, body3Sum,
         };
       }
     }
@@ -1708,7 +1712,7 @@ export class PriceMonitoringWorker {
     if (ask * 100 > cfg.limit_price_cents) {
       return { placed: false,
         reason: `ask ${(ask * 100).toFixed(1)}¢ > limit ${cfg.limit_price_cents}¢`,
-        adaptive };
+        adaptive, body3Sum };
     }
 
     // Place — initial entry, base size only.
@@ -1760,7 +1764,7 @@ export class PriceMonitoringWorker {
         matchCase: matchedEdgeCase ? (matchedEdgeCase.label ?? matchedEdgeCase.id)
                  : armedMode        ? 'armed'
                  :                    'idle',
-        adaptive,
+        adaptive, body3Sum,
       };
     } catch (err) {
       return {
@@ -2881,11 +2885,14 @@ async function fetchStreakWithVolume(
   }
   const meanBodyRatio = streakBars.length > 0 ? sumRatios / streakBars.length : 0;
 
-  // Body-3 gate input: |close-open| sum over the LAST 3 closed bars before
-  // windowStart (regardless of direction — within a streak ≥ 3 these are all
-  // same direction by definition; for streak < 3 the sum is informational).
+  // Body-3 gate input: |close-open| sum over the last min(3, |streak|) STREAK
+  // bars (NOT "last 3 closed"). For streak < 3, "last 3 closed" pulls in a
+  // pre-streak bar of the OPPOSITE direction, inflating body3 + the displayed
+  // ratio — verified prod 2026-06-11 21:25 VN: streak=2 UP showed body3 $268
+  // (incl a DOWN bar) → ratio 1.35, while the 2 actual streak bars were $156.
+  // For streak ≥ 3 this equals "last 3 closed" (all in-streak).
   let body3Sum = 0;
-  for (const b of bars.slice(-3)) body3Sum += Math.abs(b.close - b.open);
+  for (const b of bars.slice(-Math.min(3, n))) body3Sum += Math.abs(b.close - b.open);
 
   // ── Extended-edge context (clustering + magnitude) ─────────────────────
   // Computed from the same bars, mirrors analyze-*.ts backtest definitions.
