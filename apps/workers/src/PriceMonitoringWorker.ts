@@ -19,7 +19,7 @@
 
 import { log } from '@trading-bot/core/logger';
 import type {
-  SignalBus, SignalT0PlusEvent, SignalT4Event, SignalTMinus3Event,
+  SignalBus, SignalT0PlusEvent, SignalT4Event, SignalTMinus3Event, EchoEdgeContext,
   SignalT0Event, SignalEchoStateEvent, VolumeBucket, OrderRef,
   DefensiveGapStats,
 } from '@trading-bot/core/SignalBus';
@@ -606,7 +606,8 @@ export class PriceMonitoringWorker {
   ): Promise<{ event?: SignalT4Event; reason?: string; persistentSkip: boolean }> {
     const streakResult = await fetchStreakWithVolume(state.symbol, windowStart);
     const { streak, volumeBuckets, bodyHasHigh, bodyHasTiny, meanBodyRatio,
-            bodyHasVeryExtreme, mismatches, binanceStreak, body3Sum, avgBody } = streakResult;
+            bodyHasVeryExtreme, mismatches, binanceStreak, body3Sum, avgBody,
+            edgeContext } = streakResult;
     const absStreak    = Math.abs(streak);
 
     // Surface Binance/Poly disagreements that affected streak interpretation.
@@ -765,6 +766,7 @@ export class PriceMonitoringWorker {
         bodyHasVeryExtreme,
         body3Sum,
         avgBody,
+        edgeContext,
         limitCents:    cfg.limit_price_cents,
         emittedAt:     Date.now(),
       },
@@ -1626,7 +1628,8 @@ export class PriceMonitoringWorker {
     // 13:44:55 UTC fix that aligned this with backtest semantics.
     let matchedEdgeCase: EchoEdgeCase | null = null;
     if (cfg.strategy === 'echo') {
-      matchedEdgeCase = matchEchoEdgeCase(cfg.echo_edge_cases ?? [], effectiveStreak, body3Sum, avgBody);
+      matchedEdgeCase = matchEchoEdgeCase(cfg.echo_edge_cases ?? [], effectiveStreak, body3Sum, avgBody,
+        t4.edgeContext, COIN_META[state.symbol].windowMs / 60_000);
     }
     if (matchedEdgeCase) {
       const ratioGate = matchedEdgeCase.body3OverAvgMin != null && matchedEdgeCase.body3OverAvgMin > 0 && avgBody > 0;
@@ -1640,6 +1643,10 @@ export class PriceMonitoringWorker {
         armed:         adapt.mode === 'aggressive',
         body3Sum, body3Src, avgBody,
         gate:          ratioGate ? `ratio ${ratioVal.toFixed(2)} ≥ ${matchedEdgeCase.body3OverAvgMin}` : `dollar $${body3Sum.toFixed(0)} ≥ $${matchedEdgeCase.body3Min}`,
+        // Extended-condition context (when the matched edge uses them).
+        ...(t4.edgeContext && (matchedEdgeCase.momentumPctMin || matchedEdgeCase.cumMovePctMin || matchedEdgeCase.priorStreakMin) ? {
+          ext: `mom ${t4.edgeContext.momentumPct.toFixed(2)}% cum ${t4.edgeContext.cumMovePct.toFixed(2)}% priors ${t4.edgeContext.recentStreakPeaks.filter(p => p.dir === t4.edgeContext!.regime).map(p => p.streak).join(',')}`,
+        } : {}),
       });
       adaptive.reason = ratioGate
         ? `${reason} → edge "${matchedEdgeCase.label ?? matchedEdgeCase.id}" (streak ${effectiveStreak} body3/avg ${ratioVal.toFixed(2)})`
@@ -2690,6 +2697,9 @@ interface StreakResult {
    * 0 when no bars loaded (ratio gate skipped).
    */
   avgBody: number;
+  /** Extended-edge context (clustering + magnitude) computed from the bars.
+   *  Drives EchoEdgeCase.priorStreakMin / momentumPctMin / cumMovePctMin. */
+  edgeContext: EchoEdgeContext;
 }
 
 /**
@@ -2721,6 +2731,7 @@ async function fetchStreakWithVolume(
       streak: 0, volumeBuckets: [], bodyHasHigh: false, bodyHasTiny: false,
       meanBodyRatio: 0, bodyHasVeryExtreme: false,
       mismatches: [], binanceStreak: 0, body3Sum: 0, avgBody: 0,
+      edgeContext: EMPTY_EDGE_CONTEXT,
     };
   }
 
@@ -2791,6 +2802,7 @@ async function fetchStreakWithVolume(
       streak: 0, volumeBuckets: [], bodyHasHigh: false, bodyHasTiny: false,
       meanBodyRatio: 0, bodyHasVeryExtreme: false,
       mismatches: [], binanceStreak: 0, body3Sum: 0, avgBody: 0,
+      edgeContext: EMPTY_EDGE_CONTEXT,
     };
   }
 
@@ -2863,11 +2875,39 @@ async function fetchStreakWithVolume(
   let body3Sum = 0;
   for (const b of bars.slice(-3)) body3Sum += Math.abs(b.close - b.open);
 
+  // ── Extended-edge context (clustering + magnitude) ─────────────────────
+  // Computed from the same bars, mirrors analyze-*.ts backtest definitions.
+  const L = bars.length;
+  const regime: 1 | -1 = streak > 0 ? 1 : -1;
+  const runStartIdx = L - n;                       // first bar of the current run
+  // cumMove: % move over the run's bars (open of first → close of last), in dir.
+  const runOpen = bars[runStartIdx]?.open ?? 0;
+  const cumMovePct = runOpen > 0 ? (bars[L-1]!.close - runOpen) / runOpen * 100 * regime : 0;
+  // momentum: % move over the last 12 closed bars (= 1h on 5m), in dir.
+  const momIdx = L - 1 - 12;
+  const momRef = momIdx >= 0 ? (bars[momIdx]?.close ?? 0) : 0;
+  const momentumPct = momRef > 0 ? (bars[L-1]!.close - momRef) / momRef * 100 * regime : 0;
+  // prior-run peaks: walk outcomes BEFORE the current run; each run's peak is
+  // its last bar (closest to current). barsBefore = bars from that peak to the
+  // current run's start. Matcher filters by dir / window / count.
+  const recentStreakPeaks: Array<{ streak: number; dir: 1 | -1; barsBefore: number }> = [];
+  for (let i = runStartIdx - 1; i >= 0; ) {
+    const o = outcomes[i];
+    if (o === 'doji') { i--; continue; }
+    let j = i; while (j >= 0 && outcomes[j] === o) j--;
+    recentStreakPeaks.push({ streak: i - j, dir: o === 'up' ? 1 : -1, barsBefore: runStartIdx - i });
+    i = j;
+  }
+  const edgeContext: EchoEdgeContext = { regime, cumMovePct, momentumPct, recentStreakPeaks };
+
   return {
     streak, volumeBuckets, bodyHasHigh, bodyHasTiny, meanBodyRatio, bodyHasVeryExtreme,
-    mismatches, binanceStreak, body3Sum, avgBody,
+    mismatches, binanceStreak, body3Sum, avgBody, edgeContext,
   };
 }
+
+/** Neutral edge context for the no-streak early returns (nothing fires anyway). */
+const EMPTY_EDGE_CONTEXT: EchoEdgeContext = { regime: 1, cumMovePct: 0, momentumPct: 0, recentStreakPeaks: [] };
 
 /**
  * Backfill in-memory echo state (`lastEchoTriggerAt` AND `lastExtremeStreakAt`)
@@ -3226,6 +3266,8 @@ function matchEchoEdgeCase(
   effectiveStreak: number,
   body3Sum: number,
   avgBody: number,
+  edgeContext?: EchoEdgeContext,
+  binMinutes = 5,
 ): EchoEdgeCase | null {
   for (const ec of cases) {
     if (!ec.enabled) continue;
@@ -3238,6 +3280,23 @@ function matchEchoEdgeCase(
       // Absolute-dollar gate (legacy / fallback when avgBody unavailable).
       if (body3Sum < ec.body3Min) continue;
       if (ec.body3Max != null && body3Sum > ec.body3Max) continue;
+    }
+    // Extended conditions (clustering + magnitude) — ANDed with the gates above.
+    // When ANY is set we need edgeContext to verify; missing context → don't fire.
+    const wantsExt = (ec.momentumPctMin != null && ec.momentumPctMin > 0)
+      || (ec.cumMovePctMin != null && ec.cumMovePctMin > 0)
+      || (ec.priorStreakMin != null && ec.priorStreakMin > 0);
+    if (wantsExt) {
+      if (!edgeContext) continue;
+      if (ec.momentumPctMin != null && ec.momentumPctMin > 0 && edgeContext.momentumPct < ec.momentumPctMin) continue;
+      if (ec.cumMovePctMin != null && ec.cumMovePctMin > 0 && edgeContext.cumMovePct < ec.cumMovePctMin) continue;
+      if (ec.priorStreakMin != null && ec.priorStreakMin > 0) {
+        const winBars = (ec.priorWindowMin ?? 60) / binMinutes;
+        const cnt = edgeContext.recentStreakPeaks.filter(p =>
+          p.dir === edgeContext.regime && p.streak >= ec.priorStreakMin! && p.barsBefore <= winBars,
+        ).length;
+        if (cnt < (ec.priorCountMin ?? 1)) continue;
+      }
     }
     return ec;
   }

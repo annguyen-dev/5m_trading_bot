@@ -47,6 +47,25 @@ export interface SignalT0PlusEvent {
   emittedAt:    number;
 }
 
+/**
+ * Extended-edge context computed from the 48-bar baseline at T+4. Drives the
+ * clustering + magnitude edge conditions (EchoEdgeCase.priorStreakMin /
+ * momentumPctMin / cumMovePctMin). Worker-internal — FE/Telegram ignore it.
+ */
+export interface EchoEdgeContext {
+  /** Streak direction being faded: +1 up-streak, −1 down-streak. */
+  regime: 1 | -1;
+  /** |% move| over the streak's bars (open of first → close of last), signed
+   *  in the streak direction (positive = moved the way we'd fade). */
+  cumMovePct: number;
+  /** |% move| over the last 12 closed bars (= 1h on 5m), in the streak dir. */
+  momentumPct: number;
+  /** Peaks of PRIOR runs (separate from the current run) within the baseline,
+   *  for clustering edges. barsBefore = bars from the prior run's end to the
+   *  current run's start. */
+  recentStreakPeaks: Array<{ streak: number; dir: 1 | -1; barsBefore: number }>;
+}
+
 export interface SignalT4Event {
   type:          'T+4';
   coin:          CoinSymbol;
@@ -87,6 +106,8 @@ export interface SignalT4Event {
    * instead of a fixed dollar floor. 0 if no bars loaded.
    */
   avgBody?:      number;
+  /** Extended-edge context (clustering + magnitude). Present for echo strategy. */
+  edgeContext?:  EchoEdgeContext;
   limitCents:    number;
   emittedAt:     number;
 }

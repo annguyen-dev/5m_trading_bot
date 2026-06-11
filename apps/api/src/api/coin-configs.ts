@@ -140,6 +140,13 @@ const patchSchema = z.object({
     // strict) — which nukes the entire ratio strategy on the next config save.
     body3OverAvgMin: z.number().min(0).max(10).optional(),
     dcaBody3Min: z.number().min(0).max(10_000),
+    // Extended conditions (clustering + magnitude). MUST be here or zod strips
+    // them — see the golden rule above + EDGE_CASES.md.
+    priorStreakMin:  z.number().int().min(2).max(20).optional(),
+    priorWindowMin:  z.number().min(1).max(1440).optional(),
+    priorCountMin:   z.number().int().min(1).max(10).optional(),
+    momentumPctMin:  z.number().min(0).max(50).optional(),
+    cumMovePctMin:   z.number().min(0).max(50).optional(),
   })).max(16).optional(),
   echo_dca_scale:         z.array(z.number().min(1).max(20)).max(10).optional(),
   echo_dca_scale_idle:    z.array(z.number().min(1).max(20)).max(10).optional(),

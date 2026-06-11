@@ -165,6 +165,29 @@ export interface EchoEdgeCase {
   /** |body3| floor for DCA placement when this case opened the cycle.
    *  Typically lower than body3Min (averaging-down accepts weaker signal). */
   dcaBody3Min:  number;
+
+  // ── Extended conditions (clustering + magnitude). All optional; when set,
+  //    ANDed with the streak + body gates above. Computed from the 48-bar
+  //    baseline at T+4 (SignalT4Event.edgeContext). Backtest: EDGE_CASES.md.
+
+  /** CLUSTERING: require ≥ `priorCountMin` prior same-direction streak-peaks
+   *  ≥ this value, that ended within `priorWindowMin` minutes before the
+   *  current run started. "Exhaustion clustering" — e.g. streak4 fades 58%→
+   *  OOS 61% when a prior ≥5 ran within 30m. 0/undefined = no clustering gate. */
+  priorStreakMin?: number;
+  /** CLUSTERING: lookback window in minutes for the prior-peak scan. */
+  priorWindowMin?: number;
+  /** CLUSTERING: min count of qualifying prior peaks (default 1; 2 = double). */
+  priorCountMin?:  number;
+
+  /** MAGNITUDE: require |% move over the last 12 closed bars| (= 1h on 5m), in
+   *  the streak direction, ≥ this. "Đã tăng bao nhiêu" — recent momentum. On 5m
+   *  streak=3, ≥0.38% → 58% / OOS 60%. 0/undefined = no momentum gate. */
+  momentumPctMin?: number;
+  /** MAGNITUDE: require |% move over the streak's bars|, in the streak
+   *  direction, ≥ this. Over-extension of THIS run. 1h streak=4 ≥1.85% → 62% /
+   *  OOS 59%; 1h streak=2 ≥0.90% → 56%. 0/undefined = no cum-move gate. */
+  cumMovePctMin?:  number;
 }
 
 /**

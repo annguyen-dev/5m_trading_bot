@@ -456,6 +456,17 @@ export interface EchoEdgeCase {
    *  Recommended: streak=3 → 1.2, streak=6/7 → 1.0. 0/undefined = dollar gate. */
   body3OverAvgMin?: number;
   dcaBody3Min:  number;
+  // Extended conditions (clustering + magnitude). Preserved through the editor
+  // (it spreads the edge object); no dedicated input UI yet — set via API/DB.
+  // See EDGE_CASES.md. Backtest scripts: analyze-clustering-v2 / -magnitude-edges.
+  /** Clustering: ≥priorCountMin prior same-dir streak-peaks ≥this within priorWindowMin. */
+  priorStreakMin?: number;
+  priorWindowMin?: number;
+  priorCountMin?:  number;
+  /** Magnitude: |% move over last 12 bars (1h@5m)| in streak dir ≥ this. */
+  momentumPctMin?: number;
+  /** Magnitude: |% move over the streak's bars| in streak dir ≥ this. */
+  cumMovePctMin?:  number;
 }
 
 export interface AutoScheduleEntry {
