@@ -217,6 +217,12 @@ function CoinRow({
       && (ec.body3Max == null || (ec.body3Max >= ec.body3Min && ec.body3Max <= 10_000))
       && (ec.body3OverAvgMin == null || (ec.body3OverAvgMin >= 0 && ec.body3OverAvgMin <= 10))
       && ec.dcaBody3Min >= 0 && ec.dcaBody3Min <= 10_000
+      // Extended conditions (clustering + magnitude). All optional.
+      && (ec.priorStreakMin == null || (ec.priorStreakMin >= 2 && ec.priorStreakMin <= 20))
+      && (ec.priorWindowMin == null || (ec.priorWindowMin >= 1 && ec.priorWindowMin <= 1440))
+      && (ec.priorCountMin  == null || (ec.priorCountMin  >= 1 && ec.priorCountMin  <= 10))
+      && (ec.momentumPctMin == null || (ec.momentumPctMin >= 0 && ec.momentumPctMin <= 50))
+      && (ec.cumMovePctMin  == null || (ec.cumMovePctMin  >= 0 && ec.cumMovePctMin  <= 50))
     )
     && scheduleValid
     && echoValid;
@@ -1016,7 +1022,8 @@ function EdgeCaseEditor({
           </thead>
           <tbody>
             {value.map(ec => (
-              <tr key={ec.id} style={{ background: ec.enabled ? 'transparent' : '#0a0d12' }}>
+              <React.Fragment key={ec.id}>
+              <tr style={{ background: ec.enabled ? 'transparent' : '#0a0d12' }}>
                 <td style={{ padding: '2px 6px' }}>
                   <input type="checkbox"
                          checked={ec.enabled}
@@ -1089,6 +1096,47 @@ function EdgeCaseEditor({
                   </button>
                 </td>
               </tr>
+              <tr style={{ background: ec.enabled ? 'transparent' : '#0a0d12' }}>
+                <td />
+                <td colSpan={8} style={{ padding: '0 6px 8px' }}>
+                  <div style={{ display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap',
+                                fontSize: 10, color: '#6e7681' }}>
+                    <span style={{ color: '#8b949e' }}>adv:</span>
+                    <label title="MAGNITUDE: |% move over last 12 bars (1h@5m)| in streak dir ≥ this. 0 = off. e.g. 5m streak3 → 0.38."
+                           style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                      mom% ≥
+                      <NumInput value={ec.momentumPctMin ?? 0} min={0} max={50} step={0.01} disabled={disabled}
+                                onChange={v => update(ec.id, { momentumPctMin: v > 0 ? v : undefined })} />
+                    </label>
+                    <label title="MAGNITUDE: |% move over the streak's bars| in streak dir ≥ this. 0 = off. e.g. 1h streak2 → 0.90, streak4 → 1.85."
+                           style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                      cum% ≥
+                      <NumInput value={ec.cumMovePctMin ?? 0} min={0} max={50} step={0.01} disabled={disabled}
+                                onChange={v => update(ec.id, { cumMovePctMin: v > 0 ? v : undefined })} />
+                    </label>
+                    <span style={{ color: '#30363d' }}>│</span>
+                    <label title="CLUSTERING: require a prior same-direction streak-peak ≥ this value. 0 = off. e.g. 5m streak4 → 5."
+                           style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                      prior streak ≥
+                      <NumInput value={ec.priorStreakMin ?? 0} min={0} max={20} step={1} disabled={disabled}
+                                onChange={v => update(ec.id, { priorStreakMin: v > 0 ? v : undefined })} />
+                    </label>
+                    <label title="CLUSTERING: lookback window (minutes) for the prior-streak scan. e.g. 30."
+                           style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                      within min
+                      <NumInput value={ec.priorWindowMin ?? 0} min={0} max={1440} step={5} disabled={disabled}
+                                onChange={v => update(ec.id, { priorWindowMin: v > 0 ? v : undefined })} />
+                    </label>
+                    <label title="CLUSTERING: min count of qualifying prior peaks (1, or 2 for double-cluster)."
+                           style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                      count ≥
+                      <NumInput value={ec.priorCountMin ?? 0} min={0} max={10} step={1} disabled={disabled}
+                                onChange={v => update(ec.id, { priorCountMin: v > 0 ? v : undefined })} />
+                    </label>
+                  </div>
+                </td>
+              </tr>
+              </React.Fragment>
             ))}
           </tbody>
         </table>
