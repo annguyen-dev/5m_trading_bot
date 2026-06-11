@@ -113,6 +113,7 @@ streak=2 trên **5m**: magnitude KHÔNG cứu (best ~54%, âm $/ngày) — quá 
 | **Priming NGƯỢC chiều** (prior DOWN → fade UP) | Vô dụng. Xác nhận là exhaustion cùng chiều, không phải whipsaw |
 | **Defensive regime theo UTC-hour** | Không cải thiện WR |
 | **Hour-range × edge** (combine) | Không add robust. 5m EU 08-16 chỉ +2pp (gần noise); 1h số đẹp đều n nhỏ + OOS sụp block bên cạnh = overfit. Edge chạy ổn mọi giờ. Hint yếu: 04-08 UTC yếu nhất @5m. `analyze-hour-range.ts` |
+| **Streak frequency** (đếm tần suất/24h → gate) | Không predict WR. Tercile low/mid/high gần phẳng; chỗ lệch ko giữ OOS, đôi chỗ HIGH-freq còn tốt hơn (ngược). Lý do: tần suất ≈ volatility mà ratio/momentum đã chuẩn hóa → redundant. Kill-switch (outcome-based) là regime-guard đúng. `analyze-streak-frequency.ts` |
 | **"Bad hours" + streak cao + body restrict** | Không có edge đáng kể |
 | **Follow (thuận xu hướng)** thay vì fade | Chiến lược là fade — follow không test sâu |
 | **Wick / rejection candle** | 5m vô dụng (âm); 1h chỉ s5 (n nhỏ). Trái sách vở — rejection ko predict fade ở đây |
