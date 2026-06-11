@@ -372,6 +372,13 @@ export class PriceMonitoringWorker {
   private async fetchInProgressIcon(
     symbol: CoinSymbol, windowStart: number, windowEnd: number,
   ): Promise<string> {
+    // Direction = Binance close-vs-open (the chart visual) — consistent with
+    // the streak detection (now Binance-based) + the backtest. The live bar's
+    // current price vs open is deterministic; Poly midpoint is fallback ONLY
+    // when Binance is flat / the fetch fails (returns ⚪ → no +1, conservative).
+    const binIcon = await fetchInProgressIconBinance(symbol, windowStart);
+    if (binIcon !== '⚪') return binIcon;
+    // Fallback: Poly midpoint from the in-memory book cache (instant).
     const { rows } = await getPool().query<{ token_up: string }>(
       `SELECT token_up FROM poly_clob_markets
         WHERE symbol = $1 AND window_start = $2 AND window_end = $3
@@ -385,10 +392,9 @@ export class PriceMonitoringWorker {
         const mid = (cache.bestBid + cache.bestAsk) / 2;
         if (mid > 0.55) return '🟢';
         if (mid < 0.45) return '🔴';
-        // dead band → inconclusive Poly, fall through to Binance
       }
     }
-    return fetchInProgressIconBinance(symbol, windowStart);
+    return '⚪';
   }
 
   /** Register a handler called on every share_tick from any subscribed token.
@@ -2787,14 +2793,19 @@ async function fetchStreakWithVolume(
     }
   }
 
-  // Effective per-bar outcome: Poly first, Binance fallback (doji bars
-  // count as doji regardless — Poly NULL on a Binance doji means we
-  // genuinely don't know the direction).
-  const outcomes: ('up' | 'down' | 'doji')[] = bars.map((_, i) => {
-    const poly = polyMap.get(allWindowStarts[i]!);
-    if (poly) return poly;
-    return binanceOutcomes[i]!;
-  });
+  // Streak DIRECTION from Binance close-vs-open — the chart visual AND the
+  // source the edges were backtested on. Poly is kept ONLY for mismatch alerts
+  // + T-0 closure (P&L truth). History: 1769269 Poly → b6ff6c2 Binance →
+  // dc44000 Poly → THIS revert to Binance.
+  //
+  // Why: poly_clob_markets.outcome is the T-0 midpoint read, which lands on the
+  // wrong side of 0.5 for tiny-move bars. Verified 2026-06-11 10:20 UTC BTC:
+  // Binance +$7.5 UP, Polymarket UI green (up), but stored outcome 'down' →
+  // bot's streak undercounted by 1 → fired s6 on a chart-7 setup. Binance
+  // close-vs-open is deterministic, matches the chart, and matches the backtest.
+  // dc44000's phaseT0 closure tree still reconciles Binance candle vs Poly
+  // outcome (skip DCA + reset on mismatch), so no double-fade regression.
+  const outcomes: ('up' | 'down' | 'doji')[] = binanceOutcomes;
 
   const newest = outcomes[outcomes.length - 1];
   if (!newest || newest === 'doji') {
@@ -2826,8 +2837,9 @@ async function fetchStreakWithVolume(
     binanceStreak = binanceNewest === 'up' ? bn : -bn;
   }
 
-  // ── Mismatch detection (info-only — Poly drives streak, this is for
-  //    alerts so user knows when Binance chart diverges from Poly truth).
+  // ── Mismatch detection (info-only — Binance drives streak now; this alerts
+  //    when Poly's stored outcome diverges from the Binance chart so the user
+  //    knows the bet may resolve against the chart visual at T-0).
   const visibleStart = bars.length - n;
   const mismatches: StreakResult['mismatches'] = [];
   for (let i = visibleStart; i < bars.length; i++) {
