@@ -114,6 +114,16 @@ streak=2 trên **5m**: magnitude KHÔNG cứu (best ~54%, âm $/ngày) — quá 
 | **Defensive regime theo UTC-hour** | Không cải thiện WR |
 | **"Bad hours" + streak cao + body restrict** | Không có edge đáng kể |
 | **Follow (thuận xu hướng)** thay vì fade | Chiến lược là fade — follow không test sâu |
+| **Wick / rejection candle** | 5m vô dụng (âm); 1h chỉ s5 (n nhỏ). Trái sách vở — rejection ko predict fade ở đây |
+
+### Modest — THẬT nhưng yếu hơn (chưa implement, `analyze-wick-vol-accel.ts`)
+| Signal | Edge | OOS | Vs đã có |
+|---|---|---|---|
+| Volume climax | 5m s3 vol≥2.3× (top10%) | 63% | implementable (có volume) nhưng s3 đã có ratio+mom — overlap |
+| Deceleration | 1h s2/s4 accel thấp (move hụt hơi) | 56-58% | yếu hơn cum/ratio |
+| Volume climax | 1h s4 vol≥0.95× | 56% | overlap s4 cum |
+
+→ Đều 55-57% (yếu hơn magnitude/clustering 58-62%) + overlap streak đã có filter. Để dành, chưa thêm.
 
 ---
 
