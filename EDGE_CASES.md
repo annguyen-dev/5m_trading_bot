@@ -115,6 +115,7 @@ streak=2 trên **5m**: magnitude KHÔNG cứu (best ~54%, âm $/ngày) — quá 
 | **"Bad hours" + streak cao + body restrict** | Không có edge đáng kể |
 | **Follow (thuận xu hướng)** thay vì fade | Chiến lược là fade — follow không test sâu |
 | **Wick / rejection candle** | 5m vô dụng (âm); 1h chỉ s5 (n nhỏ). Trái sách vở — rejection ko predict fade ở đây |
+| **momentum × wick/climax** (combine) | KHÔNG stack — đo cùng "over-extension", tương quan cao → momentum nuốt hết. Wick âm kể cả combine. Climax chỉ +3pp ở 1h s4 (n nhỏ). `analyze-momentum-combos.ts` |
 
 ### Modest — THẬT nhưng yếu hơn (chưa implement, `analyze-wick-vol-accel.ts`)
 | Signal | Edge | OOS | Vs đã có |
