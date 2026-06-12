@@ -176,7 +176,7 @@ function fmtWindow(start: number, end: number): string {
 function coinLabel(coin: CoinSymbol | string): string {
   const meta = COIN_META[coin as CoinSymbol];
   const tf = meta ? meta.binanceInterval : '5m';
-  const base = String(coin).replace(/_1H$/i, '');
+  const base = String(coin).replace(/_(1H|15M)$/i, '');
   return `${base}_${tf}`;
 }
 

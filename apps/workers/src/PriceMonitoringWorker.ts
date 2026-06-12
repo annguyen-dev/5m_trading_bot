@@ -88,10 +88,11 @@ const BINANCE_SYMBOL: Partial<Record<CoinSymbol, string>> = {
   XRP:    'XRPUSDT',
   DOGE:   'DOGEUSDT',
   BNB:    'BNBUSDT',
-  // BTC_1H / ETH_1H share the same Binance spot pair as BTC / ETH; only the
-  // kline interval differs (COIN_META[*_1H].binanceInterval='1h' vs '5m').
+  // BTC_1H / ETH_1H / BTC_15m share the same Binance spot pair as BTC / ETH; only
+  // the kline interval differs (COIN_META[*].binanceInterval: '1h' / '15m' vs '5m').
   BTC_1H: 'BTCUSDT',
   ETH_1H: 'ETHUSDT',
+  BTC_15m: 'BTCUSDT',
 };
 
 /** Pyth TradingView ticker per coin (fallback for coins not on Binance). */
@@ -3338,7 +3339,7 @@ async function fetchBars(
 }
 
 async function fetchBinanceBars(
-  binanceSym: string, interval: '5m' | '1h', startTimeMs: number, endTimeMs: number, limit: number,
+  binanceSym: string, interval: '5m' | '15m' | '1h', startTimeMs: number, endTimeMs: number, limit: number,
 ): Promise<Bar[]> {
   try {
     return await withRetry(`Binance klines ${binanceSym}@${interval}`, async () => {

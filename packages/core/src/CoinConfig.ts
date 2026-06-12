@@ -8,7 +8,7 @@
  */
 import { getPool } from '@trading-bot/db';
 
-export type CoinSymbol  = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE' | 'HYPE' | 'BNB' | 'BTC_1H' | 'ETH_1H';
+export type CoinSymbol  = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE' | 'HYPE' | 'BNB' | 'BTC_1H' | 'ETH_1H' | 'BTC_15m';
 
 /**
  * Per-coin metadata for timeframe / Polymarket integration / phase scheduling.
@@ -26,7 +26,7 @@ export type CoinSymbol  = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE' | 'HYPE' | 'BNB
  */
 export interface CoinMeta {
   windowMs:           number;
-  binanceInterval:    '5m' | '1h';
+  binanceInterval:    '5m' | '15m' | '1h';
   previewOffsetMs:    number;
   decisionOffsetMs:   number;
   recheckOffsetMs:    number | null;
@@ -94,6 +94,17 @@ export const COIN_META: Record<CoinSymbol, CoinMeta> = {
     decisionOffsetMs: 10 * 60_000,
     recheckOffsetMs:  30_000,
     slugForWindow:    (s) => formatCrypto1hSlug('ethereum', s),
+  },
+  // BTC_15m — 15-minute timeframe. Slug family matches 5m (btc-updown-{tf}-{unix}),
+  // not the 1h date format. Phase dispatch is generic (COIN_META offsets), same as
+  // BTC_1H. Edges (s2/s4/s5 ratio) discovered on 365d Binance 15m — see EDGE_CASES.md.
+  BTC_15m: {
+    windowMs:         900_000,     // 15 min
+    binanceInterval:  '15m',
+    previewOffsetMs:  720_000,     // T+12min — preview signal + Telegram (~80% in, like 5m's 4/5)
+    decisionOffsetMs: 3_000,       // T-3s — place boundary order (same as 5m)
+    recheckOffsetMs:  null,        // no recheck (window short like 5m)
+    slugForWindow:    (s) => `btc-updown-15m-${s}`,
   },
 };
 export type CoinMode    = 'signal_only' | 'signal_and_order';
@@ -473,7 +484,7 @@ const DEFAULT_CONFIG: CoinConfig = {
   dca_body3_min_armed:              0,
 };
 
-export const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB', 'BTC_1H', 'ETH_1H'];
+export const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB', 'BTC_1H', 'ETH_1H', 'BTC_15m'];
 
 /**
  * Per-coin overrides applied on top of DEFAULT_CONFIG. Used for fields where
@@ -522,6 +533,16 @@ export const PER_COIN_OVERRIDES: Partial<Record<CoinSymbol, Partial<CoinConfig>>
     echo_window_minutes:         360,  // 6h arm window — placeholder
     echo_signal_min_streak:      2,
     echo_baseline_streak:        4,
+  },
+  // BTC_15m — universal-edge echo (s2/s4/s5 ratio). Baseline streak set high so
+  // only edge cases fire; size $2 (sane on shared ~$45 balance — base $24 would
+  // blow up, see sim). DB-stored config is source of truth; these are defaults.
+  BTC_15m: {
+    strategy:                    'echo',
+    size_usdc:                   2,
+    limit_price_cents:           57,
+    streak_min:                  2,
+    echo_baseline_streak:        99,   // edge-only — baseline never fires
   },
 };
 

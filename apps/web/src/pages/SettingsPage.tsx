@@ -14,7 +14,7 @@ import {
   type TelegramChannel, type TelegramInfoType, type CoinSymbol,
 } from '../api/client.js';
 
-const ALL_COINS: CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB', 'BTC_1H'];
+const ALL_COINS: CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB', 'BTC_1H', 'ETH_1H', 'BTC_15m'];
 
 export default function SettingsPage() {
   const [rows,  setRows]  = useState<CoinConfigRow[] | null>(null);
