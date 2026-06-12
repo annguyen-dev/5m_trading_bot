@@ -13,6 +13,10 @@
 |---|---|---|
 | **BTC 5m** | s3 ratio≥1.2 · s6 ratio≥1.0 · s7 ratio≥1.0 · **s3 mom≥0.38%** · **s4 prior≥5/30m** | POLY_1271, chung |
 | **BTC 1h** | s3 ratio≥0.8 · s4 ratio≥1.0 · **s2 cum≥0.90%** · **s4 cum≥1.85%** (streak_min=2) | (chung) |
+| **ETH 5m** | s3 ratio≥1.0 · s4≥0.8 · s5≥0.8 · s6≥1.0 (size $1) | (chung) |
+| **ETH 1h** | s3 ratio≥0.8 (size $1) | (chung) |
+
+> DOGE/XRP/BNB/SOL/HYPE: **disabled**. Live coins: BTC, BTC_1H, ETH, ETH_1H (2026-06-12).
 
 Mọi edge: `baseline=99` (chỉ edge fire), entry cap $0.55, no DCA, kill-switch bật.
 Đường fire theo streak-count (`auto_order_min_streak`) + arm mode **tắt** (sentinel 99) — xem [§ Arm mode](#arm-mode).
@@ -103,11 +107,36 @@ streak=2 trên **5m**: magnitude KHÔNG cứu (best ~54%, âm $/ngày) — quá 
 
 ---
 
+## Multi-coin discovery (2026-06-12)
+
+Cùng phương pháp (ratio/magnitude/clustering, OOS) chạy cho ETH/SOL/BNB. **Edge structure khác nhau per coin** (`SYMBOL=… npx tsx`):
+
+| Coin | 5m sweet spot | 1h | Ghi chú |
+|---|---|---|---|
+| BTC | s3/6/7 (ratio) | s3/4 | sát breakeven, ret/DD thấp |
+| **ETH** 🥇 | **s3-s6** (ratio mạnh; s3 ~$2/ngày) | s3≥0.8 | giàu nhất, s4 chạy thẳng |
+| SOL 🥈 | **s4** (ratio≥1.0/mom $0.99), s6 | s3≥1.0 ($0.41) | s3 noisy (cần ratio≥1.5); s5 chỉ qua clustering |
+| BNB | **s4 CLUSTERING** ($0.57) | s3 (combo) | ratio đơn lẻ CHẾT |
+
+**Ranking risk-adjusted (5m full config, ret/DD = PnL/maxDD, base $5, 365d):**
+| Hạng | Coin | ret/DD | maxDD | PnL/yr |
+|---|---|---|---|---|
+| 🥇 | ETH | **4.3** | 55R | $1200 |
+| 🥈 | SOL | 1.4 | 63R | $436 |
+| 🥉 | BTC | 0.1 | 117R | $80 |
+| 4 | BNB | 0.1 | — | ratio chết |
+
+**Correlation vs BTC (5m):** direction agreement **76-81%**, concordant outcomes **77-81%** (cùng thắng/cùng thua). SOLO WR (khi BTC ngoài streak): ETH **56%** (chỉ ETH trên breakeven) / SOL 51% / BNB 49%.
+→ Các alt **correlated mạnh** với BTC → trade nhiều coin full-size = **DD cộng dồn**, không diversify. **ETH là single tốt nhất.** Scripts: `analyze-eth-btc-corr.ts` (ALT env), `analyze-eth-btc-dd.ts` (ALT/ALT_CFG env).
+
+---
+
 ## Ngõ cụt — ĐÃ LOẠI (đừng test lại)
 
 | Pattern | Kết quả |
 |---|---|
 | **Raw streak** (không filter) | Mọi streak length 50-55% → thua. Phải có filter. |
+| **body3+ratio KHÔNG streak** (fade nến to bất kỳ) | ~52% (dưới breakeven), lỗ khắp. Streak thêm ~3pp (54-56%). Streak là filter CHÍNH (directional persistence→exhaustion); 1 nến to đơn lẻ = 50/50 breakout vs spike → ratio mất ý nghĩa. `analyze-bodyratio-nostreak.ts` |
 | **Fixed dollar body3** | Decay theo regime; ratio luôn ăn đứt |
 | **streak=5 fade** | Chết hẳn (50-51%), clustering cũng không cứu, thậm chí âm |
 | **Priming NGƯỢC chiều** (prior DOWN → fade UP) | Vô dụng. Xác nhận là exhaustion cùng chiều, không phải whipsaw |
