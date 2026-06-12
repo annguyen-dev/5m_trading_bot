@@ -158,6 +158,8 @@ export interface CoinT3Event {
   signalPath?: 'boundary' | 'dca';
   /** True if placement happened at T-0 retry (not the original T-3s tick). */
   lateRetry?:  boolean;
+  /** Which rule fired: matched edge-case label/id, or 'idle'/'armed' mode. */
+  matchCase?:  string;
   emittedAt:   number;
 }
 

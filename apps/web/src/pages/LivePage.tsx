@@ -2167,7 +2167,19 @@ const CoinCard = React.memo(function CoinCard({
             {t3.action === 'order_placed'
               ? <>✅ <strong>{(t3.direction ?? '?').toUpperCase()}</strong>
                   {' @ '}{t3.price != null ? `${(t3.price * 100).toFixed(0)}¢` : '?'}
-                  {' · $'}{t3.sizeUsdc ?? '?'}</>
+                  {' · $'}{t3.sizeUsdc ?? '?'}
+                  {t3.matchCase && (() => {
+                    const isEdge = !['idle', 'armed', 'idle-chain'].includes(t3.matchCase!);
+                    return (
+                      <span style={{
+                        marginLeft: 6, padding: '1px 6px', borderRadius: 4, fontSize: 11,
+                        background: isEdge ? '#16301c' : '#21262d',
+                        color:      isEdge ? '#7ee787' : '#8b949e',
+                      }}>
+                        {isEdge ? '📋 ' : '⚙ '}{t3.matchCase}
+                      </span>
+                    );
+                  })()}</>
               : t3.action === 'order_skipped'
               ? <span style={{ color: '#f0a500' }}>⚠ skip: {t3.reason ?? '—'}</span>
               : <span style={{ color: '#8b949e' }}>ℹ signal-only mode</span>}

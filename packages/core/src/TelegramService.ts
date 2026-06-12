@@ -229,13 +229,13 @@ function formatTMinus3(ev: SignalTMinus3Event): string {
       //   BTC_5m: 🔴🔴🔴 🔴   ✅ FIRE
       //   window: 04:55-05:00, streak: -4
       //   body3 $502 · avg $140 · ratio 1.20×
-      //   match case: streak4   |   type: boundary
+      //   📋 edge: streak4   |   type: boundary
       //   ✅ 🟢 UP @ 30¢ · $6 · id ab12cd…
       const lines = [
         `<b>${coinLabel(ev.coin)}</b>: ${streakChain(ev.pastStreakIcons ?? '', ev.currentIcon ?? '')}   ✅ <b>FIRE</b>${lateTag}`,
         `window: <code>${win}</code>, streak: <b>${ev.streak ?? '?'}</b>`,
         body3Line(ev.body3Sum, ev.avgBody),
-        `match case: <b>${escapeHtml(matchCase)}</b>   |   type: <b>${type}</b>`,
+        `${['idle', 'armed', 'idle-chain', '?'].includes(matchCase) ? '⚙ mode' : '📋 edge'}: <b>${escapeHtml(matchCase)}</b>   |   type: <b>${type}</b>`,
         `${dirIcon} <b>${(ev.direction ?? '?').toUpperCase()}</b> @ ${priceStr} · $${ev.sizeUsdc ?? '?'}`
           + (ev.orderId ? ` · id <code>${escapeHtml(ev.orderId.slice(0, 8))}…</code>` : ''),
       ];
