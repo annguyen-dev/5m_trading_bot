@@ -433,7 +433,7 @@ export const api = {
 
 // ── Per-coin config types ───────────────────────────────────────────────────
 
-export type CoinSymbol  = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE' | 'HYPE' | 'BNB' | 'BTC_1H';
+export type CoinSymbol  = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE' | 'HYPE' | 'BNB' | 'BTC_1H' | 'ETH_1H';
 export type CoinMode    = 'signal_only' | 'signal_and_order';
 /** Strategy choice — 'streak' = baseline simple, 'echo' = Echo Hunt (arm-window). */
 export type CoinStrategy = 'streak' | 'echo';

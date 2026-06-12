@@ -8,7 +8,7 @@
  */
 import { getPool } from '@trading-bot/db';
 
-export type CoinSymbol  = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE' | 'HYPE' | 'BNB' | 'BTC_1H';
+export type CoinSymbol  = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE' | 'HYPE' | 'BNB' | 'BTC_1H' | 'ETH_1H';
 
 /**
  * Per-coin metadata for timeframe / Polymarket integration / phase scheduling.
@@ -50,13 +50,14 @@ const make5mMeta = (sym: string): CoinMeta => ({
   slugForWindow: (unixSec) => `${SLUG_PREFIX_5M[sym]}${unixSec}`,
 });
 
-/** Slug for BTC 1h Polymarket markets. Format observed (gamma-api):
- *  `bitcoin-up-or-down-{month}-{day}-{year}-{hour}{am|pm}-et`
+/** Slug for a 1h Polymarket up/down market. Format observed (gamma-api):
+ *  `{name}-up-or-down-{month}-{day}-{year}-{hour}{am|pm}-et`
  *  Examples: `bitcoin-up-or-down-may-27-2026-6am-et`,
- *            `bitcoin-up-or-down-may-27-2026-12pm-et`.
- *  Date/hour are in ET (America/New_York, DST-aware). The hour is the START
- *  of the 1h candle (e.g. 6am-et = candle 06:00→07:00 ET). */
-function formatBtc1hSlug(unixSec: number): string {
+ *            `ethereum-up-or-down-june-12-2026-2am-et`.
+ *  `name` is the long coin name on Polymarket (bitcoin / ethereum). Date/hour
+ *  are in ET (America/New_York, DST-aware). The hour is the START of the 1h
+ *  candle (e.g. 6am-et = candle 06:00→07:00 ET). */
+function formatCrypto1hSlug(name: string, unixSec: number): string {
   const d = new Date(unixSec * 1000);
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/New_York', month: 'long', day: 'numeric',
@@ -67,7 +68,7 @@ function formatBtc1hSlug(unixSec: number): string {
   const year  = parts.find(p => p.type === 'year')!.value;
   const hour  = parts.find(p => p.type === 'hour')!.value;
   const ampm  = parts.find(p => p.type === 'dayPeriod')!.value.toLowerCase();
-  return `bitcoin-up-or-down-${month}-${day}-${year}-${hour}${ampm}-et`;
+  return `${name}-up-or-down-${month}-${day}-${year}-${hour}${ampm}-et`;
 }
 
 export const COIN_META: Record<CoinSymbol, CoinMeta> = {
@@ -84,7 +85,15 @@ export const COIN_META: Record<CoinSymbol, CoinMeta> = {
     previewOffsetMs:  40 * 60_000,  // T+40min — emit preview signal + Telegram
     decisionOffsetMs: 10 * 60_000,  // T-10min — place boundary order
     recheckOffsetMs:  30_000,       // T-30s   — recheck + cancel if conditions flipped
-    slugForWindow:    formatBtc1hSlug,
+    slugForWindow:    (s) => formatCrypto1hSlug('bitcoin', s),
+  },
+  ETH_1H: {
+    windowMs:         3_600_000,
+    binanceInterval:  '1h',
+    previewOffsetMs:  40 * 60_000,
+    decisionOffsetMs: 10 * 60_000,
+    recheckOffsetMs:  30_000,
+    slugForWindow:    (s) => formatCrypto1hSlug('ethereum', s),
   },
 };
 export type CoinMode    = 'signal_only' | 'signal_and_order';
@@ -464,7 +473,7 @@ const DEFAULT_CONFIG: CoinConfig = {
   dca_body3_min_armed:              0,
 };
 
-export const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB', 'BTC_1H'];
+export const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB', 'BTC_1H', 'ETH_1H'];
 
 /**
  * Per-coin overrides applied on top of DEFAULT_CONFIG. Used for fields where

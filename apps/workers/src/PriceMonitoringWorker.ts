@@ -88,9 +88,10 @@ const BINANCE_SYMBOL: Partial<Record<CoinSymbol, string>> = {
   XRP:    'XRPUSDT',
   DOGE:   'DOGEUSDT',
   BNB:    'BNBUSDT',
-  // BTC_1H shares the same Binance spot pair as BTC; only the kline interval
-  // differs (COIN_META[BTC_1H].binanceInterval='1h' vs BTC's '5m').
+  // BTC_1H / ETH_1H share the same Binance spot pair as BTC / ETH; only the
+  // kline interval differs (COIN_META[*_1H].binanceInterval='1h' vs '5m').
   BTC_1H: 'BTCUSDT',
+  ETH_1H: 'ETHUSDT',
 };
 
 /** Pyth TradingView ticker per coin (fallback for coins not on Binance). */
