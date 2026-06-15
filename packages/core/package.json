@@ -8,6 +8,10 @@
       "types": "./dist/CoinConfig.d.ts",
       "import": "./dist/CoinConfig.js"
     },
+    "./resultGate": {
+      "types": "./dist/resultGate.d.ts",
+      "import": "./dist/resultGate.js"
+    },
     "./SignalBus": {
       "types": "./dist/SignalBus.d.ts",
       "import": "./dist/SignalBus.js"

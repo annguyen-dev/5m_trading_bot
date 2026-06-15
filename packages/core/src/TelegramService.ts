@@ -205,21 +205,22 @@ function formatT4(ev: SignalT4Event): string {
 
 /** body3 + avgBody + regime-relative ratio line. ratio = body3 / (avgBody×3) —
  *  the gate the bot fades on. Shows '?' when data missing. */
-function body3Line(body3Sum: number | undefined, avgBody: number | undefined): string {
-  if (body3Sum == null) return 'body3: ?';
+function body3Line(body3Sum: number | undefined, avgBody: number | undefined, er?: number): string {
+  // ER = Kaufman efficiency-ratio (chop detector). <0.25 = choppy (fade loses).
+  const erStr = er != null ? ` · ER <b>${er.toFixed(2)}</b>` : '';
+  if (body3Sum == null) return `body3: ?${erStr}`;
   const b3 = `$${body3Sum.toFixed(0)}`;
   if (avgBody != null && avgBody > 0) {
     const ratio = body3Sum / (avgBody * 3);
-    return `body3 ${b3} · avg $${avgBody.toFixed(0)} · ratio <b>${ratio.toFixed(2)}×</b>`;
+    return `body3 ${b3} · avg $${avgBody.toFixed(0)} · ratio <b>${ratio.toFixed(2)}×</b>${erStr}`;
   }
-  return `body3 ${b3}`;
+  return `body3 ${b3}${erStr}`;
 }
 
 function formatTMinus3(ev: SignalTMinus3Event): string {
   const win      = fmtWindow(ev.windowStart, ev.windowEnd);
-  const type     = ev.signalPath === 'dca' ? 'dca' : 'boundary';
   const lateTag  = ev.lateRetry ? ' · ⏰ <i>T-0 retry</i>' : '';
-  const matchCase = ev.matchCase ?? (ev.adaptive ? ev.adaptive.mode.replace('aggressive','armed').replace('default','idle').replace('conservative','idle-chain') : '?');
+  const matchCase = ev.matchCase ?? '?';
 
   switch (ev.action) {
     case 'order_placed': {
@@ -229,13 +230,13 @@ function formatTMinus3(ev: SignalTMinus3Event): string {
       //   BTC_5m: 🔴🔴🔴 🔴   ✅ FIRE
       //   window: 04:55-05:00, streak: -4
       //   body3 $502 · avg $140 · ratio 1.20×
-      //   📋 edge: streak4   |   type: boundary
+      //   📋 edge: streak4
       //   ✅ 🟢 UP @ 30¢ · $6 · id ab12cd…
       const lines = [
         `<b>${coinLabel(ev.coin)}</b>: ${streakChain(ev.pastStreakIcons ?? '', ev.currentIcon ?? '')}   ✅ <b>FIRE</b>${lateTag}`,
         `window: <code>${win}</code>, streak: <b>${ev.streak ?? '?'}</b>`,
-        body3Line(ev.body3Sum, ev.avgBody),
-        `${['idle', 'armed', 'idle-chain', '?'].includes(matchCase) ? '⚙ mode' : '📋 edge'}: <b>${escapeHtml(matchCase)}</b>   |   type: <b>${type}</b>`,
+        body3Line(ev.body3Sum, ev.avgBody, ev.efficiencyRatio),
+        `📋 edge: <b>${escapeHtml(matchCase)}</b>`,
         `${dirIcon} <b>${(ev.direction ?? '?').toUpperCase()}</b> @ ${priceStr} · $${ev.sizeUsdc ?? '?'}`
           + (ev.orderId ? ` · id <code>${escapeHtml(ev.orderId.slice(0, 8))}…</code>` : ''),
       ];
@@ -244,8 +245,8 @@ function formatTMinus3(ev: SignalTMinus3Event): string {
     case 'order_skipped':
       return [
         `<b>${coinLabel(ev.coin)}</b>: ${streakChain(ev.pastStreakIcons ?? '', ev.currentIcon ?? '')}   ⚠ <b>SKIP</b>`,
-        `window: <code>${win}</code>, streak: <b>${ev.streak ?? '?'}</b>  ·  type: ${type}`,
-        body3Line(ev.body3Sum, ev.avgBody),
+        `window: <code>${win}</code>, streak: <b>${ev.streak ?? '?'}</b>`,
+        body3Line(ev.body3Sum, ev.avgBody, ev.efficiencyRatio),
         `reason: ${escapeHtml(ev.reason ?? '(no reason)')}`,
       ].join('\n');
     case 'signal_only_mode':
@@ -259,9 +260,8 @@ function escapeHtml(s: string): string {
 
 function formatT0Plus(ev: SignalT0PlusEvent): string {
   const o = ev.order;
-  const dcaTag = o.signalPath === 'dca' ? ' · 🔄 DCA' : '';
   return [
-    `<b>${coinLabel(ev.coin)}</b> · <b>T+0</b> · <code>${fmtWindow(ev.windowStart, ev.windowEnd)}</code> · 🎯 active order${dcaTag}`,
+    `<b>${coinLabel(ev.coin)}</b> · <b>T+0</b> · <code>${fmtWindow(ev.windowStart, ev.windowEnd)}</code> · 🎯 active order`,
     `${o.direction.toUpperCase()} @ ${(o.entryPrice * 100).toFixed(1)}¢ · $${o.sizeUsdc} · `
       + `id <code>${escapeHtml(o.orderId.slice(0, 8))}…</code>`,
   ].join('\n');
@@ -278,21 +278,11 @@ function formatT0(ev: SignalT0Event): string {
   if (ev.order) {
     const o = ev.order;
     const pnlStr = `PnL ${o.pnlUsdc >= 0 ? '+' : ''}$${o.pnlUsdc.toFixed(2)}`;
-    const dcaTag = o.signalPath === 'dca' ? ' · 🔄 DCA' : '';
     lines.push(
-      `<b>${coinLabel(ev.coin)}</b> · <b>T-0</b> · <code>${winLabel}</code> · ${outIcon} ${ev.outcome.toUpperCase()} · ${pnlStr}${dcaTag}`,
+      `<b>${coinLabel(ev.coin)}</b> · <b>T-0</b> · <code>${winLabel}</code> · ${outIcon} ${ev.outcome.toUpperCase()} · ${pnlStr}`,
       `entry ${(o.entryPrice * 100).toFixed(1)}¢ → exit ${(o.exitPrice * 100).toFixed(1)}¢ · `
         + `<code>${escapeHtml(o.orderId.slice(0, 8))}…</code>`,
     );
-    if (ev.dca) {
-      const d = ev.dca;
-      const ratio = o.sizeUsdc > 0 ? (d.sizeUsdc / o.sizeUsdc).toFixed(2) : '?';
-      lines.push(
-        `🔄 <b>DCA placed</b> for N+1 (<code>${nextWin}</code>): `
-          + `${d.direction.toUpperCase()} @ ${(d.entryPrice * 100).toFixed(1)}¢ · `
-          + `$${d.sizeUsdc.toFixed(2)} (${ratio}× of loser $${o.sizeUsdc})`,
-      );
-    }
     if (ev.cancelled) {
       const c = ev.cancelled;
       lines.push(

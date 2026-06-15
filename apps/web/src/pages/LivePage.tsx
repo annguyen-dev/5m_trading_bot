@@ -2137,6 +2137,11 @@ const CoinCard = React.memo(function CoinCard({
                   </span>
                 </>
               )}
+              {t4.efficiencyRatio != null && (
+                <span style={{ color: t4.efficiencyRatio < 0.25 ? '#f0a500' : '#3fb950', fontWeight: 600 }}>
+                  {' · '}ER {t4.efficiencyRatio.toFixed(2)}
+                </span>
+              )}
             </div>
           )}
           <div style={CS.dim}>

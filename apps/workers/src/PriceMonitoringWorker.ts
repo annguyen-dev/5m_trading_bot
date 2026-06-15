@@ -29,6 +29,11 @@ import {
   type CoinSymbol, type CoinConfig, type EchoEdgeCase,
 } from '@trading-bot/core/CoinConfig';
 import { recordOrder, hasAutoOrderFor } from '@trading-bot/core/orderPlacement';
+import {
+  getResultGateConfig, loadResultGateState, saveResultGateState, applyOutcome, gateAllows,
+  DEFAULT_RESULT_GATE, INITIAL_GATE_STATE,
+  type ResultGateConfig, type ResultGateState,
+} from '@trading-bot/core/resultGate';
 import { getClobExecutor } from '@trading-bot/core/PolymarketClobExecutor';
 import { withRetry } from '@trading-bot/core/retry';
 import { getPool } from '@trading-bot/db';
@@ -140,6 +145,16 @@ interface CoinState {
    * In-memory; workers restart loses cycle state (acceptable for MVP).
    */
   cycleActive:        boolean;
+  /**
+   * Result-gate (pooled): pending edge-signals keyed by their TARGET window
+   * start → fade direction. Set at T-3s whether the order was PLACED (active)
+   * or SKIPPED (paused → paper-tracked); consumed at that target window's
+   * phaseT0. A Map (not a single field) because a new signal's T-3s for window
+   * N+2 fires ~3s BEFORE the prior window N+1's T-0, so a single field would be
+   * overwritten before consumption. Independent of cycleActive so paper-signals
+   * (no cycle) still update the gate.
+   */
+  gateSignal:         Map<number, 'up' | 'down'>;
   cycleDirection?:    'up' | 'down';   // bot's bet side for this cycle
   lastCycleOrderSize: number | null;
   dcaFiredCount:      number;
@@ -310,6 +325,10 @@ export class PriceMonitoringWorker {
    *  TICK_MS — old run keeps going, next tick skips. */
   private syncOutcomesInFlight = false;
 
+  /** Pooled result-momentum gate: config + live state (loaded in start()). */
+  private resultGateCfg:   ResultGateConfig = DEFAULT_RESULT_GATE;
+  private resultGateState: ResultGateState  = INITIAL_GATE_STATE;
+
   constructor(
     private readonly bus: SignalBus,
   ) {}
@@ -411,6 +430,14 @@ export class PriceMonitoringWorker {
     this.running = true;
     log('info', 'PriceMonitoringWorker starting');
 
+    // Pooled result-gate: load config + persisted state (paper-signals never
+    // reach poly_orders, so the state can't be replayed from orders).
+    this.resultGateCfg   = await getResultGateConfig();
+    this.resultGateState = await loadResultGateState();
+    if (this.resultGateCfg.enabled) {
+      log('info', 'Result-gate enabled', { cfg: this.resultGateCfg, state: this.resultGateState });
+    }
+
     await this.syncCoins();
     if (this.coins.size === 0) {
       log('warn', 'PriceMonitoringWorker: no enabled coins — idle (will pick up when enabled via /coins)');
@@ -418,6 +445,27 @@ export class PriceMonitoringWorker {
 
     this.timer = setInterval(() => void this.tick(), TICK_MS);
     void this.tick();
+  }
+
+  /**
+   * Feed ONE settled signal outcome (real or paper) into the POOLED result
+   * gate. Mutates the in-memory state synchronously (so concurrent BTC/ETH
+   * T-0s sequence deterministically on the JS event loop), then persists and
+   * logs a pause/resume flip. No-op when the gate is disabled.
+   */
+  private async feedResultGate(win: boolean): Promise<void> {
+    if (!this.resultGateCfg.enabled) return;
+    const { state, transition } = applyOutcome(this.resultGateState, win, this.resultGateCfg);
+    this.resultGateState = state;
+    if (transition) {
+      log('info', `Result-gate ${transition.toUpperCase()} (pooled)`, {
+        win, consecLosses: state.consecLosses, paused: state.paused,
+        pauseLosses: this.resultGateCfg.pauseLosses, resumeWins: this.resultGateCfg.resumeWins,
+      });
+    }
+    await saveResultGateState(state).catch((err: unknown) =>
+      log('warn', 'result-gate state persist failed',
+        { error: err instanceof Error ? err.message : String(err) }));
   }
 
   /**
@@ -485,6 +533,7 @@ export class PriceMonitoringWorker {
     const state: CoinState = {
       symbol, poly, emitted: new Set(),
       cycleActive:        false,
+      gateSignal:         new Map(),
       lastCycleOrderSize: null,
       dcaFiredCount:      0,
       cycleMode:          null,
@@ -774,6 +823,7 @@ export class PriceMonitoringWorker {
         bodyHasVeryExtreme,
         body3Sum,
         avgBody,
+        efficiencyRatio: edgeContext.efficiencyRatio,
         edgeContext,
         limitCents:    cfg.limit_price_cents,
         emittedAt:     Date.now(),
@@ -1353,6 +1403,7 @@ export class PriceMonitoringWorker {
         currentIcon:     t4.currentIcon,
         ...((result.body3Sum ?? t4.body3Sum) != null ? { body3Sum: result.body3Sum ?? t4.body3Sum } : {}),
         ...(t4.avgBody != null ? { avgBody: t4.avgBody } : {}),
+        ...(t4.efficiencyRatio != null ? { efficiencyRatio: t4.efficiencyRatio } : {}),
         ...(result.matchCase ? { matchCase: result.matchCase } : {}),
         ...(result.adaptive ? { adaptive: result.adaptive } : {}),
         emittedAt: Date.now(),
@@ -1370,6 +1421,7 @@ export class PriceMonitoringWorker {
         currentIcon:     t4.currentIcon,
         ...((result.body3Sum ?? t4.body3Sum) != null ? { body3Sum: result.body3Sum ?? t4.body3Sum } : {}),
         ...(t4.avgBody != null ? { avgBody: t4.avgBody } : {}),
+        ...(t4.efficiencyRatio != null ? { efficiencyRatio: t4.efficiencyRatio } : {}),
         ...(result.adaptive ? { adaptive: result.adaptive } : {}),
         emittedAt: Date.now(),
       });
@@ -1715,6 +1767,35 @@ export class PriceMonitoringWorker {
       return { placed: false,
         reason: `ask ${(ask * 100).toFixed(1)}¢ > limit ${cfg.limit_price_cents}¢`,
         adaptive, body3Sum };
+    }
+
+    // Result-gate (pooled): this is a confirmed signal for window N+1. Record
+    // it for the outcome feed at that window's T-0 (real OR paper). If the
+    // pooled gate is PAUSED, skip the REAL order but keep paper-tracking so the
+    // resume-after-win logic still sees outcomes. gateSignal is matched by
+    // windowStart at phaseT0 so the signal→resolution offset stays exact.
+    // Only PARTICIPATING coins (cfg.coins) touch the pooled gate. Other coins
+    // (e.g. the 1h/15m variants, which also run echo edges) must NOT feed the
+    // pooled consec-loss count nor be gated by it — else their outcomes corrupt
+    // the BTC+ETH regime signal the gate was validated on.
+    if (this.resultGateCfg.enabled && this.resultGateCfg.coins.includes(state.symbol)) {
+      // Prune stale pending entries (their phaseT0 already ran) before adding.
+      for (const ws of state.gateSignal.keys()) {
+        if (ws < nextWindowStartMs - 3 * COIN_META[state.symbol].windowMs) state.gateSignal.delete(ws);
+      }
+      state.gateSignal.set(nextWindowStartMs, direction);
+      if (!gateAllows(state.symbol, this.resultGateCfg, this.resultGateState)) {
+        log('info', `Result-gate PAUSED — paper-tracking, no real order ${state.symbol}`, {
+          direction, consecLosses: this.resultGateState.consecLosses,
+        });
+        return {
+          placed: false,
+          reason: `result-gate paused (${this.resultGateState.consecLosses} consec losses)`,
+          adaptive, body3Sum,
+          matchCase: matchedEdgeCase ? (matchedEdgeCase.label ?? matchedEdgeCase.id)
+                   : armedMode        ? 'armed' : 'idle',
+        };
+      }
     }
 
     // Place — initial entry, base size only.
@@ -2096,6 +2177,18 @@ export class PriceMonitoringWorker {
           error: err instanceof Error ? err.message : String(err),
         });
       });
+    }
+
+    // Result-gate (pooled): feed THIS window's outcome if it was the target of
+    // a prior T-3s signal (real order OR paper-tracked while paused). Matched by
+    // windowStart so the signal→resolution offset (signal at N, resolves N+1) is
+    // exact. Runs regardless of cycleActive so paper-signals update the gate.
+    if (state.gateSignal.has(windowStart)) {
+      const dir = state.gateSignal.get(windowStart)!;
+      state.gateSignal.delete(windowStart);
+      // fade won if the window closed on our bet side. Skip the feed on a doji
+      // (outcome 'unknown') — ambiguous, don't corrupt the consec-loss count.
+      if (outcome !== 'unknown') await this.feedResultGate(outcome === dir);
     }
 
     const t4 = state.lastT4;
@@ -2908,6 +3001,11 @@ async function fetchStreakWithVolume(
   const momIdx = L - 1 - 12;
   const momRef = momIdx >= 0 ? (bars[momIdx]?.close ?? 0) : 0;
   const momentumPct = momRef > 0 ? (bars[L-1]!.close - momRef) / momRef * 100 * regime : 0;
+  // efficiency-ratio (chop detector) over the last 12 closed bars: |net|/|path|.
+  // Same anchor as momentum. Low = chop (fade loses), high = clean trend.
+  let erPath = 0;
+  if (momIdx >= 0) for (let j = momIdx + 1; j <= L - 1; j++) erPath += Math.abs(bars[j]!.close - bars[j-1]!.close);
+  const efficiencyRatio = (momIdx >= 0 && erPath > 0) ? Math.abs(bars[L-1]!.close - bars[momIdx]!.close) / erPath : 0;
   // prior-run peaks: walk outcomes BEFORE the current run; each run's peak is
   // its last bar (closest to current). barsBefore = bars from that peak to the
   // current run's start. Matcher filters by dir / window / count.
@@ -2919,7 +3017,7 @@ async function fetchStreakWithVolume(
     recentStreakPeaks.push({ streak: i - j, dir: o === 'up' ? 1 : -1, barsBefore: runStartIdx - i });
     i = j;
   }
-  const edgeContext: EchoEdgeContext = { regime, cumMovePct, momentumPct, recentStreakPeaks };
+  const edgeContext: EchoEdgeContext = { regime, cumMovePct, momentumPct, efficiencyRatio, recentStreakPeaks };
 
   return {
     streak, volumeBuckets, bodyHasHigh, bodyHasTiny, meanBodyRatio, bodyHasVeryExtreme,
@@ -2928,7 +3026,7 @@ async function fetchStreakWithVolume(
 }
 
 /** Neutral edge context for the no-streak early returns (nothing fires anyway). */
-const EMPTY_EDGE_CONTEXT: EchoEdgeContext = { regime: 1, cumMovePct: 0, momentumPct: 0, recentStreakPeaks: [] };
+const EMPTY_EDGE_CONTEXT: EchoEdgeContext = { regime: 1, cumMovePct: 0, momentumPct: 0, efficiencyRatio: 0, recentStreakPeaks: [] };
 
 /**
  * Backfill in-memory echo state (`lastEchoTriggerAt` AND `lastExtremeStreakAt`)
@@ -3306,11 +3404,13 @@ function matchEchoEdgeCase(
     // When ANY is set we need edgeContext to verify; missing context → don't fire.
     const wantsExt = (ec.momentumPctMin != null && ec.momentumPctMin > 0)
       || (ec.cumMovePctMin != null && ec.cumMovePctMin > 0)
+      || (ec.efficiencyRatioMin != null && ec.efficiencyRatioMin > 0)
       || (ec.priorStreakMin != null && ec.priorStreakMin > 0);
     if (wantsExt) {
       if (!edgeContext) continue;
       if (ec.momentumPctMin != null && ec.momentumPctMin > 0 && edgeContext.momentumPct < ec.momentumPctMin) continue;
       if (ec.cumMovePctMin != null && ec.cumMovePctMin > 0 && edgeContext.cumMovePct < ec.cumMovePctMin) continue;
+      if (ec.efficiencyRatioMin != null && ec.efficiencyRatioMin > 0 && edgeContext.efficiencyRatio < ec.efficiencyRatioMin) continue;
       if (ec.priorStreakMin != null && ec.priorStreakMin > 0) {
         const winBars = (ec.priorWindowMin ?? 60) / binMinutes;
         const cnt = edgeContext.recentStreakPeaks.filter(p =>

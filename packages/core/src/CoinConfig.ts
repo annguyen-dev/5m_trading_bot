@@ -208,6 +208,11 @@ export interface EchoEdgeCase {
    *  direction, ≥ this. Over-extension of THIS run. 1h streak=4 ≥1.85% → 62% /
    *  OOS 59%; 1h streak=2 ≥0.90% → 56%. 0/undefined = no cum-move gate. */
   cumMovePctMin?:  number;
+  /** REGIME (chop filter): require Kaufman efficiency-ratio over the last 12
+   *  closed bars ≥ this. Skips CHOPPY conditions where the fade loses (ER<0.25 →
+   *  53% WR < breakeven). ≥0.25 recommended (2yr OOS: pooled Δ+$350, and turns
+   *  BTC from −$96 to +$152). 0/undefined = no chop gate. Range 0–1. */
+  efficiencyRatioMin?: number;
 }
 
 /**

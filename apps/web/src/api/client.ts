@@ -467,6 +467,8 @@ export interface EchoEdgeCase {
   momentumPctMin?: number;
   /** Magnitude: |% move over the streak's bars| in streak dir ≥ this. */
   cumMovePctMin?:  number;
+  /** Regime: Kaufman efficiency-ratio over last 12 bars ≥ this (chop filter, 0–1). */
+  efficiencyRatioMin?: number;
 }
 
 export interface AutoScheduleEntry {

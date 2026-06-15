@@ -139,6 +139,8 @@ export interface CoinT4Event {
   body3Sum?:           number;
   /** 48-bar avg |body|. ratio = body3Sum/(avgBody×3) = the regime gate. */
   avgBody?:            number;
+  /** Kaufman efficiency-ratio (chop detector), 0–1. <0.25 = chop (fade loses). */
+  efficiencyRatio?:    number;
   limitCents:          number;
   emittedAt:           number;
 }

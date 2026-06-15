@@ -211,3 +211,15 @@ Tất cả implemented (c53be8e). Matcher ANDs với streak+body gate. priorWind
 - 1h → echo + ratio: 2026-06-11
 - Clustering discovery: 2026-06-11 (chưa code)
 - Strip bug fix (ratio gate khôi phục): `f02479c`, `4a4a8ed`
+
+## Result-gate (K1) + ER chop-filter (2026-06-15)
+
+Hai cải tiến pooled BTC+ETH 5m, OFF mặc định (`resultGate.ts`, `efficiencyRatioMin` per-edge).
+
+**ER chop-filter (`efficiencyRatioMin`, recommend 0.25):** Kaufman efficiency-ratio 12 nến = |net move|/|total path|. ER<0.25 = chop → fade thua (53% WR < breakeven 55%). Bỏ vùng chop. 2yr OOS: pooled Δ+$350; **BTC từ −$96 → +$152** (lever ĐẦU TIÊN cứu được BTC_5m). Market feature đo trước khi đánh, per-trade, giúp cả 2 coin. Gate AND như `body3OverAvgMin`.
+
+**Result-gate K1 (`result_gate` setting):** chuỗi win/loss của bot momentum (+10pp lag-1: sau win 60% / sau loss 50%). Nghỉ sau K loss liên tiếp, vào lại sau R paper-win. Rolling walk-forward chọn K=1/R=1 (9/9 khúc, OOS Δ+$551). PHẢI pooled (per-coin tệ hơn always-on); feed PHẢI scope theo `cfg.coins` không thì 1h/15m làm hỏng đếm BTC+ETH.
+
+**Combo ER+K1 = +$927/2yr** (bets ~37%). Plan: bật ER trước, K1 sau.
+
+**Dead-ends phiên này (đừng test lại):** spike/nến lớn = coincident (loss LÀ nến lớn), không leading. Volume = phẳng. Block giờ (05 UTC yếu) = nhỏ. Co-move-only gate / window-dedupe gate = fail (bet-based consec-loss mới ăn). DCA tuning = tăng DD. Per-coin result-gate = tệ hơn always-on.

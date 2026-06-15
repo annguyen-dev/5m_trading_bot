@@ -60,6 +60,11 @@ export interface EchoEdgeContext {
   cumMovePct: number;
   /** |% move| over the last 12 closed bars (= 1h on 5m), in the streak dir. */
   momentumPct: number;
+  /** Kaufman efficiency ratio over the last 12 closed bars: |net move| / |total
+   *  path travelled|. 0 = pure chop (wiggled, net ~0), 1 = clean straight trend.
+   *  Low (chop) → fade loses (~53% WR < breakeven); high (extended trend → pulls
+   *  back) → fade wins (~58%). Leading regime signal, measured before betting. */
+  efficiencyRatio: number;
   /** Peaks of PRIOR runs (separate from the current run) within the baseline,
    *  for clustering edges. barsBefore = bars from the prior run's end to the
    *  current run's start. */
@@ -108,6 +113,9 @@ export interface SignalT4Event {
   avgBody?:      number;
   /** Extended-edge context (clustering + magnitude). Present for echo strategy. */
   edgeContext?:  EchoEdgeContext;
+  /** Kaufman efficiency-ratio (chop detector) over the last 12 bars at signal
+   *  time, 0–1. Surfaced on the card so the ER chop-filter is checkable. */
+  efficiencyRatio?: number;
   limitCents:    number;
   emittedAt:     number;
 }
@@ -137,6 +145,8 @@ export interface SignalTMinus3Event {
   /** 48-bar avg |body| at decision time. ratio = body3Sum/(avgBody×3) is the
    *  regime-relative gate the bot fades on. */
   avgBody?:      number;
+  /** Kaufman efficiency-ratio (chop detector) at decision time, 0–1. */
+  efficiencyRatio?: number;
   /** Which gate matched: 'idle' | 'armed' | edge-case label (e.g. 'streak4'). */
   matchCase?:    string;
   /** True if this placement was retried at T-0 of N (after T-3s failed gates). */

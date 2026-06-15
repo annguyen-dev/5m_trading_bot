@@ -223,6 +223,7 @@ function CoinRow({
       && (ec.priorCountMin  == null || (ec.priorCountMin  >= 1 && ec.priorCountMin  <= 10))
       && (ec.momentumPctMin == null || (ec.momentumPctMin >= 0 && ec.momentumPctMin <= 50))
       && (ec.cumMovePctMin  == null || (ec.cumMovePctMin  >= 0 && ec.cumMovePctMin  <= 50))
+      && (ec.efficiencyRatioMin == null || (ec.efficiencyRatioMin >= 0 && ec.efficiencyRatioMin <= 1))
     )
     && scheduleValid
     && echoValid;
@@ -1113,6 +1114,12 @@ function EdgeCaseEditor({
                       cum% ≥
                       <NumInput value={ec.cumMovePctMin ?? 0} min={0} max={50} step={0.01} disabled={disabled}
                                 onChange={v => update(ec.id, { cumMovePctMin: v > 0 ? v : undefined })} />
+                    </label>
+                    <label title="REGIME (chop filter): Kaufman efficiency-ratio over last 12 bars ≥ this (0–1). Skips choppy conditions where the fade loses. 0 = off. ≥0.25 recommended."
+                           style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                      ER ≥
+                      <NumInput value={ec.efficiencyRatioMin ?? 0} min={0} max={1} step={0.05} disabled={disabled}
+                                onChange={v => update(ec.id, { efficiencyRatioMin: v > 0 ? v : undefined })} />
                     </label>
                     <span style={{ color: '#30363d' }}>│</span>
                     <label title="CLUSTERING: require a prior same-direction streak-peak ≥ this value. 0 = off. e.g. 5m streak4 → 5."
