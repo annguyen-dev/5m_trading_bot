@@ -23,6 +23,7 @@ import { useLiveStream, type LiveMarket, type LiveShare,
          type LiveSignal, type LiveStreamStats,
          type CoinSymbol, type CoinEventsEntry,
          type VolumeBucket,
+         type ResultGateSnapshot,
          type LiveStreamState } from '../hooks/useLiveStream.js';
 
 const ALL_COINS: readonly CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB', 'BTC_1H', 'ETH_1H', 'BTC_15m'];
@@ -161,6 +162,8 @@ export default function LivePage() {
 
       <div className="page-wrap">
         <ModeBanner settings={settings} switching={switching} onSwitch={switchMode} />
+
+        <ResultGateBadge resultGate={stream.resultGate} />
 
         <EchoStatusPanel coinEvents={stream.coinEvents} />
 
@@ -1788,6 +1791,37 @@ const ModeBanner = React.memo(function ModeBanner({
 });
 
 // ────────────────────────────────────────────────────────────────────────────
+// ResultGateBadge — pooled K1 result-gate (paper-track) status banner.
+// Amber when paused (paper-tracking, no real orders), green when active.
+function ResultGateBadge({ resultGate }: { resultGate: ResultGateSnapshot | null }) {
+  if (!resultGate || !resultGate.enabled) return null;
+  const { paused, consecLosses, pauseLosses, resumeWins, coins } = resultGate;
+  const label = coins.join('+');
+  const c = paused
+    ? { bg: '#3a2a0a', border: '#b8860b', fg: '#ffd27a' }
+    : { bg: '#0e2a1a', border: '#1a7a4a', fg: '#7ee0a8' };
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 8,
+      padding: '8px 12px', marginBottom: 10, borderRadius: 8,
+      background: c.bg, border: `1px solid ${c.border}`, color: c.fg,
+      fontSize: 13, fontWeight: 600,
+    }}>
+      <span style={{ fontSize: 16 }}>{paused ? '⏸️' : '▶️'}</span>
+      {paused ? (
+        <span>
+          Paper-track <b>BẬT</b> · <b>{label}</b> PAUSED — {consecLosses} loss liên tiếp,
+          không đánh tiền thật. Resume sau {resumeWins} paper-win.
+        </span>
+      ) : (
+        <span>
+          Result-gate <b>ACTIVE</b> · <b>{label}</b> đánh thật (paper-track armed — pause sau {pauseLosses} loss).
+        </span>
+      )}
+    </div>
+  );
+}
+
 // EchoStatusPanel — prominent strategy state display above the chart.
 // Panel container is ALWAYS rendered (so user knows it exists), but only
 // coins that actually publish echo_state events get a row. Coins running

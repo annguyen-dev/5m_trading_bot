@@ -236,6 +236,25 @@ export interface CoinEventsEntry {
   echo?:   CoinEchoEvent;
 }
 
+/** Pooled result-gate (K1 paper-track) status for the Live page badge. */
+export interface ResultGateSnapshot {
+  enabled:          boolean;
+  paused:           boolean;
+  consecLosses:     number;
+  consecPausedWins: number;
+  pauseLosses:      number;
+  resumeWins:       number;
+  coins:            string[];
+}
+/** Transition event pushed when the gate flips paused/resumed. */
+interface ResultGateEvent {
+  transition:   'paused' | 'resumed';
+  pooledCoins:  string[];
+  consecLosses: number;
+  pauseLosses:  number;
+  resumeWins:   number;
+}
+
 const SIGNAL_HISTORY_MAX = 20;
 
 export interface LiveStreamState {
@@ -251,6 +270,8 @@ export interface LiveStreamState {
   signals:       LiveSignal[];
   /** Latest worker event per phase, keyed by coin. Updated by coin_t4/t30/t0. */
   coinEvents:    Partial<Record<CoinSymbol, CoinEventsEntry>>;
+  /** Pooled result-gate status (null if off / never loaded). */
+  resultGate:    ResultGateSnapshot | null;
   stats:         LiveStreamStats;
 }
 
@@ -265,6 +286,7 @@ const INITIAL: LiveStreamState = {
   lastSignal:    null,
   signals:       [],
   coinEvents:    {},
+  resultGate:    null,
   stats:         { totalEvents: 0, eventsPerSec: 0, ageMs: 0 },
 };
 
@@ -405,6 +427,7 @@ export function useLiveStream(url = '/api/poly/stream'): LiveStreamState {
             // FE would render no echo/defensive panel until the next state
             // transition (could be many minutes).
             coinEvents: hydrateEchoStates(stateRef.current.coinEvents, snap.echoStates),
+            resultGate: (snap.resultGate ?? stateRef.current.resultGate) as ResultGateSnapshot | null,
           };
           scheduleFlush();
         } catch (err) { console.warn('snapshot parse', err); }
@@ -563,6 +586,24 @@ export function useLiveStream(url = '/api/poly/stream'): LiveStreamState {
           stateRef.current = {
             ...stateRef.current,
             coinEvents: { ...stateRef.current.coinEvents, [e.coin]: { ...prev, echo: e } },
+          };
+          tickStat();
+          scheduleFlush();
+        } catch { /* ignore */ }
+      });
+
+      // Pooled result-gate (K1) paused/resumed → update the Live page badge.
+      es.addEventListener('coin_resultgate', (ev) => {
+        try {
+          const e = JSON.parse((ev as MessageEvent).data) as ResultGateEvent;
+          stateRef.current = {
+            ...stateRef.current,
+            resultGate: {
+              enabled: true, coins: e.pooledCoins,
+              pauseLosses: e.pauseLosses, resumeWins: e.resumeWins,
+              paused: e.transition === 'paused', consecLosses: e.consecLosses,
+              consecPausedWins: 0,
+            },
           };
           tickStat();
           scheduleFlush();

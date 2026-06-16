@@ -221,6 +221,11 @@ async function bootstrap(): Promise<void> {
       engine.recordEchoState(ev);
       engine.emit('coin_echo', ev);
     }
+    if (ev.type === 'result_gate') {
+      // Update the in-memory gate mirror + fan out to the Live page badge.
+      engine.recordResultGate(ev);
+      engine.emit('coin_resultgate', ev);
+    }
   });
 
   const server = app.listen(PORT, () => {

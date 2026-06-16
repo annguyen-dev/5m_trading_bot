@@ -27,8 +27,9 @@
 
 import { EventEmitter } from 'events';
 import { PolymarketService, type PolyClobMarket, type ShareTick } from '@trading-bot/core/PolymarketService';
-import type { SignalEchoStateEvent } from '@trading-bot/core/SignalBus';
+import type { SignalEchoStateEvent, SignalResultGateEvent } from '@trading-bot/core/SignalBus';
 import type { CoinSymbol } from '@trading-bot/core/CoinConfig';
+import { getResultGateConfig, loadResultGateState } from '@trading-bot/core/resultGate';
 import { getPool } from '@trading-bot/db';
 import { FutureTickScanner, type FutureTick } from './FutureTickScanner.js';
 import { BinanceFastTicker, type FastTick } from './BinanceFastTicker.js';
@@ -39,6 +40,18 @@ export interface ShareSnapshot {
   bestAsk:   number | null;
   lastPrice: number | null;
   ts:        number;
+}
+
+/** Pooled result-gate (K1) status for the Live page badge. Hydrated from DB at
+ *  startup, then updated on each `result_gate` transition event. */
+export interface ResultGateSnapshot {
+  enabled:          boolean;
+  paused:           boolean;
+  consecLosses:     number;
+  consecPausedWins: number;
+  pauseLosses:      number;
+  resumeWins:       number;
+  coins:            CoinSymbol[];
 }
 
 export interface EngineSnapshot {
@@ -53,6 +66,8 @@ export interface EngineSnapshot {
    *  echo_state event. Lets new SSE clients render the echo/defensive panel
    *  immediately on page load instead of waiting for the next state change. */
   echoStates:     Partial<Record<CoinSymbol, SignalEchoStateEvent>>;
+  /** Pooled result-gate status (null if never loaded / gate off). */
+  resultGate:     ResultGateSnapshot | null;
   connected: {
     polymarket: boolean;
     binanceWs:  boolean;
@@ -71,6 +86,7 @@ export class LiveTradingEngine extends EventEmitter {
   private scan: FutureTick | null = null;
   private lastSignal: unknown | null = null;
   private echoStates = new Map<CoinSymbol, SignalEchoStateEvent>();
+  private resultGate: ResultGateSnapshot | null = null;
   private refreshTimer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -89,6 +105,7 @@ export class LiveTradingEngine extends EventEmitter {
     // FE clients staring at empty echo panels until the next worker state
     // transition (could be hours).
     await this.loadPersistedEchoStates();
+    await this.loadResultGate();
     await this.poly.start();
     await this.scanner.start();
     await this.fast.start();
@@ -113,6 +130,24 @@ export class LiveTradingEngine extends EventEmitter {
     }
   }
 
+  /** Hydrate the pooled result-gate status from DB (config + state) so the first
+   *  snapshot already shows paused/active. Best-effort. */
+  private async loadResultGate(): Promise<void> {
+    try {
+      const cfg = await getResultGateConfig();
+      const st  = await loadResultGateState();
+      this.resultGate = {
+        enabled: cfg.enabled, coins: cfg.coins,
+        pauseLosses: cfg.pauseLosses, resumeWins: cfg.resumeWins,
+        paused: st.paused, consecLosses: st.consecLosses, consecPausedWins: st.consecPausedWins,
+      };
+    } catch (err) {
+      log('warn', 'LiveTradingEngine: result_gate hydrate failed (continuing)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   async stop(): Promise<void> {
     log('info', 'LiveTradingEngine stopping');
     if (this.refreshTimer) { clearInterval(this.refreshTimer); this.refreshTimer = null; }
@@ -129,6 +164,7 @@ export class LiveTradingEngine extends EventEmitter {
       scan:          this.scan,
       lastSignal:    this.lastSignal,
       echoStates:    Object.fromEntries(this.echoStates) as Partial<Record<CoinSymbol, SignalEchoStateEvent>>,
+      resultGate:    this.resultGate,
       connected: {
         polymarket: this.poly.isConnected(),
         binanceWs:  this.fast.isConnected(),
@@ -157,6 +193,19 @@ export class LiveTradingEngine extends EventEmitter {
         coin: ev.coin, error: err instanceof Error ? err.message : String(err),
       });
     });
+  }
+
+  /** Update the pooled result-gate status from a transition event. The worker
+   *  persists the source of truth (settings.result_gate_state); this is just the
+   *  in-memory mirror for the snapshot. Caller also fans out via `engine.emit`. */
+  recordResultGate(ev: SignalResultGateEvent): void {
+    const paused = ev.transition === 'paused';
+    this.resultGate = {
+      enabled: true, coins: ev.pooledCoins,
+      pauseLosses: ev.pauseLosses, resumeWins: ev.resumeWins,
+      paused, consecLosses: ev.consecLosses,
+      consecPausedWins: 0,   // any transition lands on a 0 paper-win count
+    };
   }
 
   private wire(): void {
