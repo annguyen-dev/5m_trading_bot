@@ -307,9 +307,23 @@ export interface SignalStreakDataMismatchEvent {
   emittedAt:          number;
 }
 
+/** Pooled result-gate (K1) flipped to paused/resumed — Telegram status alert. */
+export interface SignalResultGateEvent {
+  type:         'result_gate';
+  /** Triggering coin (used for channel routing); the gate itself is pooled. */
+  coin:         CoinSymbol;
+  transition:   'paused' | 'resumed';
+  /** Coins the gate pools across (e.g. BTC+ETH). */
+  pooledCoins:  CoinSymbol[];
+  consecLosses: number;
+  pauseLosses:  number;
+  resumeWins:   number;
+  emittedAt:    number;
+}
+
 export type SignalBusEvent =
   | SignalT0PlusEvent | SignalT4Event | SignalTMinus3Event | SignalT0Event
-  | SignalEchoStateEvent | SignalStreakDataMismatchEvent;
+  | SignalEchoStateEvent | SignalStreakDataMismatchEvent | SignalResultGateEvent;
 
 // ── Channel names ──────────────────────────────────────────────────────────
 
@@ -319,7 +333,8 @@ const CHANNEL_T3        = 'signal:T-3s';
 const CHANNEL_T0        = 'signal:T-0';
 const CHANNEL_ECHO      = 'signal:echo_state';
 const CHANNEL_MISMATCH  = 'signal:streak_data_mismatch';
-const ALL_CHANNELS      = [CHANNEL_T0PLUS, CHANNEL_T4, CHANNEL_T3, CHANNEL_T0, CHANNEL_ECHO, CHANNEL_MISMATCH] as const;
+const CHANNEL_RESULTGATE = 'signal:result_gate';
+const ALL_CHANNELS      = [CHANNEL_T0PLUS, CHANNEL_T4, CHANNEL_T3, CHANNEL_T0, CHANNEL_ECHO, CHANNEL_MISMATCH, CHANNEL_RESULTGATE] as const;
 
 function channelFor(ev: SignalBusEvent): string {
   switch (ev.type) {
@@ -329,6 +344,7 @@ function channelFor(ev: SignalBusEvent): string {
     case 'T-0':        return CHANNEL_T0;
     case 'echo_state': return CHANNEL_ECHO;
     case 'streak_data_mismatch': return CHANNEL_MISMATCH;
+    case 'result_gate':          return CHANNEL_RESULTGATE;
   }
 }
 

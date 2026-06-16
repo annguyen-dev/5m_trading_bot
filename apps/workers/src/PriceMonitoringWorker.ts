@@ -453,7 +453,7 @@ export class PriceMonitoringWorker {
    * T-0s sequence deterministically on the JS event loop), then persists and
    * logs a pause/resume flip. No-op when the gate is disabled.
    */
-  private async feedResultGate(win: boolean): Promise<void> {
+  private async feedResultGate(win: boolean, coin: CoinSymbol): Promise<void> {
     if (!this.resultGateCfg.enabled) return;
     const { state, transition } = applyOutcome(this.resultGateState, win, this.resultGateCfg);
     this.resultGateState = state;
@@ -462,6 +462,17 @@ export class PriceMonitoringWorker {
         win, consecLosses: state.consecLosses, paused: state.paused,
         pauseLosses: this.resultGateCfg.pauseLosses, resumeWins: this.resultGateCfg.resumeWins,
       });
+      // Telegram status alert (worker's own bus.onSignal → telegram.send).
+      await this.bus.publish({
+        type: 'result_gate', coin, transition,
+        pooledCoins:  this.resultGateCfg.coins,
+        consecLosses: state.consecLosses,
+        pauseLosses:  this.resultGateCfg.pauseLosses,
+        resumeWins:   this.resultGateCfg.resumeWins,
+        emittedAt:    Date.now(),
+      }).catch((err: unknown) =>
+        log('warn', 'result-gate event publish failed',
+          { error: err instanceof Error ? err.message : String(err) }));
     }
     await saveResultGateState(state).catch((err: unknown) =>
       log('warn', 'result-gate state persist failed',
@@ -2188,7 +2199,7 @@ export class PriceMonitoringWorker {
       state.gateSignal.delete(windowStart);
       // fade won if the window closed on our bet side. Skip the feed on a doji
       // (outcome 'unknown') — ambiguous, don't corrupt the consec-loss count.
-      if (outcome !== 'unknown') await this.feedResultGate(outcome === dir);
+      if (outcome !== 'unknown') await this.feedResultGate(outcome === dir, state.symbol);
     }
 
     const t4 = state.lastT4;

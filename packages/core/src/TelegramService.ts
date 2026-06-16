@@ -22,7 +22,7 @@ import { Bot } from 'grammy';
 import { log } from './observability/logger.js';
 import type {
   SignalBusEvent, SignalT0PlusEvent, SignalT4Event, SignalTMinus3Event,
-  SignalT0Event, SignalStreakDataMismatchEvent,
+  SignalT0Event, SignalStreakDataMismatchEvent, SignalResultGateEvent,
 } from './SignalBus.js';
 import type { Signal } from '@trading-bot/shared';
 import {
@@ -81,7 +81,7 @@ export class TelegramService {
   private infoTypeFor(ev: SignalBusEvent): TelegramInfoType {
     // T+4 + data alerts both fan to 'signal' channels; trade-life events
     // (T+0 / T-3s / T-0) go to 'order' channels.
-    if (ev.type === 'T+4' || ev.type === 'streak_data_mismatch') return 'signal';
+    if (ev.type === 'T+4' || ev.type === 'streak_data_mismatch' || ev.type === 'result_gate') return 'signal';
     return 'order';
   }
 
@@ -118,6 +118,7 @@ export class TelegramService {
         case 'T-3s': text = formatTMinus3(ev);  break;
         case 'T-0':   text = formatT0(ev);        break;
         case 'streak_data_mismatch': text = formatStreakMismatch(ev); break;
+        case 'result_gate': text = formatResultGate(ev); break;
       }
     } catch (err) {
       log('warn', 'TelegramService formatter failed', {
@@ -324,5 +325,20 @@ function formatStreakMismatch(ev: SignalStreakDataMismatchEvent): string {
     `Polymarket: ${polyIcon} ${ev.polyDirection.toUpperCase()}`,
     `<i>Bot uses Binance for streak/arm (chart visual). Poly resolved this bar opposite</i>`,
     `<i>→ if a contrarian bet was placed on this bar's direction, T-0 outcome may go against us.</i>`,
+  ].join('\n');
+}
+
+function formatResultGate(ev: SignalResultGateEvent): string {
+  const coins = ev.pooledCoins.length ? ev.pooledCoins.join('+') : coinLabel(ev.coin);
+  if (ev.transition === 'paused') {
+    return [
+      `⏸️ <b>Result-gate PAUSED</b> · ${coins} pooled`,
+      `${ev.consecLosses} consec loss (K=${ev.pauseLosses}) → paper-tracking, no real orders`,
+      `<i>Resumes after ${ev.resumeWins} paper-win.</i>`,
+    ].join('\n');
+  }
+  return [
+    `▶️ <b>Result-gate RESUMED</b> · ${coins} pooled`,
+    `${ev.resumeWins} paper-win → real trading resumes`,
   ].join('\n');
 }
