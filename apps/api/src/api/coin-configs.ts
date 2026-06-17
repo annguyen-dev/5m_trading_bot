@@ -184,8 +184,12 @@ const patchSchema = z.object({
 export async function updateCoinConfigHandler(
   req: Request, res: Response,
 ): Promise<void> {
-  const symbolRaw = String(req.params['symbol'] ?? '').toUpperCase();
-  if (!ALL_COINS.includes(symbolRaw as CoinSymbol)) {
+  // Case-insensitive match → canonical CoinSymbol. NOT .toUpperCase(): that
+  // mangles the lowercase timeframe suffix (BTC_15m → BTC_15M ∉ ALL_COINS → 400,
+  // so BTC_15m config could never be saved via the API).
+  const symbolRaw = String(req.params['symbol'] ?? '');
+  const symbol = ALL_COINS.find(c => c.toLowerCase() === symbolRaw.toLowerCase());
+  if (!symbol) {
     res.status(400).json({ error: `unknown symbol: ${symbolRaw}` });
     return;
   }
@@ -195,8 +199,8 @@ export async function updateCoinConfigHandler(
     return;
   }
   try {
-    const next = await updateCoinConfig(symbolRaw as CoinSymbol, parsed.data);
-    res.json({ symbol: symbolRaw, ...next });
+    const next = await updateCoinConfig(symbol, parsed.data);
+    res.json({ symbol, ...next });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
